@@ -1,0 +1,22 @@
+        ESQUINA TROPICAL        
+            RNC: N/A            
+            Tel: N/A            
+--------------------------------
+Factura: F-20260205164423
+Fecha : 2026-02-05 20:44:23
+Cajero: admin
+--------------------------------
+DESCRIPCIÓN
+CANT x P.U               IMPORTE
+--------------------------------
+Presidente (regular) 355ml
+4.00 x 125.00             500.00
+--------------------------------
+SUBTOTAL:                 500.00
+DESCUENTO:                  0.00
+TOTAL:                    500.00
+--------------------------------
+     GRACIAS POR SU COMPRA      
+
+
+
