@@ -11,6 +11,7 @@ from main_reportes_manager import MainReportesManager   # Módulo general de rep
 from caja_manager import CajaManager                    # Módulo de caja
 from users_manager import UsersManager                  # 🔹 Módulo de gestión de usuarios
 from historial_facturas_manager import HistorialFacturasManager
+from dashboard_manager import DashboardManager
 
 
 class BarSystemApp:
@@ -181,6 +182,16 @@ class BarSystemApp:
         buttons_frame = ctk.CTkFrame(self.main_bg, fg_color="#2B2B2B")
         buttons_frame.pack(fill="x", padx=10, pady=(0, 10))
 
+        # ====== DASHBOARD (HOME) ======
+        dashboard_button = ctk.CTkButton(
+            buttons_frame,
+            text="📈 Inicio",
+            width=100,
+            height=40,
+            command=self.show_dashboard
+        )
+        dashboard_button.pack(side="left", padx=5, pady=5)
+
         # ====== INVENTARIO (solo admin) ======
         if self._user_can_manage_inventory():
             self.inventario_button = ctk.CTkButton(
@@ -269,7 +280,7 @@ class BarSystemApp:
         self.main_container.pack(fill="both", expand=True, padx=10, pady=10)
 
         # Contenido inicial: Mostrar Dashboard por defecto
-        self.show_reportes(default_tab="📈 Dashboard")
+        self.show_dashboard()
 
     def clear_main_container(self):
         if self.main_container is not None:
@@ -281,6 +292,7 @@ class BarSystemApp:
         self.caja_manager = None
         self.users_manager = None
         self.historial_facturas_manager = None
+        self.dashboard_manager = None
 
     # ==========================
     #   CONFIGURACIÓN IMPRESORA
@@ -436,6 +448,10 @@ class BarSystemApp:
     # ==========================
     #        MÓDULOS
     # ==========================
+    def show_dashboard(self):
+        self.clear_main_container()
+        self.dashboard_manager = DashboardManager(self.main_container)
+
     def show_inventory(self):
         # Seguridad extra por si intenta forzar desde código
         if not self._user_can_manage_inventory():
