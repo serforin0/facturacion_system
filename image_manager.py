@@ -23,18 +23,24 @@ class ImageManager:
             # Obtener extensión del archivo
             file_ext = os.path.splitext(source_path)[1].lower()
             
-            # Validar que sea una imagen
-            valid_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp']
+            # Validar que sea una imagen válida para abrir
+            valid_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
             if file_ext not in valid_extensions:
-                messagebox.showerror("Error", "Formato de imagen no válido. Use JPG, PNG, GIF o BMP.")
+                messagebox.showerror("Error", "Formato de imagen no válido. Use JPG, PNG, WEBP, GIF o BMP.")
                 return None
             
-            # Nombre del archivo destino
-            dest_filename = f"product_{product_id}{file_ext}"
+            # Nombre del archivo destino como WEBP
+            dest_filename = f"product_{product_id}.webp"
             dest_path = os.path.join(self.images_dir, dest_filename)
             
-            # Copiar archivo
-            shutil.copy2(source_path, dest_path)
+            # Redimensionar a 250x250 y guardar como WEBP
+            with Image.open(source_path) as img:
+                # Convertir a RGB si tiene paleta para evitar errores de guardado
+                if img.mode in ("RGBA", "P"): 
+                    img = img.convert("RGBA")
+                
+                img_resized = img.resize((250, 250), Image.Resampling.LANCZOS)
+                img_resized.save(dest_path, "WEBP", quality=85)
             
             return dest_path
             
@@ -48,7 +54,7 @@ class ImageManager:
             return None
         
         # Buscar cualquier imagen que coincida con el product_id
-        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
+        for ext in ['.webp', '.jpg', '.jpeg', '.png', '.gif', '.bmp']:
             possible_path = os.path.join(self.images_dir, f"product_{product_id}{ext}")
             if os.path.exists(possible_path):
                 return possible_path

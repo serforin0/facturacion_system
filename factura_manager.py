@@ -487,7 +487,7 @@ class FacturaManager:
         if not producto_row:
             try:
                 self.product_info_label.configure(text="Producto seleccionado: ninguno")
-                self.product_image_label.configure(text="Sin imagen", image=None)
+                self.product_image_label.configure(text="Sin imagen", image="")
             except Exception:
                 pass
             self.product_ctk_image = None
@@ -530,7 +530,7 @@ class FacturaManager:
                 try:
                     self.product_image_label.configure(
                         text="Error al cargar imagen",
-                        image=None
+                        image=""
                     )
                 except Exception:
                     pass
@@ -538,7 +538,7 @@ class FacturaManager:
         else:
             self.product_ctk_image = None
             try:
-                self.product_image_label.configure(text="Sin imagen", image=None)
+                self.product_image_label.configure(text="Sin imagen", image="")
             except Exception:
                 pass
             self.product_image_label.image = None
