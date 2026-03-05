@@ -531,6 +531,94 @@ class Database:
         
         return rows, total_costo, total_venta
 
+    def get_total_inventory_count(self, search_text=None, category_filter=None) -> int:
+        """Devuelve el total de productos activos para la paginación."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        query = "SELECT COUNT(*) FROM productos p LEFT JOIN categorias c ON p.categoria_id = c.id WHERE p.activo = 1"
+        params = []
+        
+        if search_text:
+            query += " AND (p.nombre LIKE ? OR p.descripcion LIKE ? OR p.codigo_barras LIKE ?)"
+            like = f"%{search_text}%"
+            params.extend([like, like, like])
+            
+        if category_filter and category_filter != "Todas":
+            query += " AND c.nombre = ?"
+            params.append(category_filter)
+            
+        cursor.execute(query, params)
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
+    def get_inventory_valuation_by_category(self):
+        """Para el gráfico de Pie: Devuelve lista de (categoria, total_valor_costo)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT c.nombre, SUM(p.stock * p.precio_base)
+            FROM productos p
+            LEFT JOIN categorias c ON p.categoria_id = c.id
+            WHERE p.activo = 1 AND p.stock > 0
+            GROUP BY c.nombre
+            HAVING SUM(p.stock * p.precio_base) > 0
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        
+        # Filtrar Null y formatear
+        data = []
+        for row in rows:
+            cat = row[0] if row[0] else "Sin categoría"
+            val = row[1] if row[1] else 0
+            data.append((cat, val))
+            
+        conn.close()
+        return data
+
+    def get_sales_last_7_days(self):
+        """Para el gráfico de Barras: Devuelve lista de (fecha_str, total_venta)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # SQLite date() function for last 7 days aggregation
+        # Tomar los últimos 7 días considerando la fecha local
+        query = """
+            SELECT date(fecha, 'localtime') as dia, SUM(total)
+            FROM facturas
+            WHERE date(fecha, 'localtime') >= date('now', '-6 days', 'localtime')
+            GROUP BY dia
+            ORDER BY dia ASC
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def get_total_facturas_count(self, fecha_inicio=None, fecha_fin=None, cajero=None) -> int:
+        """Devuelve el total de facturas para la paginación."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        query = "SELECT COUNT(*) FROM facturas WHERE 1=1"
+        params = []
+        
+        if fecha_inicio and fecha_fin:
+            query += " AND date(fecha) BETWEEN date(?) AND date(?)"
+            params.extend([fecha_inicio, fecha_fin])
+            
+        if cajero and cajero != "Todos":
+            query += " AND usuario = ?"
+            params.append(cajero)
+            
+        cursor.execute(query, params)
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
     # --------- PERFIL DE IMPRESORA ---------
     def get_printer_profile(self) -> tuple[str, int]:
         """

@@ -23,6 +23,11 @@ class InventoryManager:
         # para edición
         self.edit_image_path = None
 
+        # Paginación
+        self.current_page = 1
+        self.limit_per_page = 50
+        self.total_pages = 1
+
         self.setup_ui()
         self.load_products()
 
@@ -313,6 +318,25 @@ class InventoryManager:
         report_frame = ctk.CTkFrame(products_frame, fg_color="transparent")
         report_frame.pack(fill="x", padx=10, pady=(0, 3))
 
+        # Controles de Paginación
+        pag_frame = ctk.CTkFrame(report_frame, fg_color="transparent")
+        pag_frame.pack(side="left", fill="y", pady=2)
+
+        self.btn_prev = ctk.CTkButton(
+            pag_frame, text="< Anterior", width=80, height=26,
+            command=self.prev_page
+        )
+        self.btn_prev.pack(side="left", padx=2)
+
+        self.lbl_page = ctk.CTkLabel(pag_frame, text="Página 1 de 1", font=("Arial", 11, "bold"))
+        self.lbl_page.pack(side="left", padx=10)
+
+        self.btn_next = ctk.CTkButton(
+            pag_frame, text="Siguiente >", width=80, height=26,
+            command=self.next_page
+        )
+        self.btn_next.pack(side="left", padx=2)
+
         ctk.CTkButton(
             report_frame,
             text="📊 Stock bajo",
@@ -321,7 +345,7 @@ class InventoryManager:
             height=28,
             font=("Arial", 11, "bold"),
             width=140
-        ).pack(anchor="e", pady=2)
+        ).pack(side="right", pady=2)
 
     # =====================================================
     #                    LÓGICA DE DATOS
@@ -337,17 +361,20 @@ class InventoryManager:
 
     # ---------- BÚSQUEDA / FILTRO -----------
 
-    def search_products(self):
-        texto = self.search_entry.get().strip() if self.search_entry else ""
-        categoria = self.category_filter.get() if self.category_filter else "Todas"
-        self.load_products(search_text=texto, category_filter=categoria)
-
     def clear_search(self):
         if self.search_entry:
             self.search_entry.delete(0, "end")
         if self.category_filter:
             self.category_filter.set("Todas")
+        self.current_page = 1
         self.load_products()
+
+    # ---------- RECARGAR CON BUSQUEDA PÁGINA 1 ----------
+    def search_products(self):
+        self.current_page = 1
+        texto = self.search_entry.get().strip() if self.search_entry else ""
+        categoria = self.category_filter.get() if self.category_filter else "Todas"
+        self.load_products(search_text=texto, category_filter=categoria)
 
     # ---------- CRUD -----------
 
@@ -535,9 +562,36 @@ class InventoryManager:
             query += " AND c.nombre = ?"
             params.append(category_filter)
 
-        query += " ORDER BY p.nombre"
+        # Calcular paginación basada en conteo
+        total_items = self.db.get_total_inventory_count(search_text, category_filter)
+        import math
+        self.total_pages = math.ceil(total_items / self.limit_per_page)
+        if self.total_pages < 1:
+            self.total_pages = 1
+            
+        if self.current_page > self.total_pages:
+            self.current_page = self.total_pages
+
+        query += " ORDER BY p.nombre LIMIT ? OFFSET ?"
+        offset = (self.current_page - 1) * self.limit_per_page
+        params.extend([self.limit_per_page, offset])
 
         cursor.execute(query, params)
+
+        # Actualizar UI de Paginación
+        if hasattr(self, 'lbl_page'):
+            self.lbl_page.configure(text=f"Página {self.current_page} de {self.total_pages}")
+            
+            # Deshabilitar botones en límites
+            if self.current_page <= 1:
+                self.btn_prev.configure(state="disabled")
+            else:
+                self.btn_prev.configure(state="normal")
+                
+            if self.current_page >= self.total_pages:
+                self.btn_next.configure(state="disabled")
+            else:
+                self.btn_next.configure(state="normal")
 
         for row in cursor.fetchall():
             precio = row[3]
@@ -555,6 +609,20 @@ class InventoryManager:
         self.tree.tag_configure("low_stock", background="#ff6b6b")
 
         conn.close()
+
+    def prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            texto = self.search_entry.get().strip() if self.search_entry else ""
+            categoria = self.category_filter.get() if self.category_filter else "Todas"
+            self.load_products(search_text=texto, category_filter=categoria)
+
+    def next_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            texto = self.search_entry.get().strip() if self.search_entry else ""
+            categoria = self.category_filter.get() if self.category_filter else "Todas"
+            self.load_products(search_text=texto, category_filter=categoria)
 
     # ---------- EDITAR / ELIMINAR / REPORTE ----------
 

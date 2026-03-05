@@ -14,9 +14,13 @@ class ReporteVentasManager:
         self.main_frame = None
         self.tree_facturas = None
         self.tree_detalle = None
-        self.entry_fecha_desde = None
         self.entry_fecha_hasta = None
         self.entry_usuario = None
+
+        # Paginación
+        self.current_page = 1
+        self.limit_per_page = 50
+        self.total_pages = 1
 
         self._setup_ui()
         self.load_facturas()
@@ -117,6 +121,25 @@ class ReporteVentasManager:
             text_color="white"
         )
         lbl_facturas.pack(anchor="w", padx=5, pady=(0, 5))
+
+        # Controles de Paginación
+        pag_frame = ctk.CTkFrame(facturas_frame, fg_color="transparent")
+        pag_frame.pack(fill="x", padx=5, pady=(0, 5))
+
+        self.btn_prev = ctk.CTkButton(
+            pag_frame, text="< Anterior", width=80, height=26,
+            command=self.prev_page
+        )
+        self.btn_prev.pack(side="left", padx=2)
+
+        self.lbl_page = ctk.CTkLabel(pag_frame, text="Página 1 de 1", font=("Arial", 11, "bold"))
+        self.lbl_page.pack(side="left", padx=10)
+
+        self.btn_next = ctk.CTkButton(
+            pag_frame, text="Siguiente >", width=80, height=26,
+            command=self.next_page
+        )
+        self.btn_next.pack(side="left", padx=2)
 
         tree_container = ctk.CTkFrame(facturas_frame, fg_color="#2B2B2B")
         tree_container.pack(fill="both", expand=True)
@@ -249,12 +272,14 @@ class ReporteVentasManager:
             self.tree_detalle.delete(item)
 
     def aplicar_filtros(self):
+        self.current_page = 1
         self.load_facturas()
 
     def limpiar_filtros(self):
         self.entry_fecha_desde.delete(0, "end")
         self.entry_fecha_hasta.delete(0, "end")
         self.entry_usuario.delete(0, "end")
+        self.current_page = 1
         self.load_facturas()
 
     def load_facturas(self):
@@ -306,8 +331,21 @@ class ReporteVentasManager:
             GROUP BY 
                 f.id, f.numero, f.fecha, f.usuario, f.tipo_comprobante,
                 f.subtotal, f.descuento_total, f.impuesto_total, f.total, f.estado
-            ORDER BY f.fecha DESC
         """
+
+        # Calcular paginación basada en conteo
+        total_items = self.db.get_total_facturas_count(fecha_desde, fecha_hasta, usuario)
+        import math
+        self.total_pages = math.ceil(total_items / self.limit_per_page)
+        if self.total_pages < 1:
+            self.total_pages = 1
+            
+        if self.current_page > self.total_pages:
+            self.current_page = self.total_pages
+
+        query += " ORDER BY f.fecha DESC LIMIT ? OFFSET ?"
+        offset = (self.current_page - 1) * self.limit_per_page
+        params.extend([self.limit_per_page, offset])
 
         try:
             cursor.execute(query, params)
@@ -316,6 +354,21 @@ class ReporteVentasManager:
             conn.close()
             messagebox.showerror("Error", f"No se pudieron cargar las ventas:\n{e}")
             return
+
+        # Actualizar UI de Paginación
+        if hasattr(self, 'lbl_page'):
+            self.lbl_page.configure(text=f"Página {self.current_page} de {self.total_pages}")
+            
+            # Deshabilitar botones en límites
+            if self.current_page <= 1:
+                self.btn_prev.configure(state="disabled")
+            else:
+                self.btn_prev.configure(state="normal")
+                
+            if self.current_page >= self.total_pages:
+                self.btn_next.configure(state="disabled")
+            else:
+                self.btn_next.configure(state="normal")
 
         conn.close()
 
@@ -356,6 +409,16 @@ class ReporteVentasManager:
                     estado
                 )
             )
+
+    def prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.load_facturas()
+
+    def next_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            self.load_facturas()
 
     # ==========================================
     #        DETALLE DE FACTURA SELECCIONADA
