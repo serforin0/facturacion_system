@@ -4,8 +4,9 @@ from reporte_inventario_manager import ReporteInventarioManager
 from dashboard_manager import DashboardManager
 
 class MainReportesManager:
-    def __init__(self, parent):
+    def __init__(self, parent, default_tab="📊 Ventas"):
         self.parent = parent
+        self.default_tab = default_tab
         self.main_frame = None
         self.tabview = None
         
@@ -40,3 +41,9 @@ class MainReportesManager:
         # Instanciar el Dashboard en la tercera pestaña
         tab_dashboard = self.tabview.tab("📈 Dashboard")
         self.dashboard = DashboardManager(tab_dashboard)
+
+        # Seleccionar la pestaña por defecto
+        try:
+            self.tabview.set(self.default_tab)
+        except ValueError:
+            pass

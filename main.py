@@ -268,14 +268,8 @@ class BarSystemApp:
         self.main_container = ctk.CTkFrame(self.main_bg, fg_color='#2B2B2B')
         self.main_container.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Contenido inicial (mensaje de bienvenida)
-        welcome_label = ctk.CTkLabel(
-            self.main_container,
-            text="Selecciona un módulo: Inventario, Factura, Reportes, Caja o Usuarios",
-            font=("Arial", 18),
-            text_color="white"
-        )
-        welcome_label.pack(expand=True)
+        # Contenido inicial: Mostrar Dashboard por defecto
+        self.show_reportes(default_tab="📈 Dashboard")
 
     def clear_main_container(self):
         if self.main_container is not None:
@@ -461,9 +455,9 @@ class BarSystemApp:
             current_user=self.current_user
         )
 
-    def show_reportes(self):
+    def show_reportes(self, default_tab="📊 Ventas"):
         self.clear_main_container()
-        self.reportes_manager = MainReportesManager(self.main_container)
+        self.reportes_manager = MainReportesManager(self.main_container, default_tab=default_tab)
 
     def show_caja(self):
         self.clear_main_container()
