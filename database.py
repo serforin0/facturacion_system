@@ -426,7 +426,7 @@ class Database:
             raise ValueError("El nombre de usuario ya existe")
         conn.close()
 
-    def update_user(self, user_id: int, username: str, password: str | None, role: str):
+    def update_user(self, user_id: int, username: str, password: str, role: str):
         """
         Actualiza los datos de un usuario.
         Si password es None o cadena vacía, NO se modifica la contraseña.
@@ -472,7 +472,7 @@ class Database:
     # ==========================
     #   CONFIGURACIÓN GENERAL
     # ==========================
-    def get_config(self, clave: str, default: str | None = None) -> str | None:
+    def get_config(self, clave: str, default: str = None) -> str:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT valor FROM config WHERE clave = ?", (clave,))
@@ -531,8 +531,8 @@ class Database:
     def set_printer_profile(
         self,
         profile: str,
-        width_movil_58: int | None = None,
-        width_epson_80: int | None = None
+        width_movil_58: int = None,
+        width_epson_80: int = None
     ):
         """
         Guarda el perfil activo y, opcionalmente, los anchos para cada impresora.
@@ -559,6 +559,59 @@ class Database:
         if width <= 0:
             return default
         return width
+
+    # ==========================
+    #   BORRADO DE HISTORIAL
+    # ==========================
+    def clear_billing_history(self):
+        """
+        Borra absolutamente todo el historial de facturación para
+        iniciar desde 0. Esto incluye:
+        facturas, factura_detalle, pagos_factura,
+        log_items_factura, notas_credito, notas_credito_detalle,
+        movimientos_inventario (asociados a ventas/devoluciones), 
+        cierres_caja.
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Eliminar datos de tablas de facturación y movimientos
+            cursor.execute("DELETE FROM factura_detalle")
+            cursor.execute("DELETE FROM pagos_factura")
+            cursor.execute("DELETE FROM log_items_factura")
+            cursor.execute("DELETE FROM notas_credito_detalle")
+            cursor.execute("DELETE FROM notas_credito")
+            cursor.execute("DELETE FROM movimientos_inventario WHERE tipo_movimiento IN ('venta', 'devolucion', 'ajuste', 'ingreso') AND factura_id IS NOT NULL")
+            # Eliminar también movimientos donde factura_id sea NULL si es que se quiere borrar TODO el historial de kardex,
+            # pero el requerimiento es borrar historial de *facturación*, e iniciar desde 0. 
+            # Borrar todos los movimientos tiene sentido para un reinicio completo del sistema de transacciones.
+            # Según el prompt: "iniciar desde 0 con un nuevo cajero o un nuevo inventario" 
+            # Borramos todos los movimientos de inventario:
+            cursor.execute("DELETE FROM movimientos_inventario")
+            
+            cursor.execute("DELETE FROM facturas")
+            cursor.execute("DELETE FROM cierres_caja")
+
+            # Reiniciar secuencias de auto-incrementos (para sqlite)
+            tablas_a_resetear = [
+                'factura_detalle', 'pagos_factura', 'log_items_factura',
+                'notas_credito_detalle', 'notas_credito', 'movimientos_inventario',
+                'facturas', 'cierres_caja'
+            ]
+            
+            for tabla in tablas_a_resetear:
+                cursor.execute("UPDATE sqlite_sequence SET seq = 0 WHERE name = ?", (tabla,))
+
+            conn.commit()
+            return True, "Historial de facturación borrado con éxito."
+            
+        except Exception as e:
+            conn.rollback()
+            return False, f"Error al borrar el historial: {str(e)}"
+            
+        finally:
+            conn.close()
 
 
 # Test de la base de datos

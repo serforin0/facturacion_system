@@ -492,7 +492,10 @@ class BarSystemApp:
 
     def show_historial_facturas(self):
         self.clear_main_container()
-        self.historial_facturas_manager = HistorialFacturasManager(self.main_container)
+        self.historial_facturas_manager = HistorialFacturasManager(
+            self.main_container,
+            current_role=self.current_role
+        )
 
     def run(self):
         self.root.mainloop()

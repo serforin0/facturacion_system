@@ -17,9 +17,10 @@ class HistorialFacturasManager:
       o reconstruyendo el ticket desde la BD si el archivo no existe.
     """
 
-    def __init__(self, parent):
+    def __init__(self, parent, current_role=None):
         self.parent = parent
         self.db = Database()
+        self.current_role = current_role
 
         # directorio donde se guardan los tickets
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -163,6 +164,57 @@ class HistorialFacturasManager:
             fg_color="#34495e",
             command=self._ver_ticket_seleccionado
         ).pack(side="left", padx=6, pady=6)
+
+        if self.current_role == "admin":
+            btn_eliminar = ctk.CTkButton(
+                btn_frame,
+                text="🗑️ Eliminar Historial completo",
+                width=200,
+                fg_color="#c0392b",
+                hover_color="#a53125",
+                command=self._eliminar_historial_completo
+            )
+            # pack a la derecha para separarlo de los otros botones
+            btn_eliminar.pack(side="right", padx=6, pady=6)
+
+    # ==============================
+    #      ELIMINAR HISTORIAL
+    # ==============================
+    def _eliminar_historial_completo(self):
+        # 1. Confirmación de seguridad
+        respuesta = messagebox.askyesno(
+            "¡ADVERTENCIA DE SEGURIDAD!",
+            "Estás a punto de ELIMINAR TODO EL HISTORIAL DE FACTURACIÓN.\n\n"
+            "Esto borrará de forma irreversible todas las facturas, pagos, "
+            "notas de crédito y movimientos de kardex asociados a ventas.\n"
+            "También se borrarán los tickets generados y se reiniciará la numeración.\n\n"
+            "Solo mantendrás usuarios, productos y configuraciones.\n\n"
+            "¿Estás completamente seguro de que deseas iniciar desde 0?",
+            icon="warning"
+        )
+        
+        if not respuesta:
+            return
+            
+        # 2. Proceder con el borrado en la BD
+        exito, msj = self.db.clear_billing_history()
+        
+        if exito:
+            # 3. Borrar los archivos de tickets (.txt)
+            try:
+                for filename in os.listdir(self.facturas_dir):
+                    if filename.endswith(".txt"):
+                        file_path = os.path.join(self.facturas_dir, filename)
+                        os.remove(file_path)
+            except Exception as e:
+                print("Error al borrar archivos de tickets:", e)
+                
+            # 4. Refrescar la tabla
+            self._cargar_facturas()
+            
+            messagebox.showinfo("Éxito", "El historial de facturación ha sido eliminado por completo.")
+        else:
+            messagebox.showerror("Error", msj)
 
     # ==============================
     #        CARGAR FACTURAS
