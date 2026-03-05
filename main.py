@@ -7,7 +7,7 @@ from inventory_manager import InventoryManager
 from styles import Styles
 from database import Database
 from factura_manager import FacturaManager              # Módulo de facturación
-from reporte_ventas_manager import ReporteVentasManager # Módulo de reportes
+from main_reportes_manager import MainReportesManager   # Módulo general de reportes (Ventas + Inventario)
 from caja_manager import CajaManager                    # Módulo de caja
 from users_manager import UsersManager                  # 🔹 Módulo de gestión de usuarios
 from historial_facturas_manager import HistorialFacturasManager
@@ -463,7 +463,7 @@ class BarSystemApp:
 
     def show_reportes(self):
         self.clear_main_container()
-        self.reportes_manager = ReporteVentasManager(self.main_container)
+        self.reportes_manager = MainReportesManager(self.main_container)
 
     def show_caja(self):
         self.clear_main_container()

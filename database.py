@@ -496,6 +496,41 @@ class Database:
         conn.commit()
         conn.close()
 
+    def get_inventory_valuation(self):
+        """
+        Retorna la valorización del inventario activo.
+        Devuelve una lista de tuplas: (nombre, categoria, stock, precio_base, precio_venta, valor_costo, valor_venta)
+        Y además el gran total de (total_costo, total_venta).
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT 
+                p.nombre, 
+                c.nombre as categoria, 
+                p.stock, 
+                p.precio_base, 
+                p.precio,
+                (p.stock * p.precio_base) as valor_costo,
+                (p.stock * p.precio) as valor_venta
+            FROM productos p
+            LEFT JOIN categorias c ON p.categoria_id = c.id
+            WHERE p.activo = 1 AND p.stock > 0
+            ORDER BY c.nombre, p.nombre
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        
+        # Calcular los grandes totales
+        total_costo = sum(row[5] for row in rows if row[5] is not None)
+        total_venta = sum(row[6] for row in rows if row[6] is not None)
+        
+        conn.close()
+        
+        return rows, total_costo, total_venta
+
     # --------- PERFIL DE IMPRESORA ---------
     def get_printer_profile(self) -> tuple[str, int]:
         """
