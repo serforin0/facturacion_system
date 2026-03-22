@@ -2,9 +2,12 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageDraw
 import os
+import sys
+import subprocess
 
 class ModernImageSelector(ctk.CTkFrame):
-    def __init__(self, master, image_manager, **kwargs):
+    def __init__(self, master, image_manager, *, light_theme=False, **kwargs):
+        self._light = light_theme
         super().__init__(master, **kwargs)
         self.image_manager = image_manager
         self.current_image_path = None
@@ -12,16 +15,43 @@ class ModernImageSelector(ctk.CTkFrame):
         self.setup_ui()
     
     def setup_ui(self):
-        # Configurar el frame principal
-        self.configure(fg_color="#2a2d2e", corner_radius=10)
-        
+        if self._light:
+            self.configure(fg_color=("#EDE8DE", "#3A3835"), corner_radius=10)
+            img_bg = ("#E8E0D4", "#2F2E2C")
+            img_border = ("#C4B8A8", "#555555")
+        else:
+            self.configure(fg_color="#2a2d2e", corner_radius=10)
+            img_bg = "#3B3B3B"
+            img_border = "#4A4A4A"
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(8, 0))
+        self.buscar_top_btn = ctk.CTkButton(
+            top,
+            text="Buscar",
+            width=72,
+            height=28,
+            command=self.select_image,
+            fg_color=("#2563EB", "#1D4ED8") if self._light else ("#2B5F87", "#1E4260"),
+        )
+        self.buscar_top_btn.pack(side="left", padx=(0, 6))
+        self.foto_top_btn = ctk.CTkButton(
+            top,
+            text="Foto",
+            width=72,
+            height=28,
+            command=self._tomar_foto,
+            fg_color=("#64748B", "#475569") if self._light else ("#4A5568", "#2D3748"),
+        )
+        self.foto_top_btn.pack(side="left", padx=0)
+
         # Frame para la zona de imagen
         self.image_frame = ctk.CTkFrame(
             self, 
-            fg_color="#3B3B3B", 
+            fg_color=img_bg, 
             corner_radius=10,
             border_width=2,
-            border_color="#4A4A4A",
+            border_color=img_border,
             height=200
         )
         self.image_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -43,24 +73,24 @@ class ModernImageSelector(ctk.CTkFrame):
         # Texto instructivo
         self.info_label = ctk.CTkLabel(
             self.image_frame, 
-            text="🖼️ HACER CLIC PARA\nSELECCIONAR IMAGEN",
-            text_color="lightblue",
-            font=("Arial", 12, "bold"),
+            text="🖼️ Clic en la imagen\no use Buscar / Foto",
+            text_color=("#1e40af", "#93C5FD") if self._light else "lightblue",
+            font=("Arial", 11, "bold"),
             wraplength=150
         )
         self.info_label.pack(pady=(0, 10))
         
-        # Botón para seleccionar imagen
+        # Botón extra (compat. solo lectura / accesibilidad)
         self.select_btn = ctk.CTkButton(
             self.image_frame,
-            text="📁 SELECCIONAR IMAGEN",
+            text="Elegir archivo…",
             command=self.select_image,
-            fg_color="#2B5F87",
-            width=140,
-            height=35,
-            font=("Arial", 12, "bold")
+            fg_color=("#2B5F87", "#1E4260"),
+            width=130,
+            height=30,
+            font=("Arial", 10, "bold")
         )
-        self.select_btn.pack(pady=(0, 10))
+        self.select_btn.pack(pady=(0, 8))
         
         # Botón para eliminar imagen
         self.clear_btn = ctk.CTkButton(
@@ -85,6 +115,29 @@ class ModernImageSelector(ctk.CTkFrame):
         
         # Mostrar imagen por defecto
         self.show_default_image()
+
+    def _tomar_foto(self):
+        """Abre la app de cámara del sistema si existe; si no, instrucciones."""
+        if sys.platform == "darwin":
+            try:
+                subprocess.Popen(
+                    ["open", "-a", "Photo Booth"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                messagebox.showinfo(
+                    "Foto",
+                    "Se intentó abrir «Photo Booth». Guarde la foto y luego use «Buscar» "
+                    "para asignarla al producto.",
+                )
+                return
+            except Exception:
+                pass
+        messagebox.showinfo(
+            "Foto",
+            "Use «Buscar» para elegir una imagen desde archivos.\n\n"
+            "Si tomó una foto con el teléfono, transfiérala a esta PC y selecciónela con Buscar.",
+        )
     
     def on_hover_enter(self, event):
         """Efecto cuando el mouse entra"""
@@ -130,8 +183,8 @@ class ModernImageSelector(ctk.CTkFrame):
             
             # Actualizar UI
             self.info_label.configure(
-                text="✅ IMAGEN CARGADA\nHacer clic para cambiar",
-                text_color="#4CAF50"
+                text="✅ Imagen cargada",
+                text_color=("#15803d", "#86EFAC") if self._light else "#4CAF50"
             )
             self.clear_btn.pack(pady=(0, 10))  # Mostrar botón eliminar
             
@@ -150,17 +203,15 @@ class ModernImageSelector(ctk.CTkFrame):
         default_image = self.image_manager.get_default_image((100, 100))
         self.image_label.configure(image=default_image, text="")
         self.info_label.configure(
-            text="🖼️ HACER CLIC PARA\nSELECCIONAR IMAGEN",
-            text_color="lightblue"
+            text="🖼️ Clic en la imagen\no use Buscar / Foto",
+            text_color=("#1e40af", "#93C5FD") if self._light else "lightblue",
         )
     
     def load_existing_image(self, image_path):
         """Cargar una imagen existente en el selector"""
         if image_path and os.path.exists(image_path):
             try:
-                image = Image.open(image_path)
-                self.display_image(image)
-                self.current_image_path = image_path
+                self.load_image_from_path(image_path)
             except Exception as e:
                 print(f"Error cargando imagen existente: {e}")
     

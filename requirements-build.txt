@@ -1,0 +1,3 @@
+# Dependencias de la app + empaquetado (solo en la máquina que construye el .exe)
+-r requirements.txt
+pyinstaller>=6.0.0

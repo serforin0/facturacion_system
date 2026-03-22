@@ -1,0 +1,39 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  pyinstaller:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: PyInstaller
+        run: python -m PyInstaller --noconfirm main.spec
+
+      - name: Zip for testers
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/SistemaFacturacion.exe")) { throw "No se generó el ejecutable." }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $zip = "release/SistemaFacturacion_Windows_run${{ github.run_number }}.zip"
+          Compress-Archive -Path "dist/SistemaFacturacion.exe" -DestinationPath $zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SistemaFacturacion-Windows
+          path: |
+            dist/SistemaFacturacion.exe
+            release/SistemaFacturacion_Windows_run${{ github.run_number }}.zip

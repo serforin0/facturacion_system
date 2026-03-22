@@ -5,6 +5,7 @@ import sys
 import tempfile
 import subprocess
 
+from app_paths import data_directory, is_frozen
 from database import Database
 
 
@@ -22,8 +23,11 @@ class HistorialFacturasManager:
         self.db = Database()
         self.current_role = current_role
 
-        # directorio donde se guardan los tickets
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = (
+            data_directory()
+            if is_frozen()
+            else os.path.dirname(os.path.abspath(__file__))
+        )
         self.facturas_dir = os.path.join(base_dir, "facturas")
         os.makedirs(self.facturas_dir, exist_ok=True)
 

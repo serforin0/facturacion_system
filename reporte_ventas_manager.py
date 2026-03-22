@@ -1,5 +1,7 @@
 # reporte_ventas_manager.py
 
+from datetime import datetime, timedelta
+
 import customtkinter as ctk
 from tkinter import ttk, messagebox
 from database import Database
@@ -75,6 +77,9 @@ class ReporteVentasManager:
             placeholder_text="ej: 2025-11-30"
         )
         self.entry_fecha_hasta.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        hoy = datetime.now().date()
+        self.entry_fecha_desde.insert(0, (hoy - timedelta(days=90)).isoformat())
+        self.entry_fecha_hasta.insert(0, hoy.isoformat())
 
         # Usuario
         lbl_usuario = ctk.CTkLabel(

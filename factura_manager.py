@@ -7,7 +7,11 @@ import tempfile
 import subprocess
 from datetime import datetime
 
+from config_impresion_dialog import open_config_impresion
 from database import Database
+
+# ITBIS ventas RD (precio en catálogo = base sin ITBIS; el impuesto se suma en factura si aplica)
+TASA_ITBIS = 0.18
 
 
 class FacturaManager:
@@ -33,11 +37,11 @@ class FacturaManager:
         self.descuentos_items_total = 0.0  # suma de descuentos por línea
         self.descuento_global_monto = 0.0  # descuento general
         self.subtotal_total = 0.0          # subtotal neto (bruto - todos los descuentos)
-        self.impuestos_total = 0.0         # sin ITBIS
-        self.total_factura = 0.0           # ahora es igual al subtotal_total
+        self.impuestos_total = 0.0         # suma ITBIS líneas
+        self.total_factura = 0.0           # gravable + ITBIS − desc. global
 
         # Producto actual seleccionado después de una búsqueda
-        # Tuple: (id, nombre, precio, precio_base, precio_minimo, stock, codigo_barras, imagen_path)
+        # Tuple: (..., aplica_itbis)
         self.producto_actual = None
 
         # Resultados de la última búsqueda (lista de tuplas)
@@ -71,6 +75,19 @@ class FacturaManager:
         # Frame principal del módulo
         main_frame = ctk.CTkFrame(self.parent, fg_color="#2B2B2B")
         main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        top_cfg = ctk.CTkFrame(main_frame, fg_color="transparent")
+        top_cfg.pack(fill="x", padx=6, pady=(4, 0))
+        ctk.CTkButton(
+            top_cfg,
+            text="⚙ Ticket e impresora (58/80 mm)",
+            width=200,
+            fg_color="#475569",
+            hover_color="#334155",
+            command=lambda: open_config_impresion(
+                self.parent.winfo_toplevel(), self.db
+            ),
+        ).pack(side="right")
 
         # Frame central con dos columnas: izquierda (búsqueda) y derecha (detalle)
         center_frame = ctk.CTkFrame(main_frame, fg_color="#2B2B2B")
@@ -242,10 +259,9 @@ class FacturaManager:
             background=[("selected", "#22559b")]
         )
 
-        # SIN columna ITBIS
         self.tree_factura = ttk.Treeview(
             tree_container,
-            columns=("Nombre", "Cant", "P.Unit", "Desc", "Subt", "Total"),
+            columns=("Nombre", "Cant", "P.Unit", "Desc", "Subt", "ITBIS", "Total"),
             show="headings",
             style="FacturaTreeview.Treeview"
         )
@@ -256,6 +272,7 @@ class FacturaManager:
             ("P.Unit", 75),
             ("Desc", 75),
             ("Subt", 85),
+            ("ITBIS", 70),
             ("Total", 85),
         ]
         for col, width in cols:
@@ -320,13 +337,21 @@ class FacturaManager:
         )
         self.lbl_descuentos.grid(row=1, column=0, padx=6, pady=2, sticky="w")
 
+        self.lbl_impuestos = ctk.CTkLabel(
+            totales_frame,
+            text="ITBIS (18%): RD$ 0.00",
+            font=("Arial", 12),
+            text_color="white",
+        )
+        self.lbl_impuestos.grid(row=2, column=0, padx=6, pady=2, sticky="w")
+
         self.lbl_total = ctk.CTkLabel(
             totales_frame,
             text="Total: RD$ 0.00",
             font=("Arial", 14, "bold"),
             text_color="lightgreen"
         )
-        self.lbl_total.grid(row=0, column=1, rowspan=2, padx=6, pady=2, sticky="e")
+        self.lbl_total.grid(row=0, column=1, rowspan=3, padx=6, pady=2, sticky="e")
 
         btn_finalizar = ctk.CTkButton(
             totales_frame,
@@ -337,7 +362,7 @@ class FacturaManager:
             height=28,
             command=self.finalizar_factura
         )
-        btn_finalizar.grid(row=0, column=2, rowspan=2, padx=6, pady=4, sticky="e")
+        btn_finalizar.grid(row=0, column=2, rowspan=3, padx=6, pady=4, sticky="e")
 
         btn_desc_global = ctk.CTkButton(
             totales_frame,
@@ -346,7 +371,7 @@ class FacturaManager:
             width=140,
             command=self._abrir_descuento_global_dialog
         )
-        btn_desc_global.grid(row=2, column=0, padx=6, pady=4, sticky="w")
+        btn_desc_global.grid(row=3, column=0, padx=6, pady=4, sticky="w")
 
         totales_frame.grid_columnconfigure(0, weight=1)
         totales_frame.grid_columnconfigure(1, weight=0)
@@ -367,6 +392,27 @@ class FacturaManager:
             except ValueError:
                 return 0.0
         return 0.0
+
+    @staticmethod
+    def _precio_nivel_desde_fila(row):
+        """Precio según facturar_nivel_precio (1–4); si el nivel está en 0 usa precio principal."""
+        if not row or len(row) < 16:
+            try:
+                return float(row[2] or 0) if row else 0.0
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+        nivel = max(1, min(4, int(row[15] or 1)))
+        precios = [row[2], row[12], row[13], row[14]]
+        try:
+            p = float(precios[nivel - 1] or 0)
+        except (TypeError, ValueError, IndexError):
+            p = 0.0
+        if p <= 0:
+            try:
+                p = float(row[2] or 0)
+            except (TypeError, ValueError):
+                p = 0.0
+        return p
 
     # ---------- RENDER VISUAL DE LA LISTA ----------
 
@@ -389,8 +435,18 @@ class FacturaManager:
                 stock,
                 cb,
                 img_path,
+                _itb,
+                _fs,
+                _dsc,
+                _def,
+                _p2,
+                _p3,
+                _p4,
+                _nv,
             ) = p
-            precio_float = self._parse_precio(precio)
+            precio_float = self._parse_precio(
+                self._precio_nivel_desde_fila(p)
+            )
             marker = "✔" if pid == selected_id else " "
             line = (
                 f"[{marker}] ID:{pid} | {nombre} | "
@@ -419,7 +475,13 @@ class FacturaManager:
         cursor.execute(
             """
             SELECT id, nombre, precio, precio_base, precio_minimo,
-                   stock, codigo_barras, imagen_path
+                   stock, codigo_barras, imagen_path,
+                   IFNULL(aplica_itbis, 1),
+                   IFNULL(facturar_sin_stock, 1),
+                   IFNULL(descripcion, ''),
+                   IFNULL(descripcion_en_factura, 0),
+                   IFNULL(precio_2, 0), IFNULL(precio_3, 0), IFNULL(precio_4, 0),
+                   IFNULL(facturar_nivel_precio, 1)
             FROM productos
             WHERE activo = 1
               AND (
@@ -503,14 +565,26 @@ class FacturaManager:
             stock,
             cb,
             imagen_path,
+            aplica_itbis,
+            facturar_sin_stock,
+            _descripcion,
+            _desc_fact,
+            _p2,
+            _p3,
+            _p4,
+            _nivel,
         ) = producto_row
-        precio_float = self._parse_precio(precio)
+        pv = self._precio_nivel_desde_fila(producto_row)
+        precio_float = self._parse_precio(pv)
+        lleva = bool(int(aplica_itbis or 1))
+        extra = f" | ITBIS: {'sí' if lleva else 'no'}"
+        sin_ex = "sí" if int(facturar_sin_stock or 1) else "no"
 
         try:
             self.product_info_label.configure(
                 text=(
-                    f"{nombre} | P.Venta: RD$ {precio_float:.2f} | "
-                    f"Stock: {stock} | CB: {cb}"
+                    f"{nombre} | P.Venta: RD$ {precio_float:.2f}{extra} | "
+                    f"Stock: {stock} | Sin exist.: {sin_ex} | CB: {cb}"
                 )
             )
         except Exception:
@@ -618,11 +692,23 @@ class FacturaManager:
             stock,
             cb,
             imagen_path,
+            aplica_itbis,
+            facturar_sin_stock,
+            descripcion,
+            desc_en_factura,
+            _p2,
+            _p3,
+            _p4,
+            _nivel,
         ) = self.producto_actual
 
-        precio_unit = self._parse_precio(precio)
+        precio_unit = self._parse_precio(
+            self._precio_nivel_desde_fila(self.producto_actual)
+        )
+        aplica = bool(int(aplica_itbis or 1))
 
-        if cantidad > stock:
+        permitir_sin_stock = int(facturar_sin_stock or 1)
+        if permitir_sin_stock == 0 and cantidad > stock:
             messagebox.showerror(
                 "Stock insuficiente",
                 f"Stock disponible: {stock}. No puedes vender {cantidad}."
@@ -681,14 +767,26 @@ class FacturaManager:
 
         subtotal_neto = subtotal_bruto - descuento_linea
 
+        impuesto_item = (
+            round(subtotal_neto * TASA_ITBIS, 2) if aplica else 0.0
+        )
+        total_linea = round(subtotal_neto + impuesto_item, 2)
+
+        nombre_linea = nombre
+        if int(desc_en_factura or 0) and (descripcion or "").strip():
+            nombre_linea = f"{nombre}\n{(descripcion or '').strip()}"[:900]
+
         item = {
             "id": pid,
-            "nombre": nombre,
+            "nombre": nombre_linea,
             "cantidad": cantidad,
             "precio": precio_unit,
             "descuento": descuento_linea,
             "subtotal_bruto": subtotal_bruto,
             "subtotal_neto": subtotal_neto,
+            "aplica_itbis": aplica,
+            "impuesto_item": impuesto_item,
+            "total_linea": total_linea,
         }
 
         self.factura_items.append(item)
@@ -711,7 +809,8 @@ class FacturaManager:
             precio = item["precio"]
             desc = item["descuento"]
             subt = item["subtotal_neto"]
-            total = subt  # sin ITBIS
+            imp = float(item.get("impuesto_item") or 0)
+            total = float(item.get("total_linea") or subt)
 
             self.tree_factura.insert(
                 "",
@@ -723,6 +822,7 @@ class FacturaManager:
                     f"{precio:.2f}",
                     f"{desc:.2f}",
                     f"{subt:.2f}",
+                    f"{imp:.2f}",
                     f"{total:.2f}",
                 )
             )
@@ -752,19 +852,27 @@ class FacturaManager:
                 descuento_total - self.descuentos_items_total
             )
 
-        self.subtotal_total = self.subtotal_bruto - descuento_total
-        self.impuestos_total = 0.0
-        self.total_factura = self.subtotal_total
+        # Base gravable (tras descuentos por línea) e ITBIS
+        self.subtotal_total = sum(i["subtotal_neto"] for i in self.factura_items)
+        self.impuestos_total = sum(
+            float(i.get("impuesto_item") or 0) for i in self.factura_items
+        )
+        self.total_factura = (
+            self.subtotal_total + self.impuestos_total - self.descuento_global_monto
+        )
 
         self._refrescar_tree_factura()
         self._refrescar_totales_ui(descuento_total)
 
     def _refrescar_totales_ui(self, descuento_total):
         self.lbl_subtotal.configure(
-            text=f"Subtotal: RD$ {self.subtotal_total:.2f}"
+            text=f"Subtotal gravable: RD$ {self.subtotal_total:.2f}"
         )
         self.lbl_descuentos.configure(
             text=f"Descuentos: RD$ {descuento_total:.2f}"
+        )
+        self.lbl_impuestos.configure(
+            text=f"ITBIS (18%): RD$ {self.impuestos_total:.2f}"
         )
         self.lbl_total.configure(
             text=f"Total: RD$ {self.total_factura:.2f}"
@@ -838,7 +946,7 @@ class FacturaManager:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT precio_base, precio_minimo
+                SELECT precio_base, precio_minimo, IFNULL(aplica_itbis, 1)
                 FROM productos
                 WHERE id = ?
                 """,
@@ -848,6 +956,7 @@ class FacturaManager:
             conn.close()
 
             precio_minimo = row[1] if row and row[1] is not None else nuevo_prec
+            aplica = bool(int(row[2] or 1)) if row else True
 
             subtotal_bruto = nuevo_prec * nueva_cant
 
@@ -859,12 +968,19 @@ class FacturaManager:
                 nuevo_desc = max_desc_por_min
 
             subtotal_neto = subtotal_bruto - nuevo_desc
+            impuesto_item = (
+                round(subtotal_neto * TASA_ITBIS, 2) if aplica else 0.0
+            )
+            total_linea = round(subtotal_neto + impuesto_item, 2)
 
             item["cantidad"] = nueva_cant
             item["precio"] = nuevo_prec
             item["descuento"] = nuevo_desc
             item["subtotal_bruto"] = subtotal_bruto
             item["subtotal_neto"] = subtotal_neto
+            item["aplica_itbis"] = aplica
+            item["impuesto_item"] = impuesto_item
+            item["total_linea"] = total_linea
 
             self._recalcular_totales_y_refrescar()
             edit_win.destroy()
@@ -1194,9 +1310,17 @@ class FacturaManager:
     #    IMPRESIÓN DEL TICKET
     # ==========================
 
-    def _build_ticket_text(self, numero, fecha, usuario,
-                           detalles, subtotal_bruto,
-                           descuento_total, total):
+    def _build_ticket_text(
+        self,
+        numero,
+        fecha,
+        usuario,
+        detalles,
+        subtotal_gravable,
+        descuento_total,
+        impuesto_total,
+        total,
+    ):
         """
         Construye el texto del ticket ajustándose al ancho configurable.
         """
@@ -1210,11 +1334,17 @@ class FacturaManager:
             return char * ticket_width
 
         # -----------------------------------
-        # ENCABEZADO
+        # ENCABEZADO (desde configuración «Empresa»)
         # -----------------------------------
-        lines.append(center("ESQUINA TROPICAL"))
-        lines.append(center("RNC: N/A"))
-        lines.append(center("Tel: N/A"))
+        emp = self.db.get_empresa_info()
+        nom = (emp.get("nombre") or "Mi empresa").strip() or "Mi empresa"
+        lines.append(center(nom[:ticket_width]))
+        dir_txt = (emp.get("direccion") or "").replace("\r\n", "\n").replace("\r", "\n")
+        for part in dir_txt.split("\n"):
+            chunk = part.strip()
+            while chunk:
+                lines.append(center(chunk[:ticket_width]))
+                chunk = chunk[ticket_width:].lstrip()
         lines.append(sep())
         lines.append(f"Factura: {numero}")
         lines.append(f"Fecha : {fecha}")
@@ -1256,7 +1386,13 @@ class FacturaManager:
         # TOTALES
         # -----------------------------------
         lines.append(sep())
-        lines.append(f"SUBTOTAL:".ljust(ticket_width - 10) + f"{subtotal_bruto:10.2f}")
+        lines.append(
+            f"SUB.GRAV.:".ljust(ticket_width - 10) + f"{subtotal_gravable:10.2f}"
+        )
+        if impuesto_total and impuesto_total > 0:
+            lines.append(
+                f"ITBIS 18%:".ljust(ticket_width - 10) + f"{impuesto_total:10.2f}"
+            )
         lines.append(f"DESCUENTO:".ljust(ticket_width - 10) + f"{descuento_total:10.2f}")
         lines.append(f"TOTAL:".ljust(ticket_width - 10) + f"{total:10.2f}")
         lines.append(sep())
@@ -1304,6 +1440,8 @@ class FacturaManager:
             try:
                 printer_name = self.db.get_config("printer_name", None)
             except Exception:
+                printer_name = None
+            if printer_name is not None and str(printer_name).strip() == "":
                 printer_name = None
 
             if not printer_name:
@@ -1391,7 +1529,7 @@ class FacturaManager:
                     None,
                     round(self.subtotal_total, 2),
                     round(descuento_total, 2),
-                    0.0,  # no usas ITBIS
+                    round(self.impuestos_total, 2),
                     round(self.total_factura, 2),
                     "emitida",
                     self.current_user,
@@ -1420,8 +1558,8 @@ class FacturaManager:
                         item["cantidad"],
                         item["precio"],
                         round(item["descuento"], 2),
-                        0.0,
-                        round(item["subtotal_neto"], 2)
+                        round(float(item.get("impuesto_item") or 0), 2),
+                        round(float(item.get("total_linea") or item["subtotal_neto"]), 2),
                     )
                 )
 
@@ -1429,6 +1567,32 @@ class FacturaManager:
                 cursor.execute(
                     "UPDATE productos SET stock = stock - ? WHERE id = ?",
                     (item["cantidad"], item["id"])
+                )
+
+                cursor.execute(
+                    """
+                    SELECT IFNULL(NULLIF(TRIM(bodega_codigo), ''), '')
+                    FROM productos WHERE id = ?
+                    """,
+                    (item["id"],),
+                )
+                bod_row = cursor.fetchone()
+                bod_codigo = (bod_row[0] or "").strip() or None
+
+                self.db.insert_movimiento_kardex(
+                    item["id"],
+                    "venta",
+                    -float(item["cantidad"]),
+                    ajustar_stock=False,
+                    referencia=numero,
+                    factura_id=factura_id,
+                    usuario=self.current_user,
+                    tipo_codigo="FA",
+                    entidad_nombre="Cliente consumidor final",
+                    bodega_codigo=bod_codigo,
+                    precio_unitario=float(item["precio"]),
+                    descripcion_mov=f"Venta: Factura {numero}",
+                    conn=conn,
                 )
 
                 cursor.execute(
@@ -1445,7 +1609,7 @@ class FacturaManager:
                         item["nombre"],
                         item["cantidad"],
                         item["precio"],
-                        item["subtotal_neto"]
+                        float(item.get("total_linea") or item["subtotal_neto"]),
                     )
                 )
 
@@ -1484,14 +1648,21 @@ class FacturaManager:
                 fecha_txt,
                 self.current_user,
                 detalles_ticket,
-                self.subtotal_bruto,
+                self.subtotal_total,
                 descuento_total,
-                self.total_factura
+                self.impuestos_total,
+                self.total_factura,
             )
 
             # Guardar ticket en carpeta 'facturas'
             try:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
+                from app_paths import data_directory, is_frozen
+
+                base_dir = (
+                    data_directory()
+                    if is_frozen()
+                    else os.path.dirname(os.path.abspath(__file__))
+                )
                 facturas_dir = os.path.join(base_dir, "facturas")
                 os.makedirs(facturas_dir, exist_ok=True)
 

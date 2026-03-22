@@ -4,9 +4,16 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageDraw
 import customtkinter as ctk
 
+from app_paths import data_directory, is_frozen
+
+
 class ImageManager:
     def __init__(self):
-        self.images_dir = "product_images"
+        self.images_dir = (
+            os.path.join(data_directory(), "product_images")
+            if is_frozen()
+            else "product_images"
+        )
         self.create_images_directory()
     
     def create_images_directory(self):

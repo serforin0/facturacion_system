@@ -1,8 +1,11 @@
+import os
+
 import customtkinter as ctk
 import tkinterdnd2 as tkdnd   # lo dejamos importado por si lo usas en otros módulos
 from tkinter import messagebox
 from PIL import Image  # Para cargar el logo
 
+from config_impresion_dialog import open_config_impresion
 from inventory_manager import InventoryManager
 from styles import Styles
 from database import Database
@@ -12,6 +15,7 @@ from caja_manager import CajaManager                    # Módulo de caja
 from users_manager import UsersManager                  # 🔹 Módulo de gestión de usuarios
 from historial_facturas_manager import HistorialFacturasManager
 from dashboard_manager import DashboardManager
+from home_dashboard import HomeDashboardManager
 
 
 class BarSystemApp:
@@ -24,7 +28,6 @@ class BarSystemApp:
 
         # ✅ Ventana principal: SIEMPRE CTk
         self.root = ctk.CTk()
-        self.root.title("🍹 Esquina Tropical - Sistema de Bar")
         self.root.geometry("1200x700")
         self.root.minsize(1000, 600)
 
@@ -45,9 +48,13 @@ class BarSystemApp:
         self.caja_manager = None
         self.users_manager = None
         self.historial_facturas_manager = None
+        self.home_dashboard_manager = None
+        self.lbl_main_title = None
+        self._nav_buttons = {}
+        self._nav_active = None
 
-        # Referencia al botón de inventario (para habilitar/deshabilitar)
-        self.inventario_button = None
+        emp = self.db.get_empresa_info()
+        self.root.title(f"{emp.get('nombre') or 'Sistema'} — Gestión")
 
         # Mostrar primero el login
         self.show_login()
@@ -56,65 +63,105 @@ class BarSystemApp:
     #       PANTALLA LOGIN
     # ==========================
     def show_login(self):
-        # Limpiar todo por si acaso
         for widget in self.root.winfo_children():
             widget.destroy()
 
-        self.login_frame = ctk.CTkFrame(self.root, fg_color="#2B2B2B")
+        emp = self.db.get_empresa_info()
+        company = (emp.get("nombre") or "Mi empresa").strip()
+
+        self.login_frame = ctk.CTkFrame(self.root, fg_color="#0f172a")
         self.login_frame.pack(fill="both", expand=True)
 
-        # ======= LOGO =======
-        try:
-            logo_path = "assets/logo.png"  # Ruta del logo
-            logo_img = ctk.CTkImage(
-                light_image=Image.open(logo_path),
-                dark_image=Image.open(logo_path),
-                size=(220, 220)
-            )
-            logo_label = ctk.CTkLabel(self.login_frame, image=logo_img, text="")
-            logo_label.image = logo_img  # mantener referencia
-            logo_label.pack(pady=(40, 10))
-        except Exception as e:
-            print("Error cargando logo:", e)
+        self.login_frame.grid_columnconfigure(0, weight=1)
+        self.login_frame.grid_rowconfigure(0, weight=1)
+        self.login_frame.grid_rowconfigure(2, weight=1)
 
-        # ======= TÍTULO =======
-        title_label = ctk.CTkLabel(
+        card = ctk.CTkFrame(
             self.login_frame,
+            fg_color="#1e293b",
+            corner_radius=20,
+            border_width=1,
+            border_color="#334155",
+        )
+        card.grid(row=1, column=0, pady=24, padx=24, sticky="n")
+
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(padx=36, pady=32)
+
+        logo_path = self.db.get_app_logo_path()
+        if not logo_path:
+            _def = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
+            logo_path = _def if os.path.isfile(_def) else None
+
+        self._login_logo_img = None
+        if logo_path:
+            try:
+                pil = Image.open(logo_path).convert("RGBA")
+                pil.thumbnail((168, 168))
+                self._login_logo_img = ctk.CTkImage(
+                    light_image=pil, dark_image=pil, size=pil.size
+                )
+                ctk.CTkLabel(inner, image=self._login_logo_img, text="").pack(pady=(0, 12))
+            except OSError:
+                pass
+
+        ctk.CTkLabel(
+            inner,
+            text=company,
+            font=("Arial", 22, "bold"),
+            text_color="#f8fafc",
+        ).pack(pady=(0, 4))
+        ctk.CTkLabel(
+            inner,
+            text="Sistema de gestión",
+            font=("Arial", 13),
+            text_color="#94a3b8",
+        ).pack(pady=(0, 20))
+
+        ctk.CTkLabel(
+            inner,
             text="Iniciar sesión",
-            font=("Arial", 26, "bold"),
-            text_color="white"
+            font=("Arial", 16, "bold"),
+            text_color="#e2e8f0",
+        ).pack(anchor="w", pady=(0, 12))
+
+        self.entry_user = ctk.CTkEntry(
+            inner,
+            width=300,
+            height=42,
+            placeholder_text="Usuario",
+            corner_radius=10,
         )
-        title_label.pack(pady=(5, 20))
+        self.entry_user.pack(pady=(0, 10))
+        self.entry_pass = ctk.CTkEntry(
+            inner,
+            width=300,
+            height=42,
+            placeholder_text="Contraseña",
+            corner_radius=10,
+            show="•",
+        )
+        self.entry_pass.pack(pady=(0, 18))
 
-        # ======= CAMPO USUARIO =======
-        user_frame = ctk.CTkFrame(self.login_frame, fg_color="#2B2B2B")
-        user_frame.pack(pady=10)
-        user_label = ctk.CTkLabel(user_frame, text="Usuario:", font=("Arial", 15))
-        user_label.grid(row=0, column=0, padx=10, pady=5, sticky="e")
-        self.entry_user = ctk.CTkEntry(user_frame, width=260)
-        self.entry_user.grid(row=0, column=1, padx=10, pady=5)
-
-        # ======= CAMPO CONTRASEÑA =======
-        pass_frame = ctk.CTkFrame(self.login_frame, fg_color="#2B2B2B")
-        pass_frame.pack(pady=10)
-        pass_label = ctk.CTkLabel(pass_frame, text="Contraseña:", font=("Arial", 15))
-        pass_label.grid(row=0, column=0, padx=10, pady=5, sticky="e")
-        self.entry_pass = ctk.CTkEntry(pass_frame, width=260, show="*")
-        self.entry_pass.grid(row=0, column=1, padx=10, pady=5)
-
-        # ======= BOTÓN LOGIN =======
-        login_button = ctk.CTkButton(
-            self.login_frame,
+        ctk.CTkButton(
+            inner,
             text="Entrar",
-            width=200,
-            height=40,
-            fg_color="#2B5F87",
-            hover_color="#1D4C6B",
-            command=self.handle_login
-        )
-        login_button.pack(pady=(25, 10))
+            width=300,
+            height=44,
+            corner_radius=10,
+            font=("Arial", 15, "bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=self.handle_login,
+        ).pack(pady=(0, 8))
 
-        # Permitir Enter SOLO mientras estamos en login
+        ctk.CTkLabel(
+            inner,
+            text="Configure nombre y logo en el menú principal → Apariencia",
+            font=("Arial", 10),
+            text_color="#64748b",
+        ).pack(pady=(12, 0))
+
         self.root.bind("<Return>", self._on_enter_login)
 
     def _on_enter_login(self, event):
@@ -158,128 +205,128 @@ class BarSystemApp:
     # ==========================
     #      UI PRINCIPAL
     # ==========================
+    def refresh_branding(self):
+        """Actualiza título de ventana y cabecera tras cambiar empresa/logo en configuración."""
+        emp = self.db.get_empresa_info()
+        name = (emp.get("nombre") or "Sistema").strip()
+        self.root.title(f"{name} — Gestión")
+        if getattr(self, "lbl_main_title", None) is not None:
+            u = ""
+            if self.current_user and self.current_role:
+                u = f"   |   Usuario: {self.current_user} ({self.current_role})"
+            self.lbl_main_title.configure(
+                text=f"{name.upper()} — SISTEMA DE GESTIÓN{u}"
+            )
+
+    def _setup_main_nav(self):
+        self._nav_buttons.clear()
+        nav_wrap = ctk.CTkFrame(self.main_bg, fg_color="#1e293b", corner_radius=8)
+        nav_wrap.pack(fill="x", padx=10, pady=(0, 8))
+
+        rows = ctk.CTkFrame(nav_wrap, fg_color="transparent")
+        rows.pack(fill="x", padx=8, pady=8)
+
+        def row():
+            return ctk.CTkFrame(rows, fg_color="transparent")
+
+        r1 = row()
+        r1.pack(fill="x", pady=(0, 4))
+        r2 = row()
+        r2.pack(fill="x")
+
+        def add_btn(parent, key, text, command, width=118):
+            b = ctk.CTkButton(
+                parent,
+                text=text,
+                width=width,
+                height=32,
+                font=("Arial", 11, "bold"),
+                fg_color="#64748B",
+                hover_color="#475569",
+                command=command,
+            )
+            b.pack(side="left", padx=3, pady=2)
+            self._nav_buttons[key] = b
+
+        add_btn(r1, "home", "🏠 Inicio", self.show_dashboard)
+        add_btn(r1, "facturacion", "🧾 Facturación", self.show_facturacion)
+        add_btn(r1, "caja", "💵 Caja", self.show_caja)
+        add_btn(r1, "historial", "📋 Historial", self.show_historial_facturas)
+        if self._user_can_manage_inventory():
+            add_btn(r1, "inventory", "📦 Inventario", self.show_inventory)
+            add_btn(r1, "kardex", "📑 Kardex", self.show_kardex)
+        add_btn(r1, "reportes", "📊 Reportes", self.show_reportes)
+        add_btn(r1, "indicators", "📈 Indicadores", self.show_indicadores)
+
+        add_btn(
+            r2,
+            "compras",
+            "Compras",
+            lambda: self._nav_stub("Compras"),
+            width=100,
+        )
+        add_btn(
+            r2,
+            "cotizaciones",
+            "Cotizaciones",
+            lambda: self._nav_stub("Cotizaciones"),
+            width=100,
+        )
+        add_btn(
+            r2,
+            "devoluciones",
+            "Devoluciones",
+            lambda: self._nav_stub("Devoluciones"),
+            width=100,
+        )
+        add_btn(r2, "otros", "Otros", lambda: self._nav_stub("Otros"), width=88)
+        if self.current_role == "admin":
+            add_btn(r2, "users", "👤 Usuarios", self.show_usuarios, width=110)
+        add_btn(
+            r2,
+            "apariencia",
+            "🎨 Apariencia",
+            self._open_apariencia_config,
+            width=120,
+        )
+
+    def _set_active_nav(self, key):
+        self._nav_active = key
+        base, hi = "#64748B", "#2563EB"
+        for k, btn in self._nav_buttons.items():
+            btn.configure(fg_color=hi if k == key else base)
+
+    def _nav_stub(self, nombre: str):
+        self._set_active_nav(None)
+        messagebox.showinfo(
+            nombre,
+            "Este módulo está en la hoja de ruta.\n"
+            "Use Facturación, Inventario o Reportes según corresponda.",
+        )
+
+    def _open_apariencia_config(self):
+        open_config_impresion(self.root, self.db, on_applied=self.refresh_branding)
+
     def setup_ui(self):
-        # Frame de fondo principal
-        self.main_bg = ctk.CTkFrame(self.root, fg_color='#2B2B2B')
+        self.main_bg = ctk.CTkFrame(self.root, fg_color="#2B2B2B")
         self.main_bg.pack(fill="both", expand=True)
 
-        # Barra de título
-        title_text = "🍹 ESQUINA TROPICAL - SISTEMA DE GESTIÓN"
-        if self.current_user and self.current_role:
-            title_text += f"   |   Usuario: {self.current_user} ({self.current_role})"
-
-        title_label = ctk.CTkLabel(
+        self.lbl_main_title = ctk.CTkLabel(
             self.main_bg,
-            text=title_text,
-            font=("Arial", 24, "bold"),
-            height=60,
-            fg_color="#2B5F87",
-            text_color="white"
+            text="",
+            font=("Arial", 20, "bold"),
+            height=52,
+            fg_color="#334155",
+            text_color="white",
         )
-        title_label.pack(fill="x", padx=10, pady=10)
+        self.lbl_main_title.pack(fill="x", padx=10, pady=(10, 6))
+        self.refresh_branding()
 
-        # Barra de botones de módulos
-        buttons_frame = ctk.CTkFrame(self.main_bg, fg_color="#2B2B2B")
-        buttons_frame.pack(fill="x", padx=10, pady=(0, 10))
+        self._setup_main_nav()
 
-        # ====== DASHBOARD (HOME) ======
-        dashboard_button = ctk.CTkButton(
-            buttons_frame,
-            text="📈 Inicio",
-            width=100,
-            height=40,
-            command=self.show_dashboard
-        )
-        dashboard_button.pack(side="left", padx=5, pady=5)
+        self.main_container = ctk.CTkFrame(self.main_bg, fg_color="#2B2B2B")
+        self.main_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        # ====== INVENTARIO (solo admin) ======
-        if self._user_can_manage_inventory():
-            self.inventario_button = ctk.CTkButton(
-                buttons_frame,
-                text="📦 Inventario",
-                width=150,
-                height=40,
-                command=self.show_inventory
-            )
-        else:
-            # Botón deshabilitado y sin comando
-            self.inventario_button = ctk.CTkButton(
-                buttons_frame,
-                text="📦 Inventario (solo admin)",
-                width=150,
-                height=40,
-                state="disabled",
-                fg_color="#555555",
-                hover_color="#555555"
-            )
-        self.inventario_button.pack(side="left", padx=5, pady=5)
-
-        # ====== FACTURA ======
-        factura_button = ctk.CTkButton(
-            buttons_frame,
-            text="🧾 Factura",
-            width=150,
-            height=40,
-            command=self.show_facturacion
-        )
-        factura_button.pack(side="left", padx=5, pady=5)
-
-        # ====== REPORTES ======
-        reportes_button = ctk.CTkButton(
-            buttons_frame,
-            text="📊 Reportes",
-            width=150,
-            height=40,
-            command=self.show_reportes
-        )
-        reportes_button.pack(side="left", padx=5, pady=5)
-
-        # ====== CAJA ======
-        caja_button = ctk.CTkButton(
-            buttons_frame,
-            text="💰 Caja",
-            width=150,
-            height=40,
-            command=self.show_caja
-        )
-        caja_button.pack(side="left", padx=5, pady=5)
-
-        # ====== CONFIG IMPRESORA (TODOS PUEDEN VER) ======
-        printer_button = ctk.CTkButton(
-            buttons_frame,
-            text="🖨️ Impresora",
-            width=150,
-            height=40,
-            command=self.show_printer_config
-        )
-        printer_button.pack(side="left", padx=5, pady=5)
-
-        # 🔹 SOLO SI ES ADMIN: botón para gestionar usuarios
-        if self.current_role == "admin":
-            usuarios_button = ctk.CTkButton(
-                buttons_frame,
-                text="👤 Usuarios",
-                width=150,
-                height=40,
-                command=self.show_usuarios
-            )
-            usuarios_button.pack(side="left", padx=5, pady=5)
-
-        # Historial de facturas
-        facturas_button = ctk.CTkButton(
-            buttons_frame,
-            text="📜 Facturas",
-            width=150,
-            height=40,
-            command=self.show_historial_facturas
-        )
-        facturas_button.pack(side="left", padx=5, pady=5)
-
-        # Frame principal para módulos
-        self.main_container = ctk.CTkFrame(self.main_bg, fg_color='#2B2B2B')
-        self.main_container.pack(fill="both", expand=True, padx=10, pady=10)
-
-        # Contenido inicial: Mostrar Dashboard por defecto
         self.show_dashboard()
 
     def clear_main_container(self):
@@ -293,6 +340,7 @@ class BarSystemApp:
         self.users_manager = None
         self.historial_facturas_manager = None
         self.dashboard_manager = None
+        self.home_dashboard_manager = None
 
     # ==========================
     #   CONFIGURACIÓN IMPRESORA
@@ -450,7 +498,13 @@ class BarSystemApp:
     # ==========================
     def show_dashboard(self):
         self.clear_main_container()
+        self.home_dashboard_manager = HomeDashboardManager(self.main_container, self)
+        self._set_active_nav("home")
+
+    def show_indicadores(self):
+        self.clear_main_container()
         self.dashboard_manager = DashboardManager(self.main_container)
+        self._set_active_nav("indicators")
 
     def show_inventory(self):
         # Seguridad extra por si intenta forzar desde código
@@ -462,7 +516,41 @@ class BarSystemApp:
             return
 
         self.clear_main_container()
-        self.inventory_manager = InventoryManager(self.main_container)
+        self.inventory_manager = InventoryManager(self.main_container, app=self)
+        self._set_active_nav("inventory")
+
+    def show_kardex(self):
+        if not self._user_can_manage_inventory():
+            messagebox.showerror(
+                "Acceso denegado",
+                "No tienes permisos para usar el kardex de inventario.",
+            )
+            return
+
+        from image_manager import ImageManager
+        from kardex_manager import KardexPanel
+
+        self.clear_main_container()
+        wrap = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        hdr = ctk.CTkFrame(wrap, fg_color="transparent")
+        hdr.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(
+            hdr,
+            text="Kardex de inventario",
+            font=("Arial", 14, "bold"),
+            text_color="white",
+        ).pack(side="left", padx=4)
+
+        KardexPanel(
+            wrap,
+            self.db,
+            ImageManager(),
+            current_user=self.current_user,
+            on_refresh_products=None,
+        ).pack(fill="both", expand=True)
+        self._set_active_nav("kardex")
 
     def show_facturacion(self):
         self.clear_main_container()
@@ -470,19 +558,21 @@ class BarSystemApp:
             self.main_container,
             current_user=self.current_user
         )
+        self._set_active_nav("facturacion")
 
     def show_reportes(self, default_tab="📊 Ventas"):
         self.clear_main_container()
         self.reportes_manager = MainReportesManager(self.main_container, default_tab=default_tab)
+        self._set_active_nav("reportes")
 
     def show_caja(self):
         self.clear_main_container()
-        # 👉 Al abrir caja, lo manda automáticamente a facturación
         self.caja_manager = CajaManager(
             self.main_container,
             current_user=self.current_user,
-            on_caja_abierta=self.show_facturacion
+            on_caja_abierta=self.show_facturacion,
         )
+        self._set_active_nav("caja")
 
     def show_usuarios(self):
         # Seguridad extra por si acaso
@@ -499,6 +589,7 @@ class BarSystemApp:
             current_user=self.current_user,
             current_role=self.current_role
         )
+        self._set_active_nav("users")
 
     def show_historial_facturas(self):
         self.clear_main_container()
@@ -506,6 +597,7 @@ class BarSystemApp:
             self.main_container,
             current_role=self.current_role
         )
+        self._set_active_nav("historial")
 
     def run(self):
         self.root.mainloop()

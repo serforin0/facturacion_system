@@ -1,0 +1,100 @@
+{
+  "background_color": "#3b8b32",
+  "header_text_color": "#F8FAFC",
+  "card_color": "#FFFFFF",
+  "card_hover_color": "#F1F5F9",
+  "card_text_color": "#312E81",
+  "card_border_color": "#E2E8F0",
+  "card_border_width": 1,
+  "empty_slot_border_color": "#94A3B8",
+  "accent_color": "#4F46E5",
+  "company_name": "Esquina Tropical",
+  "company_subtitle": "Sistema de gestión\nCalle / dirección · Teléfono · Contacto",
+  "footer_hint": "Pulse el botón del módulo que desea abrir",
+  "footer_uppercase": true,
+  "show_hostname": true,
+  "grid_columns": 3,
+  "grid_rows": 4,
+  "modules": [
+    {
+      "id": "facturacion",
+      "label": "Facturación",
+      "icon": "🧾",
+      "image_path": "",
+      "action": "facturacion",
+      "require_role": "",
+      "visible": true,
+      "slot": 0
+    },
+    {
+      "id": "inventario",
+      "label": "Inventario",
+      "icon": "📦",
+      "image_path": "",
+      "action": "inventario",
+      "require_role": "admin",
+      "visible": true,
+      "slot": 1
+    },
+    {
+      "id": "reportes",
+      "label": "Reportes",
+      "icon": "📊",
+      "image_path": "",
+      "action": "reportes",
+      "require_role": "",
+      "visible": true,
+      "slot": 2
+    },
+    {
+      "id": "caja",
+      "label": "Caja",
+      "icon": "💰",
+      "image_path": "",
+      "action": "caja",
+      "require_role": "",
+      "visible": true,
+      "slot": 3
+    },
+    {
+      "id": "historial",
+      "label": "Historial de facturas",
+      "icon": "📜",
+      "image_path": "",
+      "action": "historial_facturas",
+      "require_role": "",
+      "visible": true,
+      "slot": 4
+    },
+    {
+      "id": "usuarios",
+      "label": "Usuarios",
+      "icon": "👤",
+      "image_path": "",
+      "action": "usuarios",
+      "require_role": "admin",
+      "visible": true,
+      "slot": 5
+    },
+    {
+      "id": "impresora",
+      "label": "Impresora",
+      "icon": "🖨️",
+      "image_path": "",
+      "action": "printer",
+      "require_role": "",
+      "visible": true,
+      "slot": 6
+    },
+    {
+      "id": "indicadores",
+      "label": "Indicadores",
+      "icon": "📈",
+      "image_path": "",
+      "action": "indicadores",
+      "require_role": "",
+      "visible": true,
+      "slot": 7
+    }
+  ]
+}
