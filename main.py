@@ -9,7 +9,8 @@ from config_impresion_dialog import open_config_impresion
 from inventory_manager import InventoryManager
 from styles import Styles
 from database import Database
-from factura_manager import FacturaManager              # Módulo de facturación
+from facturacion_erp_manager import FacturacionERPManager
+from factura_manager import FacturaManager              # Módulo de facturación (punto de venta)
 from main_reportes_manager import MainReportesManager   # Módulo general de reportes (Ventas + Inventario)
 from caja_manager import CajaManager                    # Módulo de caja
 from users_manager import UsersManager                  # 🔹 Módulo de gestión de usuarios
@@ -44,6 +45,7 @@ class BarSystemApp:
         self.main_container = None
         self.inventory_manager = None
         self.factura_manager = None
+        self.facturacion_erp_manager = None
         self.reportes_manager = None
         self.caja_manager = None
         self.users_manager = None
@@ -335,6 +337,7 @@ class BarSystemApp:
                 widget.destroy()
         self.inventory_manager = None
         self.factura_manager = None
+        self.facturacion_erp_manager = None
         self.reportes_manager = None
         self.caja_manager = None
         self.users_manager = None
@@ -554,9 +557,11 @@ class BarSystemApp:
 
     def show_facturacion(self):
         self.clear_main_container()
-        self.factura_manager = FacturaManager(
+        self.facturacion_erp_manager = FacturacionERPManager(
             self.main_container,
-            current_user=self.current_user
+            app=self,
+            current_user=self.current_user,
+            current_role=self.current_role,
         )
         self._set_active_nav("facturacion")
 

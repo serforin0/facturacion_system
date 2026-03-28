@@ -1,24 +1,32 @@
 import customtkinter as ctk
-from tkinter import messagebox, ttk
+from tkinter import BooleanVar, messagebox, ttk
 from PIL import Image
 import os
 import sys
 import tempfile
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config_impresion_dialog import open_config_impresion
 from database import Database
+from pos_catalogo_dialog import PosCatalogoDialog
 
 # ITBIS ventas RD (precio en catálogo = base sin ITBIS; el impuesto se suma en factura si aplica)
 TASA_ITBIS = 0.18
 
 
 class FacturaManager:
-    def __init__(self, parent, current_user=None):
+    def __init__(
+        self,
+        parent,
+        current_user=None,
+        duplicar_desde_factura_id: int | None = None,
+    ):
         self.parent = parent
         self.db = Database()
         self.current_user = current_user  # usuario logueado
+        self._duplicar_desde_factura_id = duplicar_desde_factura_id
+        self._cliente_id = None  # maestro clientes; None = mostrador / sin vínculo
 
         # Lista de ítems de la factura: cada uno es un dict
         # {
@@ -65,7 +73,12 @@ class FacturaManager:
         # referencia a la imagen CTkImage actual
         self.product_ctk_image = None
 
+        self.var_imprimir_doc = BooleanVar(value=True)
+        self.var_solo_presupuesto = BooleanVar(value=False)
+
         self._setup_ui()
+        if self._duplicar_desde_factura_id:
+            self._aplicar_duplicado_desde_factura(self._duplicar_desde_factura_id)
 
     # ==========================================
     #               UI
@@ -75,6 +88,113 @@ class FacturaManager:
         # Frame principal del módulo
         main_frame = ctk.CTkFrame(self.parent, fg_color="#2B2B2B")
         main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        emp = self.db.get_empresa_info()
+        nom_emp = (emp.get("nombre") or "Punto de venta").strip()
+        header = ctk.CTkFrame(main_frame, fg_color="#1e3a5f", corner_radius=8)
+        header.pack(fill="x", padx=2, pady=(0, 4))
+        ctk.CTkLabel(
+            header,
+            text=f"Facturación para el cliente (P.V.) — {nom_emp}",
+            font=("Arial", 14, "bold"),
+            text_color="#f8fafc",
+        ).pack(anchor="w", padx=12, pady=(10, 6))
+
+        hf = ctk.CTkFrame(header, fg_color="transparent")
+        hf.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(hf, text="Código cliente:", font=("Arial", 11)).grid(
+            row=0, column=0, sticky="w", padx=4, pady=2
+        )
+        self.entry_codigo_cliente = ctk.CTkEntry(hf, width=150, height=28)
+        self.entry_codigo_cliente.grid(row=0, column=1, padx=4, pady=2)
+        self.entry_codigo_cliente.insert(0, "MOSTRADOR")
+
+        ctk.CTkLabel(hf, text="Emisión:", font=("Arial", 11)).grid(
+            row=0, column=2, sticky="w", padx=(14, 4), pady=2
+        )
+        self.lbl_fecha_emision = ctk.CTkLabel(
+            hf, text=datetime.now().strftime("%d/%m/%Y"), font=("Arial", 11)
+        )
+        self.lbl_fecha_emision.grid(row=0, column=3, sticky="w", padx=4, pady=2)
+
+        ctk.CTkLabel(hf, text="Vendedor:", font=("Arial", 11)).grid(
+            row=0, column=4, sticky="w", padx=(14, 4), pady=2
+        )
+        self.lbl_vendedor_caja = ctk.CTkLabel(
+            hf, text=(self.current_user or "—"), font=("Arial", 11)
+        )
+        self.lbl_vendedor_caja.grid(row=0, column=5, sticky="w", padx=4, pady=2)
+
+        ctk.CTkButton(
+            hf,
+            text="Cliente…",
+            width=88,
+            height=28,
+            fg_color="#334155",
+            command=self._abrir_dialogo_cliente,
+        ).grid(row=0, column=6, padx=4, pady=2)
+        ctk.CTkButton(
+            hf,
+            text="Catálogo",
+            width=88,
+            height=28,
+            fg_color="#475569",
+            command=self._abrir_catalogo,
+        ).grid(row=0, column=7, padx=4, pady=2)
+
+        ctk.CTkLabel(hf, text="Condición pago:", font=("Arial", 11)).grid(
+            row=1, column=0, sticky="w", padx=4, pady=2
+        )
+        self._condicion_label_to_id: dict[str, int | None] = {}
+        cond_rows = self.db.list_condiciones_pago()
+        labels_cond = [f"{r[2]} ({r[1]})" for r in cond_rows]
+        self._condicion_label_to_id = {
+            f"{r[2]} ({r[1]})": int(r[0]) for r in cond_rows
+        }
+        if not labels_cond:
+            labels_cond = ["— Sin condiciones en catálogo —"]
+            self._condicion_label_to_id[labels_cond[0]] = None
+        self.combo_condicion_pago = ctk.CTkComboBox(
+            hf,
+            values=labels_cond,
+            width=240,
+            height=28,
+        )
+        self.combo_condicion_pago.set(labels_cond[0])
+        self.combo_condicion_pago.grid(row=1, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+
+        ctk.CTkLabel(hf, text="Comprobante:", font=("Arial", 11)).grid(
+            row=1, column=3, sticky="w", padx=(14, 4), pady=2
+        )
+        self.combo_tipo_comprobante = ctk.CTkComboBox(
+            hf,
+            values=[
+                "Consumidor final",
+                "Crédito fiscal",
+                "Gubernamental",
+                "Especial",
+            ],
+            width=160,
+            height=28,
+        )
+        self.combo_tipo_comprobante.set("Consumidor final")
+        self.combo_tipo_comprobante.grid(row=1, column=4, sticky="w", padx=4, pady=2)
+
+        ctk.CTkLabel(hf, text="RNC / Doc.:", font=("Arial", 11)).grid(
+            row=1, column=5, sticky="w", padx=(14, 4), pady=2
+        )
+        self.entry_rnc_cliente = ctk.CTkEntry(
+            hf, width=140, height=28, placeholder_text="Opcional"
+        )
+        self.entry_rnc_cliente.grid(row=1, column=6, sticky="w", padx=4, pady=2)
+
+        ctk.CTkCheckBox(
+            header,
+            text="Solo presupuesto (reserva precios; el inventario se mueve al confirmar la venta en el listado)",
+            variable=self.var_solo_presupuesto,
+            font=("Arial", 11),
+            text_color="#e2e8f0",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
 
         top_cfg = ctk.CTkFrame(main_frame, fg_color="transparent")
         top_cfg.pack(fill="x", padx=6, pady=(4, 0))
@@ -364,6 +484,13 @@ class FacturaManager:
         )
         btn_finalizar.grid(row=0, column=2, rowspan=3, padx=6, pady=4, sticky="e")
 
+        ctk.CTkCheckBox(
+            totales_frame,
+            text="Imprimir documento",
+            variable=self.var_imprimir_doc,
+            font=("Arial", 11),
+        ).grid(row=3, column=0, columnspan=2, padx=6, pady=4, sticky="w")
+
         btn_desc_global = ctk.CTkButton(
             totales_frame,
             text="🛈 Desc. global",
@@ -371,7 +498,7 @@ class FacturaManager:
             width=140,
             command=self._abrir_descuento_global_dialog
         )
-        btn_desc_global.grid(row=3, column=0, padx=6, pady=4, sticky="w")
+        btn_desc_global.grid(row=4, column=0, padx=6, pady=4, sticky="w")
 
         totales_frame.grid_columnconfigure(0, weight=1)
         totales_frame.grid_columnconfigure(1, weight=0)
@@ -380,6 +507,167 @@ class FacturaManager:
     # ==========================================
     #               LÓGICA
     # ==========================================
+
+    def _condicion_pago_id_actual(self) -> int | None:
+        lab = self.combo_condicion_pago.get()
+        return self._condicion_label_to_id.get(lab)
+
+    def _fecha_vencimiento_iso(self) -> str | None:
+        cid = self._condicion_pago_id_actual()
+        if cid is None:
+            return None
+        row = self.db.get_condicion_pago(cid)
+        if not row:
+            return None
+        _i, _c, _n, dias, es_cont = row
+        if int(es_cont or 1):
+            return None
+        d = datetime.now().date() + timedelta(days=int(dias or 0))
+        return d.isoformat()
+
+    def _resolver_cliente_id(self) -> int | None:
+        if self._cliente_id is not None:
+            return self._cliente_id
+        cod = (self.entry_codigo_cliente.get() or "").strip()
+        if not cod or cod.upper() == "MOSTRADOR":
+            return None
+        conn = self.db.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id FROM clientes
+            WHERE TRIM(IFNULL(documento,'')) = ? OR TRIM(nombre) = ?
+            LIMIT 1
+            """,
+            (cod, cod),
+        )
+        r = cur.fetchone()
+        conn.close()
+        return int(r[0]) if r else None
+
+    def _abrir_catalogo(self):
+        PosCatalogoDialog(
+            self.parent.winfo_toplevel(),
+            self.db,
+            self._on_catalogo_producto,
+        )
+
+    def _on_catalogo_producto(self, pid: int):
+        self.entry_buscar.delete(0, "end")
+        self.entry_buscar.insert(0, str(pid))
+        self.buscar_producto()
+
+    def _abrir_dialogo_cliente(self):
+        top = ctk.CTkToplevel(self.parent.winfo_toplevel())
+        top.title("Clientes")
+        top.geometry("580x440")
+        top.transient(self.parent.winfo_toplevel())
+        top.grab_set()
+
+        bar = ctk.CTkFrame(top, fg_color="#1e293b")
+        bar.pack(fill="x", padx=8, pady=8)
+        ent = ctk.CTkEntry(bar, width=220, placeholder_text="Nombre o documento")
+        ent.pack(side="left", padx=4)
+
+        fr = ctk.CTkFrame(top, fg_color="#0f172a")
+        fr.pack(fill="both", expand=True, padx=8, pady=4)
+        cols = ("id", "nombre", "doc", "tel")
+        tree = ttk.Treeview(fr, columns=cols, show="headings", height=14)
+        for c, t, w in (
+            ("id", "Id", 44),
+            ("nombre", "Nombre", 240),
+            ("doc", "Documento", 120),
+            ("tel", "Teléfono", 100),
+        ):
+            tree.heading(c, text=t)
+            tree.column(c, width=w)
+        sy = ttk.Scrollbar(fr, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sy.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sy.pack(side="right", fill="y")
+
+        def cargar(q: str = ""):
+            for i in tree.get_children():
+                tree.delete(i)
+            for r in self.db.buscar_clientes(q, 100):
+                tree.insert(
+                    "",
+                    "end",
+                    values=(r[0], r[1], r[2] or "", r[3] or ""),
+                )
+
+        def buscar():
+            cargar(ent.get().strip())
+
+        ctk.CTkButton(bar, text="Buscar", width=80, command=buscar).pack(
+            side="left", padx=4
+        )
+        ent.bind("<Return>", lambda e: buscar())
+        cargar()
+
+        def usar_sel():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("Cliente", "Seleccione una fila.", parent=top)
+                return
+            vals = tree.item(sel[0], "values")
+            cid = int(vals[0])
+            self._cliente_id = cid
+            doc = (vals[2] or "").strip()
+            nom = (vals[1] or "").strip()
+            self.entry_codigo_cliente.delete(0, "end")
+            self.entry_codigo_cliente.insert(0, doc or nom or str(cid))
+            self.entry_rnc_cliente.delete(0, "end")
+            if doc:
+                self.entry_rnc_cliente.insert(0, doc)
+            top.destroy()
+
+        tree.bind("<Double-1>", lambda e: usar_sel())
+
+        def alta_rapida():
+            d = ctk.CTkToplevel(top)
+            d.title("Cliente rápido")
+            d.geometry("360x200")
+            d.transient(top)
+            d.grab_set()
+            ctk.CTkLabel(d, text="Nombre").pack(anchor="w", padx=12, pady=(12, 2))
+            e_n = ctk.CTkEntry(d, width=300)
+            e_n.pack(padx=12)
+            ctk.CTkLabel(d, text="Documento (opcional)").pack(anchor="w", padx=12, pady=(8, 2))
+            e_doc = ctk.CTkEntry(d, width=300)
+            e_doc.pack(padx=12)
+
+            def ok():
+                nom = (e_n.get() or "").strip()
+                if len(nom) < 2:
+                    messagebox.showwarning("Cliente", "Indique el nombre.", parent=d)
+                    return
+                doc = (e_doc.get() or "").strip() or None
+                cid = self.db.crear_cliente_rapido(nom, doc, None)
+                self._cliente_id = int(cid)
+                self.entry_codigo_cliente.delete(0, "end")
+                self.entry_codigo_cliente.insert(0, (doc or nom)[:48])
+                self.entry_rnc_cliente.delete(0, "end")
+                if doc:
+                    self.entry_rnc_cliente.insert(0, doc)
+                d.destroy()
+                top.destroy()
+
+            ctk.CTkButton(d, text="Crear y usar", fg_color="#059669", command=ok).pack(
+                pady=16
+            )
+
+        bf = ctk.CTkFrame(top, fg_color="transparent")
+        bf.pack(fill="x", pady=8)
+        ctk.CTkButton(
+            bf, text="Usar selección", fg_color="#2563eb", command=usar_sel
+        ).pack(side="left", padx=8)
+        ctk.CTkButton(bf, text="Alta rápida…", fg_color="#475569", command=alta_rapida).pack(
+            side="left", padx=4
+        )
+        ctk.CTkButton(bf, text="Cerrar", fg_color="#64748b", command=top.destroy).pack(
+            side="left", padx=4
+        )
 
     def _parse_precio(self, precio):
         """Convierte el precio a float, aunque venga como 'RD$ 120.00'."""
@@ -616,6 +904,49 @@ class FacturaManager:
             except Exception:
                 pass
             self.product_image_label.image = None
+
+    def _aplicar_duplicado_desde_factura(self, factura_id: int):
+        data = self.db.get_factura_para_duplicar(factura_id)
+        top = self.parent.winfo_toplevel()
+        if not data:
+            messagebox.showwarning(
+                "Duplicar",
+                "No se puede duplicar: el documento debe tener líneas con producto asociado.",
+                parent=top,
+            )
+            return
+        self._cliente_id = data.get("cliente_id")
+        self.factura_items.clear()
+        for ln in data["lines"]:
+            cant = float(ln["cantidad"])
+            precio = float(ln["precio_unitario"])
+            desc = float(ln["descuento_item"])
+            subtotal_bruto = precio * cant
+            subtotal_neto = subtotal_bruto - desc
+            imp = float(ln["impuesto_item"])
+            total_linea = float(ln["total_linea"])
+            aplica = imp > 0.001
+            item = {
+                "id": ln["producto_id"],
+                "nombre": ln["descripcion"],
+                "cantidad": cant,
+                "precio": precio,
+                "descuento": desc,
+                "subtotal_bruto": subtotal_bruto,
+                "subtotal_neto": subtotal_neto,
+                "aplica_itbis": aplica,
+                "impuesto_item": imp,
+                "total_linea": total_linea,
+            }
+            self.factura_items.append(item)
+        self.entry_codigo_cliente.delete(0, "end")
+        self.entry_codigo_cliente.insert(0, data["cliente_codigo"])
+        self.combo_tipo_comprobante.set(data["comprobante_label"])
+        self.entry_rnc_cliente.delete(0, "end")
+        doc = data.get("documento_cliente") or ""
+        if doc:
+            self.entry_rnc_cliente.insert(0, doc)
+        self._recalcular_totales_y_refrescar()
 
     # ---------- PROMOCIONES / DESCUENTOS AUTOMÁTICOS ----------
 
@@ -1176,6 +1507,10 @@ class FacturaManager:
             messagebox.showerror("Error", "Total de la factura inválido.")
             return
 
+        if self.var_solo_presupuesto.get():
+            self._guardar_presupuesto()
+            return
+
         self._mostrar_dialogo_pago()
 
     def _mostrar_dialogo_pago(self):
@@ -1286,7 +1621,9 @@ class FacturaManager:
                 pagos.append({"tipo": "transferencia", "monto": trf})
 
             dlg.destroy()
-            self._guardar_y_imprimir_factura(pagos)
+            self._guardar_y_imprimir_factura(
+                pagos, imprimir=bool(self.var_imprimir_doc.get())
+            )
 
         ctk.CTkButton(
             btn_frame,
@@ -1350,6 +1687,23 @@ class FacturaManager:
         lines.append(f"Fecha : {fecha}")
         if usuario:
             lines.append(f"Cajero: {usuario}")
+        cod_cli = ""
+        if getattr(self, "entry_codigo_cliente", None) is not None:
+            cod_cli = (self.entry_codigo_cliente.get() or "").strip()
+        if cod_cli:
+            lines.append(f"Cliente: {cod_cli[:ticket_width]}")
+        if getattr(self, "combo_condicion_pago", None) is not None:
+            term = (self.combo_condicion_pago.get() or "").strip()
+            if term:
+                lines.append(f"Condición: {term[:ticket_width]}")
+        if getattr(self, "combo_tipo_comprobante", None) is not None:
+            comp = (self.combo_tipo_comprobante.get() or "").strip()
+            if comp:
+                lines.append(f"Comprobante: {comp[:ticket_width]}")
+        if getattr(self, "entry_rnc_cliente", None) is not None:
+            rnc = (self.entry_rnc_cliente.get() or "").strip()
+            if rnc:
+                lines.append(f"RNC/Doc: {rnc[:ticket_width]}")
         lines.append(sep())
 
         # -----------------------------------
@@ -1506,7 +1860,95 @@ class FacturaManager:
     #          GUARDAR FACTURA + GENERAR TICKET
     # ================================================
 
-    def _guardar_y_imprimir_factura(self, pagos):
+    def _guardar_presupuesto(self):
+        """Cotización en BD sin movimiento de inventario ni cobros."""
+        numero = f"P-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        conn = None
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+
+            descuento_total = self.descuentos_items_total + self.descuento_global_monto
+
+            lbl_comp = (self.combo_tipo_comprobante.get() or "").lower()
+            if "gubernamental" in lbl_comp:
+                tipo_comp_db = "gubernamental"
+            elif "especial" in lbl_comp:
+                tipo_comp_db = "especial"
+            elif "crédito" in lbl_comp or "credito" in lbl_comp:
+                tipo_comp_db = "credito_fiscal"
+            else:
+                tipo_comp_db = "consumidor_final"
+
+            cursor.execute(
+                """
+                INSERT INTO facturas
+                    (numero, tipo_comprobante, cliente_id, subtotal,
+                     descuento_total, impuesto_total, total, estado, usuario, caja,
+                     condicion_pago_id, fecha_vencimiento, moneda, tasa_cambio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'cotizacion', ?, ?, ?, ?, 'DOP', 1.0)
+                """,
+                (
+                    numero,
+                    tipo_comp_db,
+                    self._resolver_cliente_id(),
+                    round(self.subtotal_total, 2),
+                    round(descuento_total, 2),
+                    round(self.impuestos_total, 2),
+                    round(self.total_factura, 2),
+                    self.current_user,
+                    None,
+                    self._condicion_pago_id_actual(),
+                    self._fecha_vencimiento_iso(),
+                ),
+            )
+            factura_id = cursor.lastrowid
+
+            for item in self.factura_items:
+                cursor.execute(
+                    """
+                    INSERT INTO factura_detalle
+                        (factura_id, producto_id, descripcion, cantidad,
+                         precio_unitario, descuento_item, impuesto_item, total_linea)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        factura_id,
+                        item["id"],
+                        item["nombre"],
+                        item["cantidad"],
+                        item["precio"],
+                        round(item["descuento"], 2),
+                        round(float(item.get("impuesto_item") or 0), 2),
+                        round(float(item.get("total_linea") or item["subtotal_neto"]), 2),
+                    ),
+                )
+
+            conn.commit()
+            conn.close()
+
+            messagebox.showinfo(
+                "Presupuesto",
+                f"Presupuesto {numero} guardado. Confirme la venta desde el listado "
+                "(Pagar documento) cuando el cliente cierre.",
+            )
+            self.factura_items.clear()
+            self._cliente_id = None
+            self.var_solo_presupuesto.set(False)
+            self._recalcular_totales_y_refrescar()
+        except Exception as e:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            messagebox.showerror("Error", f"No se pudo guardar el presupuesto:\n{e}")
+
+    def _guardar_y_imprimir_factura(self, pagos, imprimir: bool = True):
         numero = self._generar_numero_factura()
 
         try:
@@ -1515,25 +1957,38 @@ class FacturaManager:
 
             descuento_total = self.descuentos_items_total + self.descuento_global_monto
 
+            lbl_comp = (self.combo_tipo_comprobante.get() or "").lower()
+            if "gubernamental" in lbl_comp:
+                tipo_comp_db = "gubernamental"
+            elif "especial" in lbl_comp:
+                tipo_comp_db = "especial"
+            elif "crédito" in lbl_comp or "credito" in lbl_comp:
+                tipo_comp_db = "credito_fiscal"
+            else:
+                tipo_comp_db = "consumidor_final"
+
             # Guardar encabezado
             cursor.execute(
                 """
                 INSERT INTO facturas
                     (numero, tipo_comprobante, cliente_id, subtotal,
-                     descuento_total, impuesto_total, total, estado, usuario, caja)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     descuento_total, impuesto_total, total, estado, usuario, caja,
+                     condicion_pago_id, fecha_vencimiento, moneda, tasa_cambio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DOP', 1.0)
                 """,
                 (
                     numero,
-                    "consumidor_final",
-                    None,
+                    tipo_comp_db,
+                    self._resolver_cliente_id(),
                     round(self.subtotal_total, 2),
                     round(descuento_total, 2),
                     round(self.impuestos_total, 2),
                     round(self.total_factura, 2),
                     "emitida",
                     self.current_user,
-                    None
+                    None,
+                    self._condicion_pago_id_actual(),
+                    self._fecha_vencimiento_iso(),
                 )
             )
 
@@ -1672,11 +2127,18 @@ class FacturaManager:
             except Exception as e:
                 print("Error guardando ticket en carpeta 'facturas':", e)
 
-            # ✅ Enviar a la impresora (RAW/ESC-POS)
-            self._send_to_printer(ticket_text)
+            # Enviar a la impresora si el usuario lo solicitó
+            if imprimir:
+                self._send_to_printer(ticket_text)
+            else:
+                messagebox.showinfo(
+                    "Factura guardada",
+                    f"Factura {numero} guardada. No se envió a imprimir.",
+                )
 
             # limpiar la factura en pantalla
             self.factura_items.clear()
+            self._cliente_id = None
             self._recalcular_totales_y_refrescar()
 
         except Exception as e:

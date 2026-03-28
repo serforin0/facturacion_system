@@ -4,6 +4,182 @@ from datetime import datetime
 from database import Database
 
 
+def calcular_totales_desde_apertura(db: Database, fecha_apertura: str) -> tuple[float, float, float, float]:
+    """
+    Total ventas y desglose por forma de pago desde fecha_apertura (pagos en facturas emitidas).
+    """
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT p.tipo_pago, SUM(p.monto)
+        FROM pagos_factura p
+        JOIN facturas f ON f.id = p.factura_id
+        WHERE f.estado = 'emitida'
+          AND datetime(f.fecha) >= datetime(?)
+        GROUP BY p.tipo_pago
+        """,
+        (fecha_apertura,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    total_ventas = 0.0
+    efectivo = 0.0
+    tarjeta = 0.0
+    otros = 0.0
+
+    for tipo_pago, monto in rows:
+        monto = float(monto or 0)
+        total_ventas += monto
+        t = (tipo_pago or "").lower()
+        if t == "efectivo":
+            efectivo += monto
+        elif "tarjeta" in t:
+            tarjeta += monto
+        else:
+            otros += monto
+
+    return total_ventas, efectivo, tarjeta, otros
+
+
+def ejecutar_cierre_caja_desde_fila(
+    db: Database,
+    caja_abierta: tuple,
+    efectivo_contado: float,
+    observaciones: str | None,
+    *,
+    usuario_cierre_display: str | None = None,
+    usuario_sesion: str | None = None,
+    parent=None,
+) -> tuple[bool, str]:
+    """
+    Cierra el turno de caja (misma lógica que el módulo Caja).
+    Retorna (True, mensaje_resumen) si cerró correctamente.
+    (False, \"\") si el usuario canceló ante un descuadre.
+    (False, mensaje) si hubo error o validación.
+    """
+    (
+        cid,
+        nombre_caja,
+        fecha_ap,
+        _fecha_ci,
+        _u_apertura,
+        _u_cierre,
+        monto_inicial,
+        _total_ventas_guardado,
+        _total_ef_guardado,
+        _total_tar_guardado,
+        _total_otros_guardado,
+        _ef_contado_prev,
+        _diff_prev,
+        _obs_prev,
+        _estado,
+    ) = caja_abierta
+
+    usuario_cierre_db = (
+        (usuario_cierre_display or "").strip()
+        or (usuario_sesion or "").strip()
+        or "—"
+    )
+
+    obs = (observaciones or "").strip() or None
+
+    total_ventas, ef_sis, tar_sis, otros_sis = calcular_totales_desde_apertura(
+        db, fecha_ap
+    )
+    efectivo_sistema_total = ef_sis + float(monto_inicial or 0)
+    diferencia = efectivo_contado - efectivo_sistema_total
+    tolerance = 0.01
+
+    if abs(diferencia) > tolerance:
+        if diferencia < 0:
+            texto_diff = f"FALTAN RD$ {abs(diferencia):.2f} en caja."
+        else:
+            texto_diff = f"SOBRAN RD$ {abs(diferencia):.2f} en caja."
+
+        msg = (
+            "La caja NO CUADRA.\n\n"
+            f"{texto_diff}\n\n"
+            f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
+            f"Efectivo contado: RD$ {efectivo_contado:.2f}\n\n"
+            "¿Deseas cerrar la caja de todos modos?"
+        )
+        if not messagebox.askyesno("Caja no cuadrada", msg, parent=parent):
+            return False, ""
+
+        if not obs:
+            return (
+                False,
+                "Para cerrar con descuadre debe indicar una observación "
+                "(p. ej. faltó dinero, error de conteo).",
+            )
+    else:
+        if not obs:
+            obs = None
+        diferencia = 0.0
+
+    fecha_cierre = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE cierres_caja
+        SET fecha_cierre = ?,
+            usuario_cierre = ?,
+            total_ventas = ?,
+            total_efectivo_sistema = ?,
+            total_tarjeta_sistema = ?,
+            total_otros_sistema = ?,
+            efectivo_contado = ?,
+            diferencia_efectivo = ?,
+            observaciones = ?,
+            estado = 'cerrado'
+        WHERE id = ?
+        """,
+        (
+            fecha_cierre,
+            usuario_cierre_db,
+            total_ventas,
+            ef_sis,
+            tar_sis,
+            otros_sis,
+            efectivo_contado,
+            diferencia,
+            obs,
+            cid,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    if abs(diferencia) <= tolerance:
+        msg = (
+            f"Caja '{nombre_caja}' cerrada y CUADRADA.\n\n"
+            f"Total ventas (sistema): RD$ {total_ventas:.2f}\n"
+            f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
+            f"Efectivo contado: RD$ {efectivo_contado:.2f}\n"
+            f"Diferencia: RD$ 0.00"
+        )
+    else:
+        if diferencia < 0:
+            texto_diff = f"FALTARON RD$ {abs(diferencia):.2f}."
+        else:
+            texto_diff = f"SOBRARON RD$ {abs(diferencia):.2f}."
+        msg = (
+            f"Caja '{nombre_caja}' cerrada con DESCUADRE.\n\n"
+            f"Total ventas (sistema): RD$ {total_ventas:.2f}\n"
+            f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
+            f"Efectivo contado: RD$ {efectivo_contado:.2f}\n"
+            f"Diferencia: RD$ {diferencia:.2f}\n\n"
+            f"{texto_diff}\n"
+            f"Observación: {obs or '(sin observación)'}"
+        )
+
+    return True, msg
+
+
 class CajaManager:
     def __init__(self, parent, current_user=None, on_caja_abierta=None):
         self.parent = parent
@@ -330,51 +506,7 @@ class CajaManager:
             self.frame_caja_abierta.pack(fill="x", padx=5, pady=(0, 5))
 
     def _calcular_totales_desde_apertura(self, fecha_apertura: str):
-        """
-        Calcula:
-        - total ventas
-        - total efectivo sistema
-        - total tarjeta sistema
-        - total otros sistema
-        desde la fecha_apertura hasta ahora, usando pagos_factura.
-        """
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-
-        # Agrupar por tipo_pago para soportar pagos mixtos
-        cursor.execute(
-            """
-            SELECT p.tipo_pago, SUM(p.monto)
-            FROM pagos_factura p
-            JOIN facturas f ON f.id = p.factura_id
-            WHERE f.estado = 'emitida'
-              AND datetime(f.fecha) >= datetime(?)
-            GROUP BY p.tipo_pago
-            """,
-            (fecha_apertura,)
-        )
-        rows = cursor.fetchall()
-        conn.close()
-
-        total_ventas = 0.0
-        efectivo = 0.0
-        tarjeta = 0.0
-        otros = 0.0
-
-        for tipo_pago, monto in rows:
-            monto = float(monto or 0)
-            total_ventas += monto
-
-            t = (tipo_pago or "").lower()
-            if t == "efectivo":
-                efectivo += monto
-            elif "tarjeta" in t:
-                tarjeta += monto
-            else:
-                # incluye transferencias, créditos, etc.
-                otros += monto
-
-        return total_ventas, efectivo, tarjeta, otros
+        return calcular_totales_desde_apertura(self.db, fecha_apertura)
 
     def abrir_caja(self):
         """Abre una nueva caja si no hay otra abierta."""
@@ -455,128 +587,26 @@ class CajaManager:
 
         observaciones = self.txt_observaciones.get("0.0", "end").strip()
 
-        (
-            cid, nombre_caja, fecha_ap, fecha_ci,
-            u_apertura, u_cierre,
-            monto_inicial, total_ventas_guardado,
-            total_ef_guardado, total_tar_guardado,
-            total_otros_guardado, ef_contado_prev,
-            diff_prev, obs_prev, estado
-        ) = self.caja_abierta
-
-        # Calcular totales finales (desde apertura hasta ahora)
-        total_ventas, ef_sis, tar_sis, otros_sis = self._calcular_totales_desde_apertura(fecha_ap)
-
-        # Lo esperado en efectivo es:
-        # efectivo sistema + monto inicial (fondo)
-        efectivo_sistema_total = ef_sis + float(monto_inicial or 0)
-        diferencia = efectivo_contado - efectivo_sistema_total
-
-        # Tolerancia mínima para considerar 0 (por redondeos)
-        tolerance = 0.01
-
-        # Si NO cuadra, primero avisar y no cerrar directamente
-        if abs(diferencia) > tolerance:
-            if diferencia < 0:
-                texto_diff = f"FALTAN RD$ {abs(diferencia):.2f} en caja."
-            else:
-                texto_diff = f"SOBRAN RD$ {abs(diferencia):.2f} en caja."
-
-            msg = (
-                "La caja NO CUADRA.\n\n"
-                f"{texto_diff}\n\n"
-                f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
-                f"Efectivo contado: RD$ {efectivo_contado:.2f}\n\n"
-                "¿Deseas cerrar la caja de todos modos?"
-            )
-            cerrar_igual = messagebox.askyesno("Caja no cuadrada", msg)
-
-            if not cerrar_igual:
-                # Usuario decidió NO cerrar hasta cuadrar manualmente
-                return
-
-            # Si decide cerrar con descuadre, forzar observación
-            if not observaciones:
-                messagebox.showerror(
-                    "Observación requerida",
-                    "Para cerrar la caja con descuadre debes indicar una observación\n"
-                    "(por ejemplo: 'faltó dinero', 'error de conteo', etc.)."
-                )
-                return
-        else:
-            # Si cuadra, podemos dejar observaciones vacías (se guarda como NULL)
-            if not observaciones:
-                observaciones = None
-            diferencia = 0.0  # normalizar
-
-        fecha_cierre = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            UPDATE cierres_caja
-            SET fecha_cierre = ?,
-                usuario_cierre = ?,
-                total_ventas = ?,
-                total_efectivo_sistema = ?,
-                total_tarjeta_sistema = ?,
-                total_otros_sistema = ?,
-                efectivo_contado = ?,
-                diferencia_efectivo = ?,
-                observaciones = ?,
-                estado = 'cerrado'
-            WHERE id = ?
-            """,
-            (
-                fecha_cierre,
-                self.current_user,
-                total_ventas,
-                ef_sis,
-                tar_sis,
-                otros_sis,
-                efectivo_contado,
-                diferencia,
-                observaciones,
-                cid
-            )
+        parent = self.parent.winfo_toplevel() if self.parent else None
+        ok, msg = ejecutar_cierre_caja_desde_fila(
+            self.db,
+            self.caja_abierta,
+            efectivo_contado,
+            observaciones,
+            usuario_cierre_display=None,
+            usuario_sesion=self.current_user,
+            parent=parent,
         )
+        if not ok:
+            if msg:
+                messagebox.showerror("Cierre de caja", msg, parent=parent)
+            return
 
-        conn.commit()
-        conn.close()
+        messagebox.showinfo("Caja cerrada", msg, parent=parent)
 
-        # Mensaje resumen de cierre
-        if abs(diferencia) <= tolerance:
-            msg = (
-                f"Caja '{nombre_caja}' cerrada y CUADRADA.\n\n"
-                f"Total ventas (sistema): RD$ {total_ventas:.2f}\n"
-                f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
-                f"Efectivo contado: RD$ {efectivo_contado:.2f}\n"
-                f"Diferencia: RD$ 0.00"
-            )
-        else:
-            if diferencia < 0:
-                texto_diff = f"FALTARON RD$ {abs(diferencia):.2f}."
-            else:
-                texto_diff = f"SOBRARON RD$ {abs(diferencia):.2f}."
-            msg = (
-                f"Caja '{nombre_caja}' cerrada con DESCUADRE.\n\n"
-                f"Total ventas (sistema): RD$ {total_ventas:.2f}\n"
-                f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
-                f"Efectivo contado: RD$ {efectivo_contado:.2f}\n"
-                f"Diferencia: RD$ {diferencia:.2f}\n\n"
-                f"{texto_diff}\n"
-                f"Observación: {observaciones or '(sin observación)'}"
-            )
-
-        messagebox.showinfo("Caja cerrada", msg)
-
-        # Limpiar entradas de cierre
         self.entry_efectivo_contado.delete(0, "end")
         self.txt_observaciones.delete("0.0", "end")
 
-        # Recargar estado y historial
         self._load_estado_caja()
         self._load_historial()
 

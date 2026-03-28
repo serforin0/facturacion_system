@@ -1,0 +1,5 @@
+# Grupo, documento_cliente (RNC/cédula), codigo_producto, cantidad
+# Cliente 88877766601 debe existir (seed_flujos_facturacion.py)
+1,88877766601,TST-FLW-01,3
+1,88877766601,TST-FLW-02,2
+2,88877766601,TST-FLW-01,1

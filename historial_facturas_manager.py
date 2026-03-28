@@ -349,90 +349,9 @@ class HistorialFacturasManager:
 
     def _generar_ticket_desde_bd(self, factura_id):
         """
-        Vuelve a construir el ticket usando la misma lógica que FacturaManager,
-        leyendo datos de facturas + factura_detalle.
+        Vuelve a construir el ticket usando la misma lógica central en Database.
         """
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-
-        # Encabezado
-        cursor.execute("""
-            SELECT numero, fecha, subtotal, descuento_total, total, usuario
-            FROM facturas
-            WHERE id = ?
-        """, (factura_id,))
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return None
-
-        numero, fecha, subtotal, descuento_total, total, usuario = row
-
-        # Detalles
-        cursor.execute("""
-            SELECT descripcion, cantidad, precio_unitario, total_linea
-            FROM factura_detalle
-            WHERE factura_id = ?
-        """, (factura_id,))
-        detalles = cursor.fetchall()
-        conn.close()
-
-        # Subtotal bruto = subtotal neto + descuento_total
-        subtotal_bruto = float(subtotal) + float(descuento_total)
-
-        # ancho de ticket desde config
-        ticket_width = self.db.get_ticket_width()
-        lines = []
-
-        def center(text):
-            return text.center(ticket_width)
-
-        def sep(char="-"):
-            return char * ticket_width
-
-        # Encabezado
-        lines.append(center("ESQUINA TROPICAL"))
-        lines.append(center("RNC: N/A"))
-        lines.append(center("Tel: N/A"))
-        lines.append(sep())
-        lines.append(f"Factura: {numero}")
-        lines.append(f"Fecha : {fecha}")
-        if usuario:
-            lines.append(f"Cajero: {usuario}")
-        lines.append(sep())
-
-        # Detalles
-        lines.append("DESCRIPCIÓN")
-        lines.append("CANT x P.U" + " " * (ticket_width - len("CANT x P.U") - 7) + "IMPORTE")
-        lines.append(sep())
-
-        for desc, cant, pu, total_linea in detalles:
-            desc = str(desc)
-            # cortar descripción si excede el ancho
-            while len(desc) > ticket_width:
-                lines.append(desc[:ticket_width])
-                desc = desc[ticket_width:]
-            if desc:
-                lines.append(desc)
-
-            left = f"{cant:.2f} x {pu:.2f}"
-            right = f"{total_linea:.2f}"
-
-            spaces = ticket_width - len(left) - len(right)
-            if spaces < 1:
-                spaces = 1
-            lines.append(left + " " * spaces + right)
-
-        # Totales
-        lines.append(sep())
-        lines.append(f"SUBTOTAL:".ljust(ticket_width - 10) + f"{subtotal_bruto:10.2f}")
-        lines.append(f"DESCUENTO:".ljust(ticket_width - 10) + f"{descuento_total:10.2f}")
-        lines.append(f"TOTAL:".ljust(ticket_width - 10) + f"{total:10.2f}")
-        lines.append(sep())
-        lines.append(center("GRACIAS POR SU COMPRA"))
-        lines.append("\n\n\n")
-
-        return "\n".join(lines)
+        return self.db.generar_ticket_texto_factura(factura_id)
 
     # ==============================
     #   VER TICKET EN VENTANA

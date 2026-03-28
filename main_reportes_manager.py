@@ -2,6 +2,7 @@ import customtkinter as ctk
 
 from config_impresion_dialog import open_config_impresion
 from database import Database
+from reporte_facturas_historial_manager import ReporteFacturasHistorialManager
 from reporte_inventario_manager import ReporteInventarioManager
 from reporte_ventas_manager import ReporteVentasManager
 
@@ -16,6 +17,7 @@ class MainReportesManager:
 
         # Referencias a los módulos hijos
         self.reporte_ventas = None
+        self.reporte_facturas_hist = None
         self.reporte_inventario = None
 
         self._setup_ui()
@@ -49,13 +51,15 @@ class MainReportesManager:
         
         # Agregar pestañas
         self.tabview.add("📊 Ventas")
+        self.tabview.add("📄 Historial de facturas")
         self.tabview.add("📦 Valorización de Inventario")
-        
-        # Instanciar el Reporte de Ventas en la primera pestaña
+
         tab_ventas = self.tabview.tab("📊 Ventas")
         self.reporte_ventas = ReporteVentasManager(tab_ventas)
-        
-        # Instanciar la Valorización de Inventario en la segunda pestaña
+
+        tab_hist = self.tabview.tab("📄 Historial de facturas")
+        self.reporte_facturas_hist = ReporteFacturasHistorialManager(tab_hist)
+
         tab_inventario = self.tabview.tab("📦 Valorización de Inventario")
         self.reporte_inventario = ReporteInventarioManager(tab_inventario)
 

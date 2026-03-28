@@ -393,6 +393,8 @@ class Database:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_movimientos_producto ON movimientos_inventario(producto_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_movimientos_factura ON movimientos_inventario(factura_id)")
         self._migrate_movimientos_kardex(cursor)
+        self._migrate_facturas_anulacion(cursor)
+        self._migrate_facturacion_extendida(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pagos_factura_factura ON pagos_factura(factura_id)")
 
         # =========================
@@ -525,6 +527,73 @@ class Database:
                 "INSERT INTO proveedores (nombre, activo) VALUES (?, 1)",
                 ("(Sin proveedor asignado)",),
             )
+
+    def _migrate_facturas_anulacion(self, cursor):
+        """Motivo y auditoría de anulación (estilo MONICA)."""
+        cursor.execute("PRAGMA table_info(facturas)")
+        cols = {row[1] for row in cursor.fetchall()}
+        specs = [
+            ("anulacion_motivo", "TEXT"),
+            ("anulacion_usuario", "TEXT"),
+            ("anulacion_fecha", "TIMESTAMP"),
+        ]
+        for name, decl in specs:
+            if name not in cols:
+                cursor.execute(f"ALTER TABLE facturas ADD COLUMN {name} {decl}")
+
+    def _migrate_facturacion_extendida(self, cursor):
+        """Condiciones de pago, vencimiento, presupuestos y metadatos de documento."""
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS condiciones_pago (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codigo TEXT UNIQUE NOT NULL,
+                nombre TEXT NOT NULL,
+                dias_credito INTEGER NOT NULL DEFAULT 0,
+                es_contado INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        cursor.execute("SELECT COUNT(*) FROM condiciones_pago")
+        if cursor.fetchone()[0] == 0:
+            for cod, nom, dias, cont in (
+                ("CONT", "Contado al momento", 0, 1),
+                ("C7", "Crédito 7 días", 7, 0),
+                ("C15", "Crédito 15 días", 15, 0),
+                ("C30", "Crédito 30 días", 30, 0),
+                ("C45", "Crédito 45 días", 45, 0),
+            ):
+                cursor.execute(
+                    """
+                    INSERT INTO condiciones_pago (codigo, nombre, dias_credito, es_contado)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (cod, nom, dias, cont),
+                )
+
+        cursor.execute("PRAGMA table_info(facturas)")
+        fcols = {row[1] for row in cursor.fetchall()}
+        for name, decl in (
+            ("fecha_vencimiento", "TEXT"),
+            ("condicion_pago_id", "INTEGER"),
+            ("observaciones", "TEXT"),
+            ("referencia_entrega", "TEXT"),
+            ("moneda", "TEXT DEFAULT 'DOP'"),
+            ("tasa_cambio", "REAL DEFAULT 1.0"),
+            ("precio_incluye_itbis", "INTEGER DEFAULT 0"),
+        ):
+            if name not in fcols:
+                cursor.execute(f"ALTER TABLE facturas ADD COLUMN {name} {decl}")
+
+        cursor.execute("PRAGMA table_info(notas_credito)")
+        ncols = {row[1] for row in cursor.fetchall()}
+        for name, decl in (
+            ("numero", "TEXT"),
+            ("usuario", "TEXT"),
+            ("estado", "TEXT DEFAULT 'emitida'"),
+        ):
+            if name not in ncols:
+                cursor.execute(f"ALTER TABLE notas_credito ADD COLUMN {name} {decl}")
 
     def _migrate_movimientos_kardex(self, cursor):
         cursor.execute("PRAGMA table_info(movimientos_inventario)")
@@ -1375,6 +1444,1117 @@ class Database:
         count = cursor.fetchone()[0]
         conn.close()
         return count
+
+    def fetch_facturas_historial_reporte(
+        self,
+        *,
+        fecha_desde: str | None = None,
+        fecha_hasta: str | None = None,
+        usuario: str | None = None,
+        estado: str = "todos",
+        texto: str | None = None,
+        limit: int = 5000,
+    ) -> list[tuple]:
+        """
+        Listado para reporte / historial de facturas (Reportería).
+        estado: 'todos' | 'emitida' | 'anulada'
+        Incluye cliente, formas de pago agregadas y montos.
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        q = """
+            SELECT
+                f.id,
+                f.numero,
+                f.fecha,
+                COALESCE(c.nombre, 'Consumidor final'),
+                COALESCE(c.documento, ''),
+                f.usuario,
+                f.tipo_comprobante,
+                IFNULL(GROUP_CONCAT(DISTINCT p.tipo_pago), '') AS formas_pago,
+                f.subtotal,
+                f.descuento_total,
+                f.impuesto_total,
+                f.total,
+                f.estado
+            FROM facturas f
+            LEFT JOIN clientes c ON c.id = f.cliente_id
+            LEFT JOIN pagos_factura p ON p.factura_id = f.id
+            WHERE 1=1
+        """
+        params: list = []
+
+        fd = (fecha_desde or "").strip()
+        fh = (fecha_hasta or "").strip()
+        if fd:
+            q += " AND date(f.fecha) >= date(?)"
+            params.append(fd)
+        if fh:
+            q += " AND date(f.fecha) <= date(?)"
+            params.append(fh)
+
+        us = (usuario or "").strip()
+        if us:
+            q += " AND IFNULL(f.usuario, '') LIKE ?"
+            params.append(f"%{us}%")
+
+        ed = (estado or "todos").lower()
+        if ed == "emitida":
+            q += " AND LOWER(IFNULL(f.estado, '')) = 'emitida'"
+        elif ed == "anulada":
+            q += " AND LOWER(IFNULL(f.estado, '')) = 'anulada'"
+
+        tx = (texto or "").strip()
+        if tx:
+            like = f"%{tx}%"
+            digits = "".join(ch for ch in tx if ch.isdigit())
+            parts = [
+                "f.numero LIKE ?",
+                "COALESCE(c.nombre, '') LIKE ?",
+                "COALESCE(c.documento, '') LIKE ?",
+            ]
+            more = [like, like, like]
+            if digits:
+                parts.append(
+                    "REPLACE(REPLACE(IFNULL(f.numero,''),'-',''),' ','') LIKE ?"
+                )
+                more.append(f"%{digits}%")
+            q += " AND (" + " OR ".join(parts) + ")"
+            params.extend(more)
+
+        q += """
+            GROUP BY
+                f.id, f.numero, f.fecha, c.nombre, c.documento,
+                f.usuario, f.tipo_comprobante,
+                f.subtotal, f.descuento_total, f.impuesto_total, f.total, f.estado
+            ORDER BY datetime(f.fecha) DESC, f.id DESC
+            LIMIT ?
+        """
+        params.append(int(limit))
+
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def get_lineas_factura_para_devolucion(self, factura_id: int) -> list[tuple]:
+        """
+        Por línea con producto: id detalle, descripción, cant. facturada,
+        cant. aún disponible para devolver, producto_id.
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT fd.id, fd.descripcion, fd.cantidad, fd.producto_id,
+                   fd.cantidad - IFNULL((
+                       SELECT SUM(ncd2.cantidad)
+                       FROM notas_credito_detalle ncd2
+                       JOIN notas_credito nc2 ON nc2.id = ncd2.nota_credito_id
+                       WHERE ncd2.factura_detalle_id = fd.id
+                         AND nc2.factura_original_id = fd.factura_id
+                   ), 0) AS disponible
+            FROM factura_detalle fd
+            WHERE fd.factura_id = ? AND fd.producto_id IS NOT NULL
+            ORDER BY fd.id
+            """,
+            (int(factura_id),),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        out = []
+        for rid, desc, cv, pid, disp in rows:
+            d = float(disp or 0)
+            if d > 0.0001:
+                out.append((int(rid), desc or "", float(cv or 0), d, int(pid)))
+        return out
+
+    def list_condiciones_pago(self) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, codigo, nombre, dias_credito, es_contado
+            FROM condiciones_pago
+            ORDER BY es_contado DESC, dias_credito ASC, id ASC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def get_condicion_pago(self, condicion_id: int) -> tuple | None:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, codigo, nombre, dias_credito, es_contado
+            FROM condiciones_pago WHERE id = ?
+            """,
+            (int(condicion_id),),
+        )
+        row = cur.fetchone()
+        conn.close()
+        return row
+
+    def buscar_clientes(self, texto: str, limit: int = 50) -> list[tuple]:
+        q = (texto or "").strip()
+        conn = self.get_connection()
+        cur = conn.cursor()
+        if not q:
+            cur.execute(
+                """
+                SELECT id, nombre, documento, telefono
+                FROM clientes
+                ORDER BY nombre
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+        else:
+            like = f"%{q}%"
+            cur.execute(
+                """
+                SELECT id, nombre, documento, telefono
+                FROM clientes
+                WHERE nombre LIKE ? OR IFNULL(documento,'') LIKE ?
+                ORDER BY nombre
+                LIMIT ?
+                """,
+                (like, like, int(limit)),
+            )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def crear_cliente_rapido(
+        self, nombre: str, documento: str | None = None, telefono: str | None = None
+    ) -> int:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO clientes (nombre, documento, telefono)
+            VALUES (?, ?, ?)
+            """,
+            ((nombre or "").strip() or "Cliente", (documento or "").strip() or None, (telefono or "").strip() or None),
+        )
+        new_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return int(new_id)
+
+    def get_factura_cliente_contacto(self, factura_id: int) -> tuple[str | None, str | None]:
+        """Email y nombre del cliente vinculado a la factura (si existe)."""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT TRIM(IFNULL(c.email,'')), TRIM(IFNULL(c.nombre,''))
+            FROM facturas f
+            LEFT JOIN clientes c ON c.id = f.cliente_id
+            WHERE f.id = ?
+            """,
+            (int(factura_id),),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None, None
+        em, nom = row
+        return ((em or None), (nom or None))
+
+    def actualizar_factura_notas(
+        self,
+        factura_id: int,
+        observaciones: str | None,
+        referencia_entrega: str | None = None,
+    ) -> bool:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE facturas
+            SET observaciones = ?, referencia_entrega = ?
+            WHERE id = ?
+            """,
+            (
+                (observaciones or "").strip() or None,
+                (referencia_entrega or "").strip() or None,
+                int(factura_id),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return cur.rowcount > 0
+
+    def _cantidad_ya_devuelta_linea(self, cur, factura_detalle_id: int, factura_id: int) -> float:
+        cur.execute(
+            """
+            SELECT IFNULL(SUM(ncd.cantidad), 0)
+            FROM notas_credito_detalle ncd
+            JOIN notas_credito nc ON nc.id = ncd.nota_credito_id
+            WHERE ncd.factura_detalle_id = ?
+              AND nc.factura_original_id = ?
+            """,
+            (int(factura_detalle_id), int(factura_id)),
+        )
+        r = cur.fetchone()
+        return float(r[0] or 0)
+
+    def registrar_devolucion_nota_credito(
+        self,
+        factura_id: int,
+        lineas: list[tuple[int, float]],
+        motivo: str,
+        usuario: str | None,
+    ) -> tuple[bool, str]:
+        motivo = (motivo or "").strip()
+        if len(motivo) < 3:
+            return False, "Indique el motivo (mínimo 3 caracteres)."
+        if not lineas:
+            return False, "No hay líneas para devolver."
+
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT IFNULL(estado,''), numero FROM facturas WHERE id = ?",
+            (int(factura_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return False, "Factura no encontrada."
+        estado, numero_fac = row
+        if (estado or "").lower() != "emitida":
+            conn.close()
+            return False, "Solo se devuelve sobre facturas emitidas."
+
+        detalles_proc = []
+        monto_total = 0.0
+        for det_id, qty_ret in lineas:
+            qty_ret = float(qty_ret or 0)
+            if qty_ret <= 0:
+                continue
+            cur.execute(
+                """
+                SELECT id, producto_id, cantidad, total_linea, descripcion
+                FROM factura_detalle
+                WHERE id = ? AND factura_id = ?
+                """,
+                (int(det_id), int(factura_id)),
+            )
+            dr = cur.fetchone()
+            if not dr:
+                conn.close()
+                return False, f"Línea #{det_id} no pertenece a la factura."
+            _id, pid, cant_orig, total_linea, desc = dr
+            cant_orig = float(cant_orig or 0)
+            if pid is None:
+                conn.close()
+                return False, "Las líneas sin producto no generan movimiento de inventario."
+            ya = self._cantidad_ya_devuelta_linea(cur, int(det_id), int(factura_id))
+            max_q = cant_orig - ya
+            if qty_ret > max_q + 0.0001:
+                conn.close()
+                return False, f"Cantidad a devolver excede lo disponible en la línea ({max_q:.2f})."
+            frac = qty_ret / cant_orig if cant_orig else 0
+            monto_linea = float(total_linea or 0) * frac
+            monto_total += monto_linea
+            detalles_proc.append((int(det_id), int(pid), qty_ret, monto_linea, desc))
+
+        if not detalles_proc:
+            conn.close()
+            return False, "Nada que procesar."
+
+        from datetime import datetime
+
+        nro = f"NC-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+        try:
+            cur.execute(
+                """
+                INSERT INTO notas_credito (
+                    factura_original_id, factura_nota_id, motivo, monto_total,
+                    numero, usuario, estado
+                )
+                VALUES (?, NULL, ?, ?, ?, ?, 'emitida')
+                """,
+                (
+                    int(factura_id),
+                    motivo,
+                    round(monto_total, 2),
+                    nro,
+                    (usuario or "").strip() or None,
+                ),
+            )
+            nc_id = cur.lastrowid
+
+            for det_id, pid, qty_ret, monto_linea, desc in detalles_proc:
+                cur.execute(
+                    """
+                    INSERT INTO notas_credito_detalle (
+                        nota_credito_id, factura_detalle_id, producto_id,
+                        cantidad, monto
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        nc_id,
+                        det_id,
+                        pid,
+                        qty_ret,
+                        round(monto_linea, 2),
+                    ),
+                )
+                cur.execute(
+                    """
+                    SELECT IFNULL(NULLIF(TRIM(bodega_codigo), ''), '')
+                    FROM productos WHERE id = ?
+                    """,
+                    (pid,),
+                )
+                br = cur.fetchone()
+                bod = (br[0] or "").strip() or None
+                self.insert_movimiento_kardex(
+                    pid,
+                    "devolucion_cliente",
+                    qty_ret,
+                    ajustar_stock=True,
+                    referencia=nro,
+                    factura_id=int(factura_id),
+                    usuario=usuario,
+                    tipo_codigo="NC",
+                    entidad_nombre=(desc or "")[:80],
+                    bodega_codigo=bod,
+                    precio_unitario=None,
+                    descripcion_mov=f"Devolución {nro} — fact. {numero_fac}",
+                    conn=conn,
+                )
+
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            return False, str(e)
+        conn.close()
+        return True, f"Nota de crédito {nro} registrada. Inventario actualizado."
+
+    def convertir_presupuesto_a_venta(
+        self,
+        factura_id: int,
+        usuario: str | None,
+        pagos: list[dict],
+    ) -> tuple[bool, str]:
+        """pagos: [{'tipo': 'efectivo', 'monto': 100.0}, ...]"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT IFNULL(estado,''), numero, total
+            FROM facturas WHERE id = ?
+            """,
+            (int(factura_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return False, "Documento no encontrado."
+        estado, numero, total = row
+        if (estado or "").lower() != "cotizacion":
+            conn.close()
+            return False, "Solo los presupuestos pendientes pueden confirmarse como venta."
+
+        cur.execute(
+            """
+            SELECT id, producto_id, descripcion, cantidad, precio_unitario
+            FROM factura_detalle
+            WHERE factura_id = ? AND producto_id IS NOT NULL
+            """,
+            (int(factura_id),),
+        )
+        det = cur.fetchall()
+        if not det:
+            conn.close()
+            return False, "El presupuesto no tiene líneas con producto."
+
+        try:
+            for _did, pid, descripcion, cant, pu in det:
+                qty = float(cant or 0)
+                if qty <= 0:
+                    continue
+                cur.execute(
+                    "UPDATE productos SET stock = IFNULL(stock,0) - ? WHERE id = ?",
+                    (qty, int(pid)),
+                )
+                cur.execute(
+                    """
+                    SELECT IFNULL(NULLIF(TRIM(bodega_codigo), ''), '')
+                    FROM productos WHERE id = ?
+                    """,
+                    (int(pid),),
+                )
+                br = cur.fetchone()
+                bod = (br[0] or "").strip() or None
+                self.insert_movimiento_kardex(
+                    int(pid),
+                    "venta",
+                    -qty,
+                    ajustar_stock=False,
+                    referencia=str(numero),
+                    factura_id=int(factura_id),
+                    usuario=usuario,
+                    tipo_codigo="FA",
+                    entidad_nombre="Confirmación presupuesto",
+                    bodega_codigo=bod,
+                    precio_unitario=float(pu or 0),
+                    descripcion_mov=f"Venta confirmada: {numero}",
+                    conn=conn,
+                )
+
+            pago_sum = sum(float(p.get("monto") or 0) for p in pagos)
+            if abs(pago_sum - float(total or 0)) > 0.05:
+                conn.rollback()
+                conn.close()
+                return (
+                    False,
+                    f"Los pagos ({pago_sum:.2f}) deben igualar el total ({float(total):.2f}).",
+                )
+
+            for p in pagos:
+                m = round(float(p.get("monto") or 0), 2)
+                if m <= 0:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO pagos_factura (factura_id, tipo_pago, monto)
+                    VALUES (?, ?, ?)
+                    """,
+                    (int(factura_id), (p.get("tipo") or "efectivo").strip(), m),
+                )
+
+            cur.execute(
+                "UPDATE facturas SET estado = 'emitida' WHERE id = ?",
+                (int(factura_id),),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            return False, str(e)
+        conn.close()
+        return True, f"Presupuesto {numero} confirmado como venta."
+
+    def importar_lote_presupuestos(
+        self, entradas: list[dict], usuario: str | None
+    ) -> tuple[int, list[str]]:
+        """
+        entradas: [{'grupo': '1', 'documento_cliente': 'RNC...', 'lineas': [(codigo, cant), ...]}, ...]
+        Crea un presupuesto (sin movimiento de inventario) por cada entrada valida.
+        """
+        from datetime import datetime
+
+        ok = 0
+        errs: list[str] = []
+        for entry in entradas:
+            g = str(entry.get("grupo", "") or "?")
+            doc = (entry.get("documento_cliente") or "").strip()
+            lineas = entry.get("lineas") or []
+            if not lineas:
+                errs.append(f"Bloque {g}: sin lineas.")
+                continue
+
+            conn = self.get_connection()
+            cur = conn.cursor()
+            try:
+                cliente_id = None
+                if doc:
+                    cur.execute(
+                        "SELECT id FROM clientes WHERE TRIM(IFNULL(documento,'')) = ? LIMIT 1",
+                        (doc,),
+                    )
+                    cr = cur.fetchone()
+                    if not cr:
+                        errs.append(f"Bloque {g}: cliente documento {doc} no encontrado.")
+                        continue
+                    cliente_id = cr[0]
+
+                det_rows = []
+                subtotal = 0.0
+                imp = 0.0
+                abort = False
+                for cod, cant in lineas:
+                    cod = (str(cod) or "").strip()
+                    cant = float(cant or 0)
+                    if not cod or cant <= 0:
+                        continue
+                    cur.execute(
+                        """
+                        SELECT id, nombre, precio, IFNULL(aplica_itbis,1)
+                        FROM productos
+                        WHERE TRIM(IFNULL(codigo_producto,'')) = ? OR CAST(id AS TEXT) = ?
+                        LIMIT 1
+                        """,
+                        (cod, cod),
+                    )
+                    pr = cur.fetchone()
+                    if not pr:
+                        errs.append(f"Bloque {g}: producto {cod} no encontrado.")
+                        abort = True
+                        break
+                    pid, nombre, precio, aplica_itb = pr
+                    precio = float(precio or 0)
+                    sb = round(precio * cant, 2)
+                    it = round(sb * 0.18, 2) if int(aplica_itb or 1) else 0.0
+                    tl = round(sb + it, 2)
+                    subtotal += sb
+                    imp += it
+                    det_rows.append((pid, nombre, cant, precio, sb, it, tl))
+
+                if abort or not det_rows:
+                    continue
+
+                nro = f"P-{datetime.now().strftime('%Y%m%d%H%M%S')}-{ok}-{g}"[:48]
+                total = round(subtotal + imp, 2)
+                cur.execute(
+                    """
+                    INSERT INTO facturas (
+                        numero, tipo_comprobante, cliente_id, subtotal,
+                        descuento_total, impuesto_total, total, estado, usuario,
+                        condicion_pago_id, fecha_vencimiento, observaciones
+                    )
+                    VALUES (?, 'consumidor_final', ?, ?, 0, ?, ?, 'cotizacion', ?, NULL, NULL,
+                            'Importacion en lote (presupuesto)')
+                    """,
+                    (
+                        nro,
+                        cliente_id,
+                        round(subtotal, 2),
+                        round(imp, 2),
+                        total,
+                        (usuario or "").strip() or None,
+                    ),
+                )
+                fid = cur.lastrowid
+                for pid, nombre, cant, precio, _sb, it, tl in det_rows:
+                    cur.execute(
+                        """
+                        INSERT INTO factura_detalle (
+                            factura_id, producto_id, descripcion, cantidad,
+                            precio_unitario, descuento_item, impuesto_item, total_linea
+                        )
+                        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                        """,
+                        (fid, pid, nombre, cant, precio, it, tl),
+                    )
+                conn.commit()
+                ok += 1
+            except Exception as e:
+                conn.rollback()
+                errs.append(f"Bloque {g}: {e}")
+            finally:
+                conn.close()
+        return ok, errs
+
+
+    def list_facturas_modulo_erp(
+        self,
+        estado_docs: str = "todos",
+        modo_filtro: str = "fecha",
+        numero_buscar: str | None = None,
+        fecha_desde: str | None = None,
+        fecha_hasta: str | None = None,
+        cliente_buscar: str | None = None,
+        monto_min: float | None = None,
+        monto_max: float | None = None,
+        producto_buscar: str | None = None,
+        terminos_modo: str | None = None,
+        bodega_filtro: str | None = None,
+        ultimos_n: int | None = None,
+        limit: int = 5000,
+    ):
+        """
+        Listado módulo Facturación (vista tipo ERP / MONICA).
+        estado_docs: 'todos' | 'emitidas' | 'anuladas' | 'presupuestos'
+        modo_filtro: 'fecha' | 'numero' | 'cliente' | 'monto' | 'producto' | 'terminos' | 'bodega' | 'todos'
+        terminos_modo: 'efectivo' | 'credito' (solo si modo_filtro=='terminos')
+        ultimos_n: si > 0, limita a los N documentos más recientes (ignora otros criterios opcionales salvo estado).
+
+        Cada fila: id, numero, fecha, cliente_nombre, documento_cliente, total, estado,
+        usuario, suma_pagos, fecha_vencimiento, moneda.
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        q = """
+            SELECT f.id, f.numero, f.fecha,
+                   COALESCE(c.nombre, 'Consumidor final'),
+                   COALESCE(c.documento, ''),
+                   f.total, f.estado, f.usuario,
+                   IFNULL((SELECT SUM(monto) FROM pagos_factura p
+                           WHERE p.factura_id = f.id), 0),
+                   IFNULL(f.fecha_vencimiento, ''),
+                   IFNULL(f.moneda, 'DOP')
+            FROM facturas f
+            LEFT JOIN clientes c ON c.id = f.cliente_id
+            WHERE 1=1
+        """
+        params: list = []
+        ed = (estado_docs or "todos").lower()
+        if ed == "emitidas":
+            q += " AND IFNULL(f.estado,'') = 'emitida'"
+        elif ed == "anuladas":
+            q += " AND IFNULL(f.estado,'') = 'anulada'"
+        elif ed == "presupuestos":
+            q += " AND IFNULL(f.estado,'') = 'cotizacion'"
+
+        modo = (modo_filtro or "todos").lower()
+        if ultimos_n and int(ultimos_n) > 0:
+            q += " ORDER BY datetime(f.fecha) DESC, f.id DESC LIMIT ?"
+            params.append(int(ultimos_n))
+            cur.execute(q, params)
+            rows = cur.fetchall()
+            conn.close()
+            return rows
+
+        fd = (fecha_desde or "").strip()
+        fh = (fecha_hasta or "").strip()
+        if modo == "fecha" and fd and fh:
+            q += " AND date(f.fecha) >= date(?) AND date(f.fecha) <= date(?)"
+            params.extend([fd, fh])
+
+        nb = (numero_buscar or "").strip()
+        if modo == "numero" and nb:
+            digits = "".join(ch for ch in nb if ch.isdigit())
+            if digits:
+                q += " AND REPLACE(REPLACE(IFNULL(f.numero,''),'-',''),' ','') LIKE ?"
+                params.append(f"%{digits}%")
+            else:
+                q += " AND f.numero LIKE ?"
+                params.append(f"%{nb}%")
+
+        cb = (cliente_buscar or "").strip()
+        if modo == "cliente" and cb:
+            like = f"%{cb}%"
+            q += (
+                " AND (COALESCE(c.nombre,'') LIKE ? OR COALESCE(c.documento,'') LIKE ?)"
+            )
+            params.extend([like, like])
+
+        if modo == "monto":
+            if monto_min is not None:
+                q += " AND f.total >= ?"
+                params.append(float(monto_min))
+            if monto_max is not None:
+                q += " AND f.total <= ?"
+                params.append(float(monto_max))
+
+        pb = (producto_buscar or "").strip()
+        if modo == "producto" and pb:
+            like = f"%{pb}%"
+            q += """
+                AND EXISTS (
+                    SELECT 1 FROM factura_detalle fd
+                    LEFT JOIN productos p ON p.id = fd.producto_id
+                    WHERE fd.factura_id = f.id
+                      AND (IFNULL(fd.descripcion,'') LIKE ?
+                           OR IFNULL(p.nombre,'') LIKE ?)
+                )
+            """
+            params.extend([like, like])
+
+        tm = (terminos_modo or "").lower()
+        if modo == "terminos" and tm == "efectivo":
+            q += """
+                AND (f.total - IFNULL((SELECT SUM(monto) FROM pagos_factura px
+                     WHERE px.factura_id = f.id), 0)) <= 0.02
+            """
+        elif modo == "terminos" and tm == "credito":
+            q += """
+                AND (f.total - IFNULL((SELECT SUM(monto) FROM pagos_factura px
+                     WHERE px.factura_id = f.id), 0)) > 0.02
+            """
+
+        bf = (bodega_filtro or "").strip()
+        if modo == "bodega" and bf and bf.upper() not in ("TODOS", "TODAS"):
+            q += """
+                AND EXISTS (
+                    SELECT 1 FROM factura_detalle fd2
+                    JOIN productos p2 ON p2.id = fd2.producto_id
+                    WHERE fd2.factura_id = f.id
+                      AND TRIM(IFNULL(p2.bodega_codigo,'')) = ?
+                )
+            """
+            params.append(bf)
+
+        q += " ORDER BY datetime(f.fecha) DESC LIMIT ?"
+        params.append(int(limit))
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def get_factura_cobro_resumen(self, factura_id: int) -> dict | None:
+        """Totales de cobro para diálogo 'Pagar documento'."""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT numero, total, estado,
+                   IFNULL((SELECT SUM(monto) FROM pagos_factura p
+                           WHERE p.factura_id = f.id), 0)
+            FROM facturas f WHERE f.id = ?
+            """,
+            (int(factura_id),),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        numero, total, estado, pagado = row
+        total = float(total or 0)
+        pagado = float(pagado or 0)
+        balance = round(total - pagado, 2)
+        return {
+            "numero": numero,
+            "total": total,
+            "pagado": pagado,
+            "balance": balance,
+            "estado": estado or "",
+        }
+
+    def fetch_caja_abierta_row(self) -> tuple | None:
+        """Fila del turno de caja abierto (misma forma que usa CajaManager)."""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, nombre_caja, fecha_apertura, fecha_cierre,
+                   usuario_apertura, usuario_cierre,
+                   monto_inicial, total_ventas,
+                   total_efectivo_sistema, total_tarjeta_sistema,
+                   total_otros_sistema, efectivo_contado,
+                   diferencia_efectivo, observaciones, estado
+            FROM cierres_caja
+            WHERE estado = 'abierto'
+            ORDER BY fecha_apertura DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        conn.close()
+        return row
+
+    def get_factura_para_duplicar(self, factura_id: int) -> dict | None:
+        """
+        Datos para abrir el POS con las mismas líneas (solo ítems con producto_id).
+        Documentos en estado emitida o cotización (presupuesto).
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT f.estado, f.tipo_comprobante, f.cliente_id,
+                   c.documento, c.nombre
+            FROM facturas f
+            LEFT JOIN clientes c ON c.id = f.cliente_id
+            WHERE f.id = ?
+            """,
+            (int(factura_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return None
+        estado, tipo_comp, cliente_id, doc, nombre = row
+        if (estado or "").lower() not in ("emitida", "cotizacion"):
+            conn.close()
+            return None
+        cur.execute(
+            """
+            SELECT producto_id, descripcion, cantidad, precio_unitario,
+                   descuento_item, impuesto_item, total_linea
+            FROM factura_detalle
+            WHERE factura_id = ?
+            ORDER BY id
+            """,
+            (int(factura_id),),
+        )
+        det_rows = cur.fetchall()
+        conn.close()
+        lines = []
+        for r in det_rows:
+            pid, descripcion, cantidad, punit, ditem, imp, tline = r
+            if pid is None:
+                continue
+            lines.append(
+                {
+                    "producto_id": int(pid),
+                    "descripcion": descripcion or "",
+                    "cantidad": float(cantidad or 0),
+                    "precio_unitario": float(punit or 0),
+                    "descuento_item": float(ditem or 0),
+                    "impuesto_item": float(imp or 0),
+                    "total_linea": float(tline or 0),
+                }
+            )
+        if not lines:
+            return None
+        labels = {
+            "consumidor_final": "Consumidor final",
+            "credito_fiscal": "Crédito fiscal",
+            "gubernamental": "Gubernamental",
+            "especial": "Especial",
+        }
+        comp_label = labels.get((tipo_comp or "").lower(), "Consumidor final")
+        if cliente_id:
+            codigo_cli = (doc or "").strip() or (nombre or "").strip() or "MOSTRADOR"
+        else:
+            codigo_cli = "MOSTRADOR"
+        return {
+            "cliente_id": int(cliente_id) if cliente_id else None,
+            "cliente_codigo": codigo_cli,
+            "documento_cliente": (doc or "").strip(),
+            "comprobante_label": comp_label,
+            "lines": lines,
+        }
+
+    def registrar_pago_factura(
+        self, factura_id: int, tipo_pago: str, monto: float
+    ) -> tuple[bool, str]:
+        """Registra un pago. Devuelve (ok, mensaje)."""
+        if monto <= 0:
+            return False, "El monto debe ser mayor que cero."
+        res = self.get_factura_cobro_resumen(factura_id)
+        if not res:
+            return False, "Factura no encontrada."
+        if (res["estado"] or "").lower() == "anulada":
+            return False, "No se puede cobrar una factura anulada."
+        if (res["estado"] or "").lower() == "cotizacion":
+            return False, "Confirme el presupuesto como venta desde Facturación (acción «Confirmar venta»)."
+        if res["balance"] <= 0:
+            return False, "La factura ya está saldada."
+        if round(monto, 2) > res["balance"] + 0.009:
+            return False, f"El monto supera el balance ({res['balance']:.2f})."
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO pagos_factura (factura_id, tipo_pago, monto)
+            VALUES (?, ?, ?)
+            """,
+            (int(factura_id), tipo_pago, round(float(monto), 2)),
+        )
+        conn.commit()
+        conn.close()
+        return True, "Pago registrado."
+
+    def anular_factura(
+        self, factura_id: int, motivo: str, usuario: str | None
+    ) -> tuple[bool, str]:
+        """
+        Marca la factura como anulada y devuelve al inventario las cantidades vendidas.
+        """
+        motivo = (motivo or "").strip()
+        if len(motivo) < 3:
+            return False, "Ingrese el motivo de la anulación (mínimo 3 caracteres)."
+
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT IFNULL(estado,''), numero FROM facturas WHERE id = ?",
+            (int(factura_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return False, "Factura no encontrada."
+        estado, numero = row
+        est = (estado or "").lower()
+        if est == "anulada":
+            conn.close()
+            return False, "El documento ya está anulado."
+        if est not in ("emitida", "cotizacion"):
+            conn.close()
+            return False, "Estado de documento no admite anulación así."
+
+        cur.execute(
+            """
+            SELECT producto_id, cantidad
+            FROM factura_detalle
+            WHERE factura_id = ? AND producto_id IS NOT NULL
+            """,
+            (int(factura_id),),
+        )
+        detalles = cur.fetchall()
+
+        try:
+            if est == "cotizacion":
+                cur.execute(
+                    """
+                    UPDATE facturas
+                    SET estado = 'anulada',
+                        anulacion_motivo = ?,
+                        anulacion_usuario = ?,
+                        anulacion_fecha = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (motivo, (usuario or "").strip() or None, int(factura_id)),
+                )
+                conn.commit()
+                conn.close()
+                return True, f"Presupuesto {numero} cancelado (sin movimiento de inventario)."
+
+            for pid, cant in detalles:
+                qty = float(cant or 0)
+                if qty <= 0:
+                    continue
+                cur.execute(
+                    """
+                    SELECT IFNULL(NULLIF(TRIM(bodega_codigo), ''), '')
+                    FROM productos WHERE id = ?
+                    """,
+                    (int(pid),),
+                )
+                br = cur.fetchone()
+                bod = (br[0] or "").strip() or None
+                self.insert_movimiento_kardex(
+                    int(pid),
+                    "anulacion_venta",
+                    qty,
+                    ajustar_stock=True,
+                    referencia=str(numero),
+                    factura_id=int(factura_id),
+                    usuario=usuario,
+                    tipo_codigo="AN",
+                    entidad_nombre="Anulación de factura",
+                    bodega_codigo=bod,
+                    precio_unitario=None,
+                    descripcion_mov=(
+                        f"Anulación factura {numero}: {motivo[:120]}"
+                    ),
+                    conn=conn,
+                )
+
+            cur.execute(
+                """
+                UPDATE facturas
+                SET estado = 'anulada',
+                    anulacion_motivo = ?,
+                    anulacion_usuario = ?,
+                    anulacion_fecha = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (motivo, (usuario or "").strip() or None, int(factura_id)),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            return False, str(e)
+        conn.close()
+        return True, f"Factura {numero} anulada. El inventario fue revertido."
+
+    def generar_ticket_texto_factura(self, factura_id: int) -> str | None:
+        """Texto del ticket térmico reconstruido desde BD (misma idea que historial)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT numero, fecha, subtotal, descuento_total, impuesto_total, total, usuario,
+                   IFNULL(estado,''), IFNULL(anulacion_motivo,'')
+            FROM facturas
+            WHERE id = ?
+            """,
+            (int(factura_id),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+        (
+            numero,
+            fecha,
+            subtotal,
+            descuento_total,
+            impuesto_total,
+            total,
+            usuario,
+            estado_fac,
+            motivo_anul,
+        ) = row
+        cursor.execute(
+            """
+            SELECT descripcion, cantidad, precio_unitario, total_linea
+            FROM factura_detalle
+            WHERE factura_id = ?
+            """,
+            (int(factura_id),),
+        )
+        detalles = cursor.fetchall()
+        conn.close()
+
+        emp = self.get_empresa_info()
+        nombre_emp = (emp.get("nombre") or "EMPRESA").strip()
+        dir_emp = (emp.get("direccion") or "").strip().split("\n")[0] if emp.get("direccion") else ""
+
+        subtotal = float(subtotal or 0)
+        descuento_total = float(descuento_total or 0)
+        impuesto_total = float(impuesto_total or 0)
+        total = float(total or 0)
+        subtotal_bruto = subtotal + descuento_total
+
+        ticket_width = self.get_ticket_width()
+        lines = []
+
+        def center(text):
+            return text[:ticket_width].center(ticket_width)
+
+        def sep(char="-"):
+            return char * ticket_width
+
+        lines.append(center(nombre_emp[:40]))
+        if dir_emp:
+            lines.append(center(dir_emp[:ticket_width]))
+        lines.append(sep())
+        if (estado_fac or "").lower() == "anulada":
+            lines.append(center("*** DOCUMENTO ANULADO ***"))
+            if (motivo_anul or "").strip():
+                m = str(motivo_anul).strip()
+                while m:
+                    lines.append(center(m[:ticket_width]))
+                    m = m[ticket_width:].lstrip()
+            lines.append(sep())
+        lines.append(f"Factura: {numero}")
+        lines.append(f"Fecha : {fecha}")
+        if usuario:
+            lines.append(f"Cajero: {usuario}")
+        lines.append(sep())
+        lines.append("DESCRIPCIÓN")
+        lines.append("CANT x P.U" + " " * max(1, ticket_width - len("CANT x P.U") - 7) + "IMPORTE")
+        lines.append(sep())
+
+        for desc, cant, pu, total_linea in detalles:
+            desc = str(desc)
+            while len(desc) > ticket_width:
+                lines.append(desc[:ticket_width])
+                desc = desc[ticket_width:]
+            if desc:
+                lines.append(desc)
+            left = f"{float(cant):.2f} x {float(pu):.2f}"
+            right = f"{float(total_linea):.2f}"
+            spaces = max(1, ticket_width - len(left) - len(right))
+            lines.append(left + " " * spaces + right)
+
+        lines.append(sep())
+        lines.append(f"SUBTOTAL:".ljust(ticket_width - 10) + f"{subtotal_bruto:10.2f}")
+        lines.append(f"DESCUENTO:".ljust(ticket_width - 10) + f"{descuento_total:10.2f}")
+        if impuesto_total and abs(impuesto_total) > 0.0001:
+            lines.append(f"ITBIS:".ljust(ticket_width - 10) + f"{impuesto_total:10.2f}")
+        lines.append(f"TOTAL:".ljust(ticket_width - 10) + f"{total:10.2f}")
+        lines.append(sep())
+        lines.append(center("GRACIAS POR SU COMPRA"))
+        lines.append("\n\n\n")
+        return "\n".join(lines)
 
     # --------- PERFIL DE IMPRESORA ---------
     def get_printer_profile(self) -> tuple[str, int]:
