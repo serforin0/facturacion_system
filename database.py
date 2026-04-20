@@ -395,6 +395,7 @@ class Database:
         self._migrate_movimientos_kardex(cursor)
         self._migrate_facturas_anulacion(cursor)
         self._migrate_facturacion_extendida(cursor)
+        self._migrate_cierres_caja_estado(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pagos_factura_factura ON pagos_factura(factura_id)")
 
         # =========================
@@ -417,6 +418,25 @@ class Database:
         conn.commit()
         conn.close()
         print("✅ Base de datos inicializada correctamente")
+
+    def _migrate_cierres_caja_estado(self, cursor):
+        """
+        Alinea estado con fecha_cierre: un turno cerrado debe tener fecha_cierre
+        y estado 'cerrado' (evita cajas 'abiertas' fantasma si hubo datos viejos).
+        """
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cierres_caja'"
+        )
+        if not cursor.fetchone():
+            return
+        cursor.execute(
+            """
+            UPDATE cierres_caja
+            SET estado = 'cerrado'
+            WHERE fecha_cierre IS NOT NULL
+              AND (estado IS NULL OR LOWER(TRIM(estado)) != 'cerrado')
+            """
+        )
 
     def _migrate_productos_monica_fields(self, cursor):
         """Campos extra para UI tipo ERP (código interno, tipo, precios 2–4, etc.)."""
@@ -2235,8 +2255,8 @@ class Database:
                    total_otros_sistema, efectivo_contado,
                    diferencia_efectivo, observaciones, estado
             FROM cierres_caja
-            WHERE estado = 'abierto'
-            ORDER BY fecha_apertura DESC
+            WHERE fecha_cierre IS NULL
+            ORDER BY datetime(fecha_apertura) DESC
             LIMIT 1
             """
         )

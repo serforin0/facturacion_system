@@ -15,6 +15,27 @@ from pos_catalogo_dialog import PosCatalogoDialog
 TASA_ITBIS = 0.18
 
 
+def _parse_monto_pago(txt: str) -> float:
+    """
+    Convierte texto de monto a float. Acepta coma de miles (53,141.30) y coma decimal (53141,30),
+    alineado con el diálogo de pago en facturacion_erp_manager.
+    """
+    s = (txt or "").strip().replace(" ", "")
+    if not s:
+        return 0.0
+    for sym in ("RD$", "US$", "$"):
+        if s.upper().startswith(sym.upper()):
+            s = s[len(sym) :].strip()
+            break
+    last_c = s.rfind(",")
+    last_d = s.rfind(".")
+    if last_c > last_d and last_c != -1:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", "")
+    return float(s)
+
+
 class FacturaManager:
     def __init__(
         self,
@@ -75,6 +96,9 @@ class FacturaManager:
 
         self.var_imprimir_doc = BooleanVar(value=True)
         self.var_solo_presupuesto = BooleanVar(value=False)
+
+        self._buscar_after_id = None
+        self._num_doc_preview = None
 
         self._setup_ui()
         if self._duplicar_desde_factura_id:
@@ -166,27 +190,39 @@ class FacturaManager:
         ctk.CTkLabel(hf, text="Comprobante:", font=("Arial", 11)).grid(
             row=1, column=3, sticky="w", padx=(14, 4), pady=2
         )
+        fr_comp = ctk.CTkFrame(hf, fg_color="transparent")
+        fr_comp.grid(row=1, column=4, sticky="w", padx=4, pady=2)
         self.combo_tipo_comprobante = ctk.CTkComboBox(
-            hf,
+            fr_comp,
             values=[
                 "Consumidor final",
                 "Crédito fiscal",
                 "Gubernamental",
                 "Especial",
             ],
-            width=160,
+            width=150,
             height=28,
+            command=self._on_tipo_comprobante_cambiado,
         )
         self.combo_tipo_comprobante.set("Consumidor final")
-        self.combo_tipo_comprobante.grid(row=1, column=4, sticky="w", padx=4, pady=2)
+        self.combo_tipo_comprobante.pack(side="left", padx=(0, 8))
+        self.lbl_sec_comprobante = ctk.CTkLabel(
+            fr_comp,
+            text="",
+            font=("Arial", 11, "bold"),
+            text_color="#93c5fd",
+        )
+        self.lbl_sec_comprobante.pack(side="left")
 
-        ctk.CTkLabel(hf, text="RNC / Doc.:", font=("Arial", 11)).grid(
+        ctk.CTkLabel(hf, text="RNC / Doc. cliente:", font=("Arial", 11)).grid(
             row=1, column=5, sticky="w", padx=(14, 4), pady=2
         )
         self.entry_rnc_cliente = ctk.CTkEntry(
             hf, width=140, height=28, placeholder_text="Opcional"
         )
         self.entry_rnc_cliente.grid(row=1, column=6, sticky="w", padx=4, pady=2)
+
+        self._actualizar_vista_secuencia_documento()
 
         ctk.CTkCheckBox(
             header,
@@ -223,26 +259,43 @@ class FacturaManager:
         search_frame = ctk.CTkFrame(left_frame, fg_color="#1F1F1F")
         search_frame.pack(fill="x", padx=5, pady=(0, 5))
 
+        ctk.CTkLabel(search_frame, text="Modo de búsqueda:", font=("Arial", 11)).grid(
+            row=0, column=0, padx=6, pady=(6, 2), sticky="w"
+        )
+        self.combo_modo_busqueda = ctk.CTkComboBox(
+            search_frame,
+            width=260,
+            height=28,
+            values=[
+                "Nombre (empieza con)",
+                "Nombre o descripción (contiene)",
+                "ID o código interno",
+                "Código de barras",
+            ],
+        )
+        self.combo_modo_busqueda.set("Nombre (empieza con)")
+        self.combo_modo_busqueda.grid(row=0, column=1, columnspan=2, padx=5, pady=(6, 2), sticky="w")
+
         lbl_buscar = ctk.CTkLabel(
             search_frame,
-            text="Buscar producto (CB / ID / Nombre):",
-            font=("Arial", 12)
+            text="Texto:",
+            font=("Arial", 12),
         )
-        lbl_buscar.grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        lbl_buscar.grid(row=1, column=0, padx=6, pady=6, sticky="w")
 
-        self.entry_buscar = ctk.CTkEntry(search_frame, width=200)
-        self.entry_buscar.grid(row=0, column=1, padx=5, pady=6, sticky="w")
+        self.entry_buscar = ctk.CTkEntry(search_frame, width=220)
+        self.entry_buscar.grid(row=1, column=1, padx=5, pady=6, sticky="w")
 
         btn_buscar = ctk.CTkButton(
             search_frame,
             text="Buscar",
             width=70,
-            command=self.buscar_producto
+            command=lambda: self.buscar_producto(desde_teclado=False),
         )
-        btn_buscar.grid(row=0, column=2, padx=6, pady=6)
+        btn_buscar.grid(row=1, column=2, padx=6, pady=6)
 
-        # Enter para buscar
-        self.entry_buscar.bind("<Return>", lambda event: self.buscar_producto())
+        self.entry_buscar.bind("<Return>", lambda e: self.buscar_producto(desde_teclado=False))
+        self.entry_buscar.bind("<KeyRelease>", self._programar_busqueda_en_vivo)
 
         # Resultados
         resultados_frame = ctk.CTkFrame(left_frame, fg_color="#1F1F1F")
@@ -525,6 +578,17 @@ class FacturaManager:
         d = datetime.now().date() + timedelta(days=int(dias or 0))
         return d.isoformat()
 
+    def _condicion_es_credito_plazo(self) -> bool:
+        """True si la condición es venta a plazo (cobro diferido; no exige el total al facturar)."""
+        cid = self._condicion_pago_id_actual()
+        if cid is None:
+            return False
+        row = self.db.get_condicion_pago(cid)
+        if not row:
+            return False
+        _i, _c, _n, _dias, es_cont = row
+        return int(es_cont or 1) == 0
+
     def _resolver_cliente_id(self) -> int | None:
         if self._cliente_id is not None:
             return self._cliente_id
@@ -744,24 +808,30 @@ class FacturaManager:
 
     # ----------------- BÚSQUEDA --------------------
 
-    def buscar_producto(self):
+    def buscar_producto(self, desde_teclado: bool = False):
         texto = self.entry_buscar.get().strip()
 
         if not texto:
-            messagebox.showerror("Error", "Introduce código de barras, ID o nombre.")
+            if not desde_teclado:
+                messagebox.showerror(
+                    "Error",
+                    "Introduce texto para buscar o elija modo (nombre, código, código de barras).",
+                )
+            else:
+                self.resultados_busqueda = []
+                self.producto_actual = None
+                self._render_lista_resultados()
+                self._mostrar_producto(None)
             return
+
+        modo = "Nombre o descripción (contiene)"
+        if getattr(self, "combo_modo_busqueda", None) is not None:
+            modo = self.combo_modo_busqueda.get() or modo
 
         conn = self.db.get_connection()
         cursor = conn.cursor()
 
-        # Intentar usar texto como ID entero
-        try:
-            id_interno = int(texto)
-        except ValueError:
-            id_interno = -1  # ID que no va a existir
-
-        cursor.execute(
-            """
+        base_sql = """
             SELECT id, nombre, precio, precio_base, precio_minimo,
                    stock, codigo_barras, imagen_path,
                    IFNULL(aplica_itbis, 1),
@@ -772,16 +842,49 @@ class FacturaManager:
                    IFNULL(facturar_nivel_precio, 1)
             FROM productos
             WHERE activo = 1
-              AND (
-                    codigo_barras = ?
-                 OR id = ?
-                 OR nombre LIKE ?
-              )
-            ORDER BY nombre
-            LIMIT 20
-            """,
-            (texto, id_interno, f"%{texto}%")
-        )
+        """
+
+        if modo == "Nombre (empieza con)":
+            cursor.execute(
+                base_sql + " AND nombre LIKE ? ORDER BY nombre COLLATE NOCASE LIMIT 40",
+                (f"{texto}%",),
+            )
+        elif modo == "Nombre o descripción (contiene)":
+            p = f"%{texto}%"
+            cursor.execute(
+                base_sql
+                + " AND (nombre LIKE ? OR IFNULL(descripcion,'') LIKE ?) "
+                + "ORDER BY nombre COLLATE NOCASE LIMIT 40",
+                (p, p),
+            )
+        elif modo == "Código de barras":
+            cursor.execute(
+                base_sql
+                + """ AND (
+                        TRIM(IFNULL(codigo_barras,'')) = ?
+                     OR codigo_barras LIKE ?
+                    )
+                    ORDER BY nombre COLLATE NOCASE LIMIT 20
+                """,
+                (texto, f"%{texto}%"),
+            )
+        else:
+            # ID o código interno
+            try:
+                id_interno = int(texto)
+            except ValueError:
+                id_interno = -1
+            cursor.execute(
+                base_sql
+                + """ AND (
+                        id = ?
+                     OR TRIM(IFNULL(codigo_producto,'')) = ?
+                     OR TRIM(IFNULL(codigo_producto,'')) LIKE ?
+                    )
+                    ORDER BY nombre COLLATE NOCASE LIMIT 20
+                """,
+                (id_interno, texto, f"{texto}%"),
+            )
 
         resultados = cursor.fetchall()
         conn.close()
@@ -947,6 +1050,7 @@ class FacturaManager:
         if doc:
             self.entry_rnc_cliente.insert(0, doc)
         self._recalcular_totales_y_refrescar()
+        self._actualizar_vista_secuencia_documento(regenerar=True)
 
     # ---------- PROMOCIONES / DESCUENTOS AUTOMÁTICOS ----------
 
@@ -1364,6 +1468,7 @@ class FacturaManager:
 
         self.factura_items.clear()
         self._recalcular_totales_y_refrescar()
+        self._actualizar_vista_secuencia_documento(regenerar=True)
 
     # ---------- DESCUENTO GLOBAL ----------
 
@@ -1488,6 +1593,32 @@ class FacturaManager:
         ahora = datetime.now().strftime("%Y%m%d%H%M%S")
         return f"F-{ahora}"
 
+    def _on_tipo_comprobante_cambiado(self, choice=None):
+        """Al cambiar tipo de comprobante, refresca la vista del próximo número."""
+        self._actualizar_vista_secuencia_documento()
+
+    def _actualizar_vista_secuencia_documento(self, regenerar: bool = False):
+        """Muestra junto al comprobante el próximo número interno (referencia al guardar)."""
+        if getattr(self, "lbl_sec_comprobante", None) is None:
+            return
+        if regenerar or not self._num_doc_preview:
+            self._num_doc_preview = self._generar_numero_factura()
+        self.lbl_sec_comprobante.configure(text=f"N° próximo: {self._num_doc_preview}")
+
+    def _programar_busqueda_en_vivo(self, event=None):
+        if event and getattr(event, "keysym", "") in ("Up", "Down", "Left", "Right", "Tab"):
+            return
+        if self._buscar_after_id is not None:
+            try:
+                self.parent.after_cancel(self._buscar_after_id)
+            except Exception:
+                pass
+        self._buscar_after_id = self.parent.after(220, self._ejecutar_busqueda_en_vivo)
+
+    def _ejecutar_busqueda_en_vivo(self):
+        self._buscar_after_id = None
+        self.buscar_producto(desde_teclado=True)
+
     # ==========================
     #   FLUJO DE FINALIZAR
     # ==========================
@@ -1519,17 +1650,31 @@ class FacturaManager:
         calcular cambio y luego llamar a _guardar_y_imprimir_factura().
         """
         total = self.total_factura
+        es_cred_plazo = self._condicion_es_credito_plazo()
 
         dlg = ctk.CTkToplevel(self.parent)
         dlg.title("Pago de factura")
-        dlg.geometry("380x260")
+        dlg.geometry("400x320" if es_cred_plazo else "380x260")
         dlg.resizable(False, False)
 
         ctk.CTkLabel(
             dlg,
             text=f"Total a pagar: RD$ {total:.2f}",
             font=("Arial", 14, "bold")
-        ).pack(pady=(10, 10))
+        ).pack(pady=(10, 4))
+
+        if es_cred_plazo:
+            ctk.CTkLabel(
+                dlg,
+                text=(
+                    "Venta a crédito: puede dejar en RD$ 0,00 lo que no cobre ahora "
+                    "y repartir el cobro entre efectivo / tarjeta / transferencia."
+                ),
+                font=("Arial", 11),
+                text_color="#a3a3a3",
+                wraplength=380,
+                justify="left",
+            ).pack(padx=12, pady=(0, 8))
 
         # ---- EFECTIVO ----
         frame_ef = ctk.CTkFrame(dlg)
@@ -1537,7 +1682,10 @@ class FacturaManager:
         ctk.CTkLabel(frame_ef, text="Efectivo:").pack(side="left", padx=5)
         entry_ef = ctk.CTkEntry(frame_ef, width=120)
         entry_ef.pack(side="left", padx=5)
-        entry_ef.insert(0, f"{total:.2f}")  # por defecto, todo en efectivo
+        if es_cred_plazo:
+            entry_ef.insert(0, "0.00")
+        else:
+            entry_ef.insert(0, f"{total:.2f}")  # por defecto, todo en efectivo
 
         # ---- TARJETA ----
         frame_tar = ctk.CTkFrame(dlg)
@@ -1555,7 +1703,7 @@ class FacturaManager:
         entry_tr.pack(side="left", padx=5)
         entry_tr.insert(0, "0.00")
 
-        # ---- CAMBIO ----
+        # ---- CAMBIO / RESUMEN CRÉDITO ----
         lbl_cambio = ctk.CTkLabel(
             dlg,
             text="Cambio: RD$ 0.00",
@@ -1565,11 +1713,28 @@ class FacturaManager:
 
         def recalcular_cambio(*args):
             try:
-                ef = float(entry_ef.get() or "0")
-                tar = float(entry_tar.get() or "0")
-                trf = float(entry_tr.get() or "0")
+                ef = _parse_monto_pago(entry_ef.get())
+                tar = _parse_monto_pago(entry_tar.get())
+                trf = _parse_monto_pago(entry_tr.get())
             except ValueError:
-                lbl_cambio.configure(text="Cambio: RD$ 0.00")
+                if es_cred_plazo:
+                    lbl_cambio.configure(
+                        text="Cobrado ahora: RD$ 0.00  |  Pendiente: "
+                        f"RD$ {total:.2f}"
+                    )
+                else:
+                    lbl_cambio.configure(text="Cambio: RD$ 0.00")
+                return
+
+            if es_cred_plazo:
+                cobrado = ef + tar + trf
+                pend = max(0.0, total - cobrado)
+                lbl_cambio.configure(
+                    text=(
+                        f"Cobrado ahora: RD$ {cobrado:.2f}  |  "
+                        f"Pendiente: RD$ {pend:.2f}"
+                    )
+                )
                 return
 
             otros = tar + trf
@@ -1593,9 +1758,9 @@ class FacturaManager:
 
         def confirmar():
             try:
-                ef = float(entry_ef.get() or "0")
-                tar = float(entry_tar.get() or "0")
-                trf = float(entry_tr.get() or "0")
+                ef = _parse_monto_pago(entry_ef.get())
+                tar = _parse_monto_pago(entry_tar.get())
+                trf = _parse_monto_pago(entry_tr.get())
             except ValueError:
                 messagebox.showerror("Error", "Montos de pago inválidos.")
                 return
@@ -1605,10 +1770,17 @@ class FacturaManager:
                 return
 
             total_pagos = ef + tar + trf
-            if total_pagos < total - 0.01:
+            if es_cred_plazo:
+                if total_pagos > total + 0.02:
+                    messagebox.showerror(
+                        "Cobro",
+                        "El total cobrado ahora no puede ser mayor que el total de la factura.",
+                    )
+                    return
+            elif total_pagos < total - 0.01:
                 messagebox.showerror(
                     "Pago insuficiente",
-                    f"El total de pagos RD$ {total_pagos:.2f} es menor que el total RD$ {total:.2f}"
+                    f"El total de pagos RD$ {total_pagos:.2f} es menor que el total RD$ {total:.2f}",
                 )
                 return
 
@@ -1936,6 +2108,7 @@ class FacturaManager:
             self._cliente_id = None
             self.var_solo_presupuesto.set(False)
             self._recalcular_totales_y_refrescar()
+            self._actualizar_vista_secuencia_documento(regenerar=True)
         except Exception as e:
             if conn is not None:
                 try:
@@ -2140,6 +2313,7 @@ class FacturaManager:
             self.factura_items.clear()
             self._cliente_id = None
             self._recalcular_totales_y_refrescar()
+            self._actualizar_vista_secuencia_documento(regenerar=True)
 
         except Exception as e:
             try:

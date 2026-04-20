@@ -21,19 +21,14 @@ from home_dashboard import HomeDashboardManager
 
 class BarSystemApp:
     def __init__(self):
-        # Configurar tema PRIMERO
-        Styles.setup_theme()
-
-        # Inicializar base de datos (crea tablas y usuarios por defecto)
+        # Base de datos antes del tema (modo claro/oscuro y color vienen de config)
         self.db = Database()
+        Styles.setup_theme_from_db(self.db)
 
         # ✅ Ventana principal: SIEMPRE CTk
         self.root = ctk.CTk()
-        self.root.geometry("1200x700")
-        self.root.minsize(1000, 600)
-
-        # Fondo oscuro
-        self.root.configure(fg_color='#2B2B2B')
+        self._apply_sensible_window_geometry()
+        Styles.apply_root_window_bg(self.root, self.db)
 
         # Variables de sesión
         self.current_user = None
@@ -52,6 +47,10 @@ class BarSystemApp:
         self.historial_facturas_manager = None
         self.home_dashboard_manager = None
         self.lbl_main_title = None
+        self.header_bar = None
+        self.btn_nav_toggle = None
+        self.nav_wrap = None
+        self._nav_collapsed = False
         self._nav_buttons = {}
         self._nav_active = None
 
@@ -60,6 +59,34 @@ class BarSystemApp:
 
         # Mostrar primero el login
         self.show_login()
+
+    def _apply_sensible_window_geometry(self):
+        """
+        Tamaño inicial y mínimo acordes a la pantalla (p. ej. 1366×768 o notebooks),
+        para que la ventana no quede cortada y pueda redimensionarse.
+        """
+        self.root.update_idletasks()
+        sw = max(1, self.root.winfo_screenwidth())
+        sh = max(1, self.root.winfo_screenheight())
+        # Espacio para barra de tareas y bordes del sistema
+        mx, my = 40, 72
+        avail_w = max(640, sw - mx)
+        avail_h = max(400, sh - my)
+
+        pref_w, pref_h = 1200, 700
+        w = min(pref_w, avail_w)
+        h = min(pref_h, avail_h)
+
+        # Mínimos bajos para pantallas pequeñas; nunca mayores que el área útil
+        min_w = max(640, min(780, avail_w))
+        min_h = max(400, min(460, avail_h))
+
+        self.root.minsize(min_w, min_h)
+        self.root.resizable(True, True)
+
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     # ==========================
     #       PANTALLA LOGIN
@@ -222,10 +249,9 @@ class BarSystemApp:
 
     def _setup_main_nav(self):
         self._nav_buttons.clear()
-        nav_wrap = ctk.CTkFrame(self.main_bg, fg_color="#1e293b", corner_radius=8)
-        nav_wrap.pack(fill="x", padx=10, pady=(0, 8))
+        self.nav_wrap = ctk.CTkFrame(self.main_bg, fg_color="#1e293b", corner_radius=8)
 
-        rows = ctk.CTkFrame(nav_wrap, fg_color="transparent")
+        rows = ctk.CTkFrame(self.nav_wrap, fg_color="transparent")
         rows.pack(fill="x", padx=8, pady=8)
 
         def row():
@@ -309,25 +335,72 @@ class BarSystemApp:
     def _open_apariencia_config(self):
         open_config_impresion(self.root, self.db, on_applied=self.refresh_branding)
 
+    def _toggle_main_nav(self):
+        """Muestra u oculta el panel de botones del menú principal (estilo hamburguesa)."""
+        self._nav_collapsed = not self._nav_collapsed
+        try:
+            self.db.set_config(
+                "main_nav_collapsed", "1" if self._nav_collapsed else "0"
+            )
+        except Exception:
+            pass
+        self._sync_main_nav_button_and_pack()
+
+    def _sync_main_nav_button_and_pack(self):
+        """Actualiza el icono del botón y empaqueta o retira la barra de navegación."""
+        if self.nav_wrap is None or self.btn_nav_toggle is None:
+            return
+        if self._nav_collapsed:
+            self.nav_wrap.pack_forget()
+            self.btn_nav_toggle.configure(text="☰")
+        else:
+            self.nav_wrap.pack(
+                fill="x", padx=10, pady=(0, 8), before=self.main_container
+            )
+            self.btn_nav_toggle.configure(text="▲")
+
     def setup_ui(self):
         self.main_bg = ctk.CTkFrame(self.root, fg_color="#2B2B2B")
         self.main_bg.pack(fill="both", expand=True)
 
-        self.lbl_main_title = ctk.CTkLabel(
-            self.main_bg,
-            text="",
-            font=("Arial", 20, "bold"),
-            height=52,
-            fg_color="#334155",
-            text_color="white",
+        self.header_bar = ctk.CTkFrame(self.main_bg, fg_color="#334155", corner_radius=6)
+        self.header_bar.pack(fill="x", padx=10, pady=(10, 6))
+
+        self.btn_nav_toggle = ctk.CTkButton(
+            self.header_bar,
+            text="▲",
+            width=42,
+            height=40,
+            font=("Arial", 16),
+            fg_color="#475569",
+            hover_color="#2563eb",
+            command=self._toggle_main_nav,
         )
-        self.lbl_main_title.pack(fill="x", padx=10, pady=(10, 6))
+        self.btn_nav_toggle.pack(side="left", padx=(10, 8), pady=8)
+
+        self.lbl_main_title = ctk.CTkLabel(
+            self.header_bar,
+            text="",
+            font=("Arial", 18, "bold"),
+            text_color="white",
+            anchor="w",
+        )
+        self.lbl_main_title.pack(side="left", fill="x", expand=True, padx=(4, 12), pady=10)
         self.refresh_branding()
 
         self._setup_main_nav()
 
+        try:
+            self._nav_collapsed = (
+                self.db.get_config("main_nav_collapsed", "0") == "1"
+            )
+        except Exception:
+            self._nav_collapsed = False
+
         self.main_container = ctk.CTkFrame(self.main_bg, fg_color="#2B2B2B")
         self.main_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self._sync_main_nav_button_and_pack()
 
         self.show_dashboard()
 

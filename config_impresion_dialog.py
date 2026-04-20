@@ -9,6 +9,7 @@ import customtkinter as ctk
 from PIL import Image
 
 from database import Database
+from styles import Styles
 
 
 class ConfigImpresionDialog(ctk.CTkToplevel):
@@ -17,7 +18,7 @@ class ConfigImpresionDialog(ctk.CTkToplevel):
         self.db = db
         self._on_applied = on_applied
         self.title("Configuración — empresa y apariencia")
-        self.geometry("520x720")
+        self.geometry("520x780")
         self.resizable(True, True)
         self.configure(fg_color=("#ECE8E2", "#2B2B2B"))
         self.transient(master.winfo_toplevel())
@@ -41,6 +42,57 @@ class ConfigImpresionDialog(ctk.CTkToplevel):
             text="Apariencia (login y barra superior)",
             font=("Arial", 14, "bold"),
         ).pack(anchor="w", **pad)
+
+        ui_mode_lbl = {
+            "dark": "Oscuro",
+            "light": "Claro",
+            "system": "Sistema",
+        }
+        ui_theme_lbl = {
+            "blue": "Azul",
+            "green": "Verde",
+            "dark-blue": "Azul oscuro",
+        }
+        cur_mode = (self.db.get_config("ui_appearance_mode", "dark") or "dark").strip()
+        if cur_mode not in ui_mode_lbl:
+            cur_mode = "dark"
+        cur_theme = (self.db.get_config("ui_color_theme", "blue") or "blue").strip()
+        if cur_theme not in ui_theme_lbl:
+            cur_theme = "blue"
+
+        ctk.CTkLabel(
+            self,
+            text="Modo de ventana (claro / oscuro) y color de acento:",
+            font=("Arial", 11),
+        ).pack(anchor="w", padx=14)
+        row_ui = ctk.CTkFrame(self, fg_color="transparent")
+        row_ui.pack(fill="x", padx=14, pady=4)
+        ctk.CTkLabel(row_ui, text="Modo:", width=120, anchor="w").pack(
+            side="left", padx=(0, 8)
+        )
+        self.combo_ui_mode = ctk.CTkComboBox(
+            row_ui,
+            width=200,
+            values=list(ui_mode_lbl.values()),
+        )
+        self.combo_ui_mode.set(ui_mode_lbl[cur_mode])
+        self.combo_ui_mode.pack(side="left", padx=4)
+        ctk.CTkLabel(row_ui, text="Tema:", width=56, anchor="w").pack(
+            side="left", padx=(16, 8)
+        )
+        self.combo_ui_theme = ctk.CTkComboBox(
+            row_ui,
+            width=180,
+            values=list(ui_theme_lbl.values()),
+        )
+        self.combo_ui_theme.set(ui_theme_lbl[cur_theme])
+        self.combo_ui_theme.pack(side="left", padx=4)
+        ctk.CTkLabel(
+            self,
+            text="Se aplica al guardar (también afecta botones y cuadros del sistema).",
+            font=("Arial", 10),
+            text_color="gray",
+        ).pack(anchor="w", padx=14, pady=(0, 6))
 
         ctk.CTkLabel(
             self,
@@ -209,6 +261,19 @@ class ConfigImpresionDialog(ctk.CTkToplevel):
             messagebox.showerror("Logo", "La ruta del logo no existe o no es accesible.")
             return
         self.db.set_config("app_logo_path", logo)
+
+        inv_mode = {"Oscuro": "dark", "Claro": "light", "Sistema": "system"}
+        inv_theme = {"Azul": "blue", "Verde": "green", "Azul oscuro": "dark-blue"}
+        mtxt = (self.combo_ui_mode.get() or "Oscuro").strip()
+        ttxt = (self.combo_ui_theme.get() or "Azul").strip()
+        self.db.set_config("ui_appearance_mode", inv_mode.get(mtxt, "dark"))
+        self.db.set_config("ui_color_theme", inv_theme.get(ttxt, "blue"))
+        Styles.setup_theme_from_db(self.db)
+        try:
+            top = self.master.winfo_toplevel()
+            Styles.apply_root_window_bg(top, self.db)
+        except Exception:
+            pass
 
         nombre = self.ent_nombre.get().strip() or "Mi empresa"
         direccion = self.txt_dir.get("1.0", "end").strip()

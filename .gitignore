@@ -1,4 +1,5 @@
 .venv/
+.venv_transcribe/
 __pycache__/
 *.pyc
 dist/

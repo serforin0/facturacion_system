@@ -267,6 +267,7 @@ class InventoryManager:
 
         cols = (
             "Código",
+            "Cód. barras",
             "Descripción",
             "P. venta",
             "Tipo",
@@ -280,11 +281,12 @@ class InventoryManager:
         self.tree = ttk.Treeview(
             tree_frame, columns=cols, show="headings", height=18
         )
-        widths = (96, 220, 82, 72, 56, 72, 52, 100, 68, 92)
+        widths = (88, 118, 200, 82, 72, 56, 72, 52, 100, 68, 92)
         for col, w in zip(cols, widths):
             self.tree.heading(col, text=col)
             self.tree.column(col, width=w, anchor="center")
         self.tree.column("Descripción", anchor="w")
+        self.tree.column("Cód. barras", anchor="w")
 
         sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -502,8 +504,8 @@ class InventoryManager:
         query = """
             SELECT p.id,
                    COALESCE(NULLIF(TRIM(p.codigo_producto), ''),
-                            NULLIF(TRIM(p.codigo_barras), ''),
                             printf('P-%05d', p.id)),
+                   IFNULL(NULLIF(TRIM(p.codigo_barras), ''), ''),
                    p.nombre,
                    p.precio,
                    IFNULL(p.tipo_producto, 'Físico'),
@@ -552,6 +554,7 @@ class InventoryManager:
             (
                 pid,
                 codigo,
+                codigo_barras,
                 nombre,
                 precio,
                 tipo,
@@ -582,6 +585,7 @@ class InventoryManager:
                 iid=str(pid),
                 values=(
                     codigo,
+                    codigo_barras or "—",
                     nombre,
                     precio_s,
                     tipo,
@@ -652,7 +656,7 @@ class InventoryManager:
 
         product_id = int(selected[0])
         vals = self.tree.item(selected[0])["values"]
-        product_name = vals[1] if vals else str(product_id)
+        product_name = vals[2] if vals and len(vals) > 2 else str(product_id)
 
         confirm = messagebox.askyesno(
             "Confirmar",

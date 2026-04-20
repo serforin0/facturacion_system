@@ -151,6 +151,52 @@ def ejecutar_cierre_caja_desde_fila(
             cid,
         ),
     )
+
+    # Otros turnos sin fecha_cierre (duplicados): si no se cierran, la app sigue viendo "caja abierta"
+    cursor.execute(
+        """
+        SELECT id, fecha_apertura, monto_inicial
+        FROM cierres_caja
+        WHERE fecha_cierre IS NULL
+        """
+    )
+    for oid, fap, mi_orf in cursor.fetchall():
+        tv_o, ef_o, tar_o, ot_o = calcular_totales_desde_apertura(db, fap)
+        mi_f = float(mi_orf or 0)
+        ef_esp_o = ef_o + mi_f
+        obs_o = (
+            "Cierre automático: había otro turno sin cerrar en la base de datos "
+            "(duplicado). Revise el historial."
+        )
+        cursor.execute(
+            """
+            UPDATE cierres_caja
+            SET fecha_cierre = ?,
+                usuario_cierre = ?,
+                total_ventas = ?,
+                total_efectivo_sistema = ?,
+                total_tarjeta_sistema = ?,
+                total_otros_sistema = ?,
+                efectivo_contado = ?,
+                diferencia_efectivo = ?,
+                observaciones = ?,
+                estado = 'cerrado'
+            WHERE id = ?
+            """,
+            (
+                fecha_cierre,
+                usuario_cierre_db,
+                tv_o,
+                ef_o,
+                tar_o,
+                ot_o,
+                ef_esp_o,
+                0.0,
+                obs_o,
+                oid,
+            ),
+        )
+
     conn.commit()
     conn.close()
 
@@ -451,8 +497,8 @@ class CajaManager:
                    total_otros_sistema, efectivo_contado,
                    diferencia_efectivo, observaciones, estado
             FROM cierres_caja
-            WHERE estado = 'abierto'
-            ORDER BY fecha_apertura DESC
+            WHERE fecha_cierre IS NULL
+            ORDER BY datetime(fecha_apertura) DESC
             LIMIT 1
             """
         )
@@ -502,6 +548,11 @@ class CajaManager:
             )
             self.lbl_totales_info.configure(text=texto_totales)
 
+            # Sugerir efectivo esperado (fondo + ventas en efectivo) para cuadrar sin descuadre
+            esperado_ef = ef_sis + float(monto_inicial or 0)
+            self.entry_efectivo_contado.delete(0, "end")
+            self.entry_efectivo_contado.insert(0, f"{esperado_ef:.2f}")
+
             # Mostrar frame de caja abierta
             self.frame_caja_abierta.pack(fill="x", padx=5, pady=(0, 5))
 
@@ -515,6 +566,22 @@ class CajaManager:
                 "Caja abierta",
                 "Ya hay una caja abierta. Debes cerrarla antes de abrir una nueva."
             )
+            return
+
+        conn_chk = self.db.get_connection()
+        cur_chk = conn_chk.cursor()
+        cur_chk.execute(
+            "SELECT id FROM cierres_caja WHERE fecha_cierre IS NULL LIMIT 1"
+        )
+        dup = cur_chk.fetchone()
+        conn_chk.close()
+        if dup is not None:
+            messagebox.showwarning(
+                "Caja abierta",
+                "Ya existe un turno sin cerrar en la base de datos. "
+                "Cierre la caja en este módulo antes de abrir otra.",
+            )
+            self._load_estado_caja()
             return
 
         nombre_caja = self.entry_nombre_caja.get().strip() or "Caja 1"
