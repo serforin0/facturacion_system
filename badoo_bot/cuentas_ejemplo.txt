@@ -1,0 +1,5 @@
+# Lista de Cuentas de Badoo de Ejemplo
+# Formatos soportados: correo:contraseña o correo,contraseña
+ejemplo1@badoo.com:claveSegura123
+ejemplo2@badoo.com,claveSuperSegura456
+ejemplo3@badoo.com:miClaveBadoo789

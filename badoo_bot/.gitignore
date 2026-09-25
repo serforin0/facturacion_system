@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Badoo session data (cookies, local storage)
+.badoo_sessions/
+
+# Logs & temp files
+*.log
+.DS_Store
