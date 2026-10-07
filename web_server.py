@@ -172,7 +172,7 @@ def _exigir_alguno(request: Request, modulos: tuple[str, ...]) -> str:
     return user
 
 
-def _armar_lineas(cur, items: list[ItemIn]):
+def _armar_lineas(cur, items: list[ItemIn], descuentos: tuple[float, float, float] = (2.0, 5.0, 10.0)):
     subtotal = 0.0
     impuesto = 0.0
     det = []
@@ -183,7 +183,7 @@ def _armar_lineas(cur, items: list[ItemIn]):
         row = cur.fetchone()
         if not row:
             continue
-        precio = round(float(item.precio), 2) if item.precio is not None else _precio(row, item.nivel)
+        precio = round(float(item.precio), 2) if item.precio is not None else _precio(row, item.nivel, descuentos)
         bruto = round(precio * item.cantidad, 2)
         itbis = round(bruto * TASA_ITBIS, 2) if int(row[8] or 1) else 0.0
         subtotal += bruto
@@ -240,14 +240,18 @@ MODULOS = [
 ]
 
 
-def _precio(row, nivel: int) -> float:
-    precios = [row[2], row[12], row[13], row[14]]
+def _precio(row, nivel: int, descuentos: tuple[float, float, float] = (2.0, 5.0, 10.0)) -> float:
+    base = float(row[2] or 0)
+    guardados = [base, row[12], row[13], row[14]]
+    nivel = max(1, min(4, int(nivel or 1)))
     try:
-        p = float(precios[max(1, min(4, nivel)) - 1] or 0)
+        p = float(guardados[nivel - 1] or 0)
     except (TypeError, ValueError, IndexError):
         p = 0.0
+    if p <= 0 and nivel > 1 and base > 0:
+        p = round(base * (1 - descuentos[nivel - 2] / 100.0), 2)
     if p <= 0:
-        p = float(row[2] or 0)
+        p = base
     return p
 
 
@@ -400,7 +404,9 @@ def estado(request: Request):
 @app.get("/api/catalogo")
 def catalogo(request: Request, q: str = "", categoria: int | None = None):
     _user(request)
-    conn = db().get_connection()
+    base = db()
+    d2, d3, d4 = _descuentos_mayor(base)
+    conn = base.get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id, nombre FROM categorias ORDER BY nombre COLLATE NOCASE")
     categorias = [{"id": i, "nombre": n} for i, n in cur.fetchall()]
@@ -414,16 +420,24 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
         params.extend([f"%{q.strip()}%", f"%{q.strip()}%"])
     sql += " ORDER BY nombre COLLATE NOCASE LIMIT 80"
     cur.execute(sql, params)
+
+    def _nivel(base_precio: float, guardado, porcentaje: float) -> float:
+        monto = float(guardado or 0)
+        if monto > 0:
+            return monto
+        return round(base_precio * (1 - porcentaje / 100.0), 2)
+
     productos = []
     for row in cur.fetchall():
+        base_precio = float(row[2] or 0)
         productos.append(
             {
                 "id": row[0],
                 "nombre": row[1],
-                "precio": float(row[2] or 0),
-                "precio_2": float(row[12] or 0),
-                "precio_3": float(row[13] or 0),
-                "precio_4": float(row[14] or 0),
+                "precio": base_precio,
+                "precio_2": _nivel(base_precio, row[12], d2),
+                "precio_3": _nivel(base_precio, row[13], d3),
+                "precio_4": _nivel(base_precio, row[14], d4),
                 "stock": row[5],
                 "codigo": row[6] or "",
                 "itbis": bool(int(row[8] or 1)),
@@ -437,7 +451,12 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
         for i, n, p in db().listar_combos_venta()
     ]
     conn.close()
-    return {"categorias": categorias, "productos": productos, "combos": combos}
+    return {
+        "categorias": categorias,
+        "productos": productos,
+        "combos": combos,
+        "descuentos": {"p2": d2, "p3": d3, "p4": d4},
+    }
 
 
 @app.post("/api/caja/abrir")
@@ -478,6 +497,7 @@ def vender(request: Request, body: VentaIn):
     subtotal = 0.0
     impuesto = 0.0
     cliente_nombre = "Consumidor final"
+    descuentos = _descuentos_mayor(base)
     conn = base.get_connection()
     cur = conn.cursor()
     try:
@@ -507,7 +527,7 @@ def vender(request: Request, body: VentaIn):
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=400, detail=f"Producto {item.id} no existe")
-            precio = _precio(row, item.nivel)
+            precio = _precio(row, item.nivel, descuentos)
             bruto = round(precio * item.cantidad, 2)
             desc = _descuento_promo(cur, row[0], item.cantidad, precio, bruto)
             neto = round(max(0.0, bruto - desc), 2)
@@ -1400,9 +1420,10 @@ def crear_cotizacion(request: Request, body: VentaIn):
     if not body.items:
         raise HTTPException(status_code=400, detail="El ticket está vacío")
     base = db()
+    descuentos = _descuentos_mayor(base)
     conn = base.get_connection()
     cur = conn.cursor()
-    det, subtotal, impuesto = _armar_lineas(cur, body.items)
+    det, subtotal, impuesto = _armar_lineas(cur, body.items, descuentos)
     if not det:
         conn.close()
         raise HTTPException(status_code=400, detail="La cotización necesita productos")
@@ -1437,6 +1458,7 @@ def crear_cotizacion(request: Request, body: VentaIn):
 def editar_cotizacion(request: Request, factura_id: int, body: VentaIn):
     _exigir(request, "cotizaciones")
     base = db()
+    descuentos = _descuentos_mayor(base)
     conn = base.get_connection()
     cur = conn.cursor()
     cur.execute("SELECT estado FROM facturas WHERE id=?", (factura_id,))
@@ -1447,7 +1469,7 @@ def editar_cotizacion(request: Request, factura_id: int, body: VentaIn):
     if row[0] != "cotizacion":
         conn.close()
         raise HTTPException(status_code=400, detail="La factura emitida se consulta. Solo la cotización se edita.")
-    det, subtotal, impuesto = _armar_lineas(cur, body.items)
+    det, subtotal, impuesto = _armar_lineas(cur, body.items, descuentos)
     if not det:
         conn.close()
         raise HTTPException(status_code=400, detail="La cotización necesita productos")
@@ -1672,10 +1694,44 @@ def ncf(request: Request):
 class ProductoIn(BaseModel):
     nombre: str
     precio: float
+    precio_2: float | None = None
+    precio_3: float | None = None
+    precio_4: float | None = None
     stock: float = 0
     codigo: str = ""
     bodega: str = "Principal"
     categoria: str = ""
+
+
+class DescuentosMayorIn(BaseModel):
+    p2: float = 2
+    p3: float = 5
+    p4: float = 10
+
+
+def _descuentos_mayor(base: Database) -> tuple[float, float, float]:
+    conn = base.get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT clave, valor FROM config WHERE clave IN ('desc_precio_2','desc_precio_3','desc_precio_4')"
+    )
+    mapa = {clave: valor for clave, valor in cur.fetchall()}
+    conn.close()
+
+    def uno(clave: str, default: str) -> float:
+        try:
+            valor = float(mapa.get(clave, default) or default)
+        except (TypeError, ValueError):
+            valor = float(default)
+        return min(90.0, max(0.0, valor))
+
+    return uno("desc_precio_2", "2"), uno("desc_precio_3", "5"), uno("desc_precio_4", "10")
+
+
+def _monto_mayor(precio: float, porcentaje: float, explicito: float | None) -> float:
+    if explicito is not None:
+        return round(float(explicito), 2)
+    return round(float(precio) * (1 - porcentaje / 100.0), 2)
 
 
 class UsuarioIn(BaseModel):
@@ -1761,7 +1817,9 @@ def inventario(request: Request, q: str = ""):
     conn = db().get_connection()
     cur = conn.cursor()
     sql = """
-        SELECT p.id, p.nombre, IFNULL(p.precio,0), IFNULL(p.stock,0),
+        SELECT p.id, p.nombre, IFNULL(p.precio,0),
+               IFNULL(p.precio_2,0), IFNULL(p.precio_3,0), IFNULL(p.precio_4,0),
+               IFNULL(p.stock,0),
                IFNULL(p.codigo_barras,''), IFNULL(p.bodega_codigo,'Principal'),
                IFNULL(c.nombre,''), IFNULL(p.stock_minimo,0), IFNULL(p.activo,1)
         FROM productos p
@@ -1776,13 +1834,15 @@ def inventario(request: Request, q: str = ""):
     cur.execute(sql, params)
     rows = [
         {
-            "id": i, "nombre": n, "precio": p, "stock": s, "codigo": cb,
-            "bodega": b or "Principal", "categoria": cat, "minimo": mn, "activo": bool(a),
+            "id": i, "nombre": n, "precio": p, "precio_2": p2, "precio_3": p3, "precio_4": p4,
+            "stock": s, "codigo": cb, "bodega": b or "Principal", "categoria": cat,
+            "minimo": mn, "activo": bool(a),
         }
-        for i, n, p, s, cb, b, cat, mn, a in cur.fetchall()
+        for i, n, p, p2, p3, p4, s, cb, b, cat, mn, a in cur.fetchall()
     ]
     conn.close()
-    return {"items": rows}
+    d2, d3, d4 = _descuentos_mayor(db())
+    return {"items": rows, "descuentos": {"p2": d2, "p3": d3, "p4": d4}}
 
 
 @app.post("/api/inventario")
@@ -1803,14 +1863,19 @@ def crear_producto(request: Request, body: ProductoIn):
         else:
             cur.execute("INSERT INTO categorias (nombre) VALUES (?)", (body.categoria.strip(),))
             cat_id = cur.lastrowid
+    d2, d3, d4 = _descuentos_mayor(base)
+    p2 = _monto_mayor(body.precio, d2, body.precio_2)
+    p3 = _monto_mayor(body.precio, d3, body.precio_3)
+    p4 = _monto_mayor(body.precio, d4, body.precio_4)
     cur.execute(
         """
         INSERT INTO productos (
-            nombre, precio, precio_base, precio_minimo, stock, categoria_id,
-            stock_minimo, codigo_barras, activo, bodega_codigo, aplica_itbis, facturar_sin_stock
-        ) VALUES (?, ?, ?, 0, ?, ?, 0, ?, 1, ?, 1, 1)
+            nombre, precio, precio_base, precio_minimo, precio_2, precio_3, precio_4,
+            stock, categoria_id, stock_minimo, codigo_barras, activo, bodega_codigo,
+            aplica_itbis, facturar_sin_stock
+        ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?, 1, ?, 1, 1)
         """,
-        (nombre, body.precio, body.precio, body.stock, cat_id, body.codigo.strip() or None, body.bodega.strip() or "Principal"),
+        (nombre, body.precio, body.precio, p2, p3, p4, body.stock, cat_id, body.codigo.strip() or None, body.bodega.strip() or "Principal"),
     )
     pid = cur.lastrowid
     conn.commit()
@@ -1840,13 +1905,18 @@ def editar_producto(request: Request, producto_id: int, body: ProductoIn):
     cur = conn.cursor()
     cat_id = _categoria_id(cur, body.categoria)
     bodega = body.bodega.strip() or "Principal"
+    d2, d3, d4 = _descuentos_mayor(db())
+    p2 = _monto_mayor(body.precio, d2, body.precio_2)
+    p3 = _monto_mayor(body.precio, d3, body.precio_3)
+    p4 = _monto_mayor(body.precio, d4, body.precio_4)
     cur.execute(
         """
         UPDATE productos
-        SET nombre=?, precio=?, precio_base=?, stock=?, codigo_barras=?, bodega_codigo=?, categoria_id=?
+        SET nombre=?, precio=?, precio_base=?, precio_2=?, precio_3=?, precio_4=?,
+            stock=?, codigo_barras=?, bodega_codigo=?, categoria_id=?
         WHERE id=?
         """,
-        (nombre, body.precio, body.precio, body.stock, body.codigo.strip() or None, bodega, cat_id, producto_id),
+        (nombre, body.precio, body.precio, p2, p3, p4, body.stock, body.codigo.strip() or None, bodega, cat_id, producto_id),
     )
     if cur.rowcount == 0:
         conn.close()
@@ -1868,6 +1938,40 @@ def editar_producto(request: Request, producto_id: int, body: ProductoIn):
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@app.get("/api/precios-mayor")
+def ver_precios_mayor(request: Request):
+    _exigir(request, "inventario")
+    d2, d3, d4 = _descuentos_mayor(db())
+    return {"p2": d2, "p3": d3, "p4": d4}
+
+
+@app.post("/api/precios-mayor")
+def guardar_precios_mayor(request: Request, body: DescuentosMayorIn):
+    _exigir(request, "inventario")
+    d2 = min(90.0, max(0.0, float(body.p2)))
+    d3 = min(90.0, max(0.0, float(body.p3)))
+    d4 = min(90.0, max(0.0, float(body.p4)))
+    base = db()
+    base.set_config("desc_precio_2", str(d2))
+    base.set_config("desc_precio_3", str(d3))
+    base.set_config("desc_precio_4", str(d4))
+    conn = base.get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE productos
+        SET precio_2 = ROUND(IFNULL(precio, 0) * (1 - ? / 100.0), 2),
+            precio_3 = ROUND(IFNULL(precio, 0) * (1 - ? / 100.0), 2),
+            precio_4 = ROUND(IFNULL(precio, 0) * (1 - ? / 100.0), 2)
+        """,
+        (d2, d3, d4),
+    )
+    cambiados = cur.rowcount
+    conn.commit()
+    conn.close()
+    return {"ok": True, "p2": d2, "p3": d3, "p4": d4, "productos": cambiados}
 
 
 @app.post("/api/etiquetas")
@@ -2540,8 +2644,20 @@ async function cargarClientesVenta(){
   } catch(e) { /* el cajero básico no lista clientes */ }
 }
 async function salir(){ await api("/api/logout", {method:"POST"}); location.reload(); }
+function etiquetasLista(d){
+  window._descuentos = d || window._descuentos || {p2:2, p3:5, p4:10};
+  const x = window._descuentos;
+  const actual = lista.value || "1";
+  lista.innerHTML = `<option value="1">Público</option><option value="2">Por mayor ${x.p2}%</option><option value="3">Por mayor ${x.p3}%</option><option value="4">Por mayor ${x.p4}%</option>`;
+  lista.value = actual;
+}
+function nombresLista(){
+  const x = window._descuentos || {p2:2, p3:5, p4:10};
+  return ["", "Público", "Por mayor "+x.p2+"%", "Por mayor "+x.p3+"%", "Por mayor "+x.p4+"%"];
+}
 async function cargar(){
   const data = await api("/api/catalogo?q=" + encodeURIComponent(q.value) + (cat.value ? "&categoria="+cat.value : ""));
+  if (data.descuentos) etiquetasLista(data.descuentos);
   cat.innerHTML = '<option value="">Todas</option>' + data.categorias.map(c=>`<option value="${c.id}">${c.nombre}</option>`).join("");
   if (window._cat) cat.value = window._cat;
   const tarjetas = data.productos.concat(data.combos || []);
@@ -2658,8 +2774,8 @@ async function pintarForm(nombre){
     metodos: ["Métodos de pago", "Los activos salen en el ticket. Si afecta caja, el vuelto se calcula sobre ese monto.",
       `<div class="form"><label>Código<input id="metCod"/></label><label>Nombre<input id="metNom"/></label><label>Afecta caja<select id="metCaja"><option value="0">No</option><option value="1">Sí</option></select></label><label>Activo<select id="metActivo"><option value="1">Sí</option><option value="0">No</option></select></label><button onclick="guardarMetodo()">Guardar</button></div><div id="metTabla"></div>`],
     ncf: ["Comprobantes NCF", "Secuencias que se imprimen en cada venta.", ""],
-    inventario: ["Inventario", "Marca productos y descarga el PDF de etiquetas con código de barras.",
-      `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button></div><div class="form" style="margin-top:14px"><label>Nombre<input id="invNom"/></label><label>Precio<input id="invPrecio" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div><div id="invTabla"></div>`],
+    inventario: ["Inventario", "El precio original es el de público. Los otros tres son por mayor y salen del porcentaje. El dueño puede cambiar esos porcentajes.",
+      `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button></div><div class="form" style="margin-top:14px"><label>1er por mayor %<input id="descP2" type="number" step="0.01" value="2"/></label><label>2do por mayor %<input id="descP3" type="number" step="0.01" value="5"/></label><label>3er por mayor %<input id="descP4" type="number" step="0.01" value="10"/></label><button class="sec" onclick="guardarDescuentos()">Guardar porcentajes</button></div><div class="form" style="margin-top:14px"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invPrecio" type="number" step="0.01"/></label><label>Al <span id="etiqP2">2</span>%<input id="invP2" type="number" step="0.01"/></label><label>Al <span id="etiqP3">5</span>%<input id="invP3" type="number" step="0.01"/></label><label>Al <span id="etiqP4">10</span>%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div><div id="invTabla"></div>`],
     kardex: ["Kardex", "Movimientos de un producto: ventas, compras, transferencias y devoluciones.",
       `<div class="form"><label>Producto<select id="kxProd">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
     historial: ["Historial", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
@@ -2969,11 +3085,44 @@ async function guardarNcf(){
     await pintarNcf();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
+function precioConDescuento(base, pct){
+  return (Number(base || 0) * (1 - Number(pct || 0) / 100)).toFixed(2);
+}
+function precioNivel(guardado, base, pct){
+  return Number(guardado || 0) > 0 ? guardado : precioConDescuento(base, pct);
+}
+function pintarEtiquetasMayor(){
+  if (document.getElementById("etiqP2")) etiqP2.textContent = descP2.value;
+  if (document.getElementById("etiqP3")) etiqP3.textContent = descP3.value;
+  if (document.getElementById("etiqP4")) etiqP4.textContent = descP4.value;
+}
+function recalcularPreciosMayor(){
+  const base = Number(invPrecio.value || 0);
+  invP2.value = precioConDescuento(base, descP2.value);
+  invP3.value = precioConDescuento(base, descP3.value);
+  invP4.value = precioConDescuento(base, descP4.value);
+  pintarEtiquetasMayor();
+}
 async function cargarInventario(){
   const qv = document.getElementById("invQ");
   const d = await api("/api/inventario?q=" + encodeURIComponent(qv ? qv.value : ""));
   window._prods = d.items || [];
-  invTabla.innerHTML = tabla(["","Producto","Precio","Stock","Código","Bodega","Categoría",""], window._prods.map(p => [`<input class="etiq" type="checkbox" value="${p.id}"/>`, escDash(p.nombre), money(p.precio), p.stock, escDash(p.codigo || "—"), escDash(p.bodega), escDash(p.categoria || "—"), `<button class="sec" onclick="editarProducto(${p.id})">Editar</button>`]));
+  if (d.descuentos && document.getElementById("descP2")) {
+    descP2.value = d.descuentos.p2;
+    descP3.value = d.descuentos.p3;
+    descP4.value = d.descuentos.p4;
+    etiquetasLista(d.descuentos);
+    pintarEtiquetasMayor();
+  }
+  const x = window._descuentos || {p2:2, p3:5, p4:10};
+  invTabla.innerHTML = tabla(["","Producto","","Original", x.p2+"%", x.p3+"%", x.p4+"%", "Stock","Código","Bodega","Categoría"], window._prods.map(p => [
+    `<input class="etiq" type="checkbox" value="${p.id}"/>`, escDash(p.nombre),
+    `<button class="sec" onclick="editarProducto(${p.id})">Editar</button>`,
+    money(p.precio), money(precioNivel(p.precio_2, p.precio, x.p2)), money(precioNivel(p.precio_3, p.precio, x.p3)), money(precioNivel(p.precio_4, p.precio, x.p4)),
+    p.stock, escDash(p.codigo || "—"), escDash(p.bodega), escDash(p.categoria || "—")
+  ]));
+  if (document.getElementById("invPrecio")) invPrecio.oninput = recalcularPreciosMayor;
+  [descP2, descP3, descP4].forEach(el => { if (el) el.oninput = recalcularPreciosMayor; });
 }
 function editarProducto(id){
   const p = (window._prods || []).find(x => x.id === id);
@@ -2981,12 +3130,28 @@ function editarProducto(id){
   window._prodId = id;
   invNom.value = p.nombre || "";
   invPrecio.value = p.precio;
+  invP2.value = Number(p.precio_2 || 0) > 0 ? p.precio_2 : precioConDescuento(p.precio, descP2.value);
+  invP3.value = Number(p.precio_3 || 0) > 0 ? p.precio_3 : precioConDescuento(p.precio, descP3.value);
+  invP4.value = Number(p.precio_4 || 0) > 0 ? p.precio_4 : precioConDescuento(p.precio, descP4.value);
   invStock.value = p.stock;
   invCod.value = p.codigo || "";
   invBod.value = p.bodega || "Principal";
   invCat.value = p.categoria || "";
   const btn = document.getElementById("btnProd");
   if (btn) btn.textContent = "Guardar cambios";
+  invNom.focus();
+}
+async function guardarDescuentos(){
+  try {
+    const r = await api("/api/precios-mayor", {method:"POST", body: JSON.stringify({
+      p2: Number(descP2.value), p3: Number(descP3.value), p4: Number(descP4.value)
+    })});
+    etiquetasLista(r);
+    formMsg.style.color = "#86efac";
+    formMsg.textContent = "Porcentajes guardados. Se recalcularon " + r.productos + " productos.";
+    productosCache = [];
+    await cargarInventario();
+  } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 async function bajarPdf(url, nombre, opt){
   const r = await fetch(url, Object.assign({credentials:"same-origin"}, opt||{}));
@@ -3018,8 +3183,9 @@ async function etiquetasPdf(){
 async function guardarProducto(){
   try {
     const body = {
-      nombre: invNom.value, precio: Number(invPrecio.value), stock: Number(invStock.value||0),
-      codigo: invCod.value, bodega: invBod.value, categoria: invCat.value
+      nombre: invNom.value, precio: Number(invPrecio.value),
+      precio_2: Number(invP2.value), precio_3: Number(invP3.value), precio_4: Number(invP4.value),
+      stock: Number(invStock.value||0), codigo: invCod.value, bodega: invBod.value, categoria: invCat.value
     };
     const url = window._prodId ? "/api/inventario/" + window._prodId : "/api/inventario";
     await api(url, {method:"POST", body: JSON.stringify(body)});
@@ -3485,7 +3651,7 @@ async function cobrar(){
   msg.textContent = "";
   try {
     const nivel = Number(lista.value);
-    const nombres = ["","Público","Mayorista","VIP","Especial"];
+    const nombres = nombresLista();
     const payload = {
       items: cart.map(l=>({id:l.id, cantidad:l.cantidad, nivel, combo:!!l.combo})),
       pagos: pagosActuales().filter(p => p.monto>0).map(p => ({codigo:p.codigo, monto:p.monto})),
@@ -3562,7 +3728,7 @@ async function guardarCotizacion(){
   if(!cart.length) return;
   try {
     const nivel = Number(lista.value);
-    const nombres = ["","Público","Mayorista","VIP","Especial"];
+    const nombres = nombresLista();
     const data = await api("/api/cotizaciones", {method:"POST", body: JSON.stringify({
       items: cart.map(l=>({id:l.id, cantidad:l.cantidad, nivel, combo:!!l.combo})),
       lista: nombres[nivel], cliente_id: cliVenta.value ? Number(cliVenta.value) : null
