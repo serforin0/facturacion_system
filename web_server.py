@@ -2064,7 +2064,15 @@ def etiquetas_pdf(request: Request, body: EtiquetasIn):
 def kardex(request: Request, producto_id: int):
     _exigir(request, "kardex")
     filas = db().get_kardex_filas_con_saldo(producto_id)
-    return {"items": filas[-80:]}
+    stock = filas[-1]["balance"] if filas else None
+    if stock is None:
+        conn = db().get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT IFNULL(stock,0) FROM productos WHERE id=?", (producto_id,))
+        row = cur.fetchone()
+        conn.close()
+        stock = float(row[0] or 0) if row else 0
+    return {"items": filas[-80:], "stock": stock}
 
 
 @app.get("/api/historial")
@@ -2498,8 +2506,12 @@ HTML = """<!DOCTYPE html>
   .form { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; align-items:end; }
   .form label { display:flex; flex-direction:column; gap:6px; font-size:13px; color:#b7c0d4; }
   .form .wide { grid-column: 1 / -1; }
+  .form > button { width:auto; justify-self:start; min-width:140px; }
   table { width:100%; border-collapse:collapse; margin-top:16px; }
-  th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #2a3348; }
+  th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #2a3348; vertical-align:top; }
+  .acciones { display:flex; flex-wrap:wrap; gap:6px; max-width:270px; }
+  .acciones button { padding:6px 8px; font-size:12px; }
+  #histTabla, #kxTabla, #cliTabla { overflow-x:auto; }
   th { color:#8b95a8; font-weight:600; }
   .bajo { outline: 1px solid #f5a524; }
   .doc { background:#141a27; border:1px solid #2a3348; border-radius:14px; padding:14px; margin:0 0 14px; }
@@ -2523,8 +2535,8 @@ HTML = """<!DOCTYPE html>
   .dash-card { background:#141a27; border:1px solid #2a3348; border-radius:16px; padding:16px; }
   .dash-card h3 { margin:0 0 12px; font-size:15px; }
   .dash-card svg { width:100%; height:210px; display:block; }
-  .barrow { display:grid; grid-template-columns: minmax(0,140px) 1fr auto; gap:8px; align-items:center; margin:8px 0; font-size:13px; }
-  .barrow span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .barrow { display:grid; grid-template-columns: minmax(0,1.15fr) minmax(48px,1.2fr) auto; gap:8px; align-items:center; margin:8px 0; font-size:13px; }
+  .barrow span { line-height:1.3; }
   .track { height:8px; background:#222a3c; border-radius:99px; overflow:hidden; }
   .track div { height:100%; border-radius:99px; }
   .dona { width:132px; height:132px; border-radius:50%; margin:8px auto; }
@@ -2801,7 +2813,8 @@ function ver(nombre){
   formulario.style.display = nombre==="venta" ? "none" : "block";
   formulario.classList.toggle("es-dash", nombre==="indicadores");
   const rail = document.querySelector(".rail");
-  if (rail) rail.style.display = nombre==="indicadores" ? "none" : "";
+  const ancho = nombre==="indicadores" || nombre==="historial" || nombre==="kardex" || nombre==="clientes";
+  if (rail) rail.style.display = ancho ? "none" : "";
   formMsg.textContent = "";
   if(nombre!=="venta") pintarForm(nombre);
 }
@@ -2833,13 +2846,13 @@ async function pintarForm(nombre){
     inventario: ["Inventario", "El precio original es el de público. Los otros tres son por mayor y salen del porcentaje. El dueño puede cambiar esos porcentajes.",
       `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button></div><div class="form" style="margin-top:14px"><label>1er por mayor %<input id="descP2" type="number" step="0.01" value="2"/></label><label>2do por mayor %<input id="descP3" type="number" step="0.01" value="5"/></label><label>3er por mayor %<input id="descP4" type="number" step="0.01" value="10"/></label><button class="sec" onclick="guardarDescuentos()">Guardar porcentajes</button></div><div class="form" style="margin-top:14px"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invPrecio" type="number" step="0.01"/></label><label>Al <span id="etiqP2">2</span>%<input id="invP2" type="number" step="0.01"/></label><label>Al <span id="etiqP3">5</span>%<input id="invP3" type="number" step="0.01"/></label><label>Al <span id="etiqP4">10</span>%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div><div id="invTabla"></div>`],
     kardex: ["Kardex", "Movimientos de un producto: ventas, compras, transferencias y devoluciones.",
-      `<div class="form"><label>Producto<select id="kxProd">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
+      `<div class="form"><label>Producto<select id="kxProd" onchange="cargarKardex()">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
     historial: ["Historial", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
       `<div class="form"><label>Estado<select id="histEstado"><option value="emitidas">Emitidas</option><option value="anuladas">Anuladas</option><option value="todos">Todas</option></select></label><label class="wide">Motivo de anulación<input id="motivoAnula"/></label><button class="sec" onclick="cargarHistorial()">Cargar</button></div><div id="docVista"></div><div id="histTabla"></div>`],
     cotizaciones: ["Cotizaciones", "Abre el presupuesto para verlo o cambiar cantidades, productos y cliente.", ""],
     indicadores: ["Dashboard", "Ventas, cajeros, pagos e inventario.", ""],
-    clientes: ["Clientes", "Nombre, documento, teléfono y correo. Ese correo recibe el comprobante.",
-      `<div class="form"><label>Nombre<input id="cliNom"/></label><label>Documento<input id="cliDoc"/></label><label>Teléfono<input id="cliTel"/></label><label>Correo<input id="cliMail"/></label><button id="btnCli" onclick="guardarCliente()">Crear cliente</button></div><div id="cliTabla"></div>`],
+    clientes: ["Clientes", "Nombre, documento, teléfono y correo. Ese correo recibe el comprobante. Cada fila se puede editar.",
+      `<div class="form"><label>Nombre<input id="cliNom"/></label><label>Documento<input id="cliDoc"/></label><label>Teléfono<input id="cliTel"/></label><label>Correo<input id="cliMail"/></label><div class="wide"><button id="btnCli" onclick="guardarCliente()">Crear cliente</button></div></div><div id="cliTabla"></div>`],
     usuarios: ["Usuarios", "El administrador ve todo. Un cajero solo entra a los módulos que marques. La contraseña vacía, al editar, no la cambia.",
       `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Obligatoria al crear"/></label><label>Rol<select id="usuRol"><option>empleado</option><option>user</option><option>admin</option></select></label><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div><div id="usuMods" class="form"></div><div id="usuTabla"></div>`],
     seguimiento: ["Seguimiento de cajeros", "Cuánto vendió cada cajero y qué turnos descuadraron. Deja una nota de seguimiento.", ""],
@@ -2865,6 +2878,7 @@ async function pintarForm(nombre){
   if(nombre==="promo") await pintarPromos();
   if(nombre==="inventario") await cargarInventario();
   if(nombre==="historial") await cargarHistorial();
+  if(nombre==="kardex") await cargarKardex();
   if(nombre==="cotizaciones") await cargarCotizaciones();
   if(nombre==="indicadores") await cargarIndicadores();
   if(nombre==="clientes") await cargarClientes();
@@ -3255,16 +3269,20 @@ async function guardarProducto(){
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 async function cargarKardex(){
+  if (!document.getElementById("kxProd") || !kxProd.value) return;
   const d = await api("/api/kardex?producto_id=" + Number(kxProd.value));
-  kxTabla.innerHTML = tabla(["Fecha","Movimiento","Tipo","Cantidad","Saldo","Bodega"], d.items.map(x => [String(x.fecha||"").slice(0,16), x.descripcion, x.tipo_codigo, x.cantidad, x.balance, x.bodega]));
+  const nombre = kxProd.selectedOptions[0] ? kxProd.selectedOptions[0].textContent : "Producto";
+  kxTabla.innerHTML = `<p class="hint">${escDash(nombre)} · existencia ${d.stock}</p>` +
+    tabla(["Fecha","Movimiento","Tipo","Cantidad","Saldo","Bodega"], (d.items||[]).map(x => [String(x.fecha||"").slice(0,16), escDash(x.descripcion), x.tipo_codigo, x.cantidad, x.balance, escDash(x.bodega)]), "Este producto no tiene movimientos.");
 }
 async function cargarHistorial(){
   const est = document.getElementById("histEstado");
   const d = await api("/api/historial?estado=" + encodeURIComponent(est ? est.value : "emitidas"));
   histTabla.innerHTML = tabla(["Número","Fecha","Cliente","Total","Estado","Usuario",""], d.items.map(f => {
-    const acciones = `<button class="sec" onclick="verDocumento(${f.id})">Ver</button> <button class="sec" onclick="bajarFactura(${f.id})">PDF</button> <button class="sec" onclick="enviarFactura(${f.id}, '${String(f.email||"").replaceAll("'","")}')">Correo</button> <button class="sec" onclick="reimprimirFactura(${f.id})">Imprimir</button> <button class="sec" onclick="repetirFactura(${f.id})">Repetir</button>` +
-      (f.estado==="emitida" ? ` <button class="sec" onclick="anularFactura(${f.id})">Anular</button> <button class="sec" onclick="irDevolver('${f.numero}')">Devolver</button>` : "");
-    return [f.numero, String(f.fecha||"").slice(0,16), f.cliente, money(f.total), f.estado, f.usuario || "—", acciones];
+    const acciones = `<div class="acciones"><button class="sec" onclick="verDocumento(${f.id})">Ver</button><button class="sec" onclick="bajarFactura(${f.id})">PDF</button><button class="sec" onclick="enviarFactura(${f.id}, '${String(f.email||"").replaceAll("'","")}')">Correo</button><button class="sec" onclick="reimprimirFactura(${f.id})">Imprimir</button><button class="sec" onclick="repetirFactura(${f.id})">Repetir</button>` +
+      (f.estado==="emitida" ? `<button class="sec" onclick="anularFactura(${f.id})">Anular</button><button class="sec" onclick="irDevolver('${String(f.numero).replaceAll("'","")}')">Devolver</button>` : "") + "</div>";
+    const fecha = String(f.fecha||"");
+    return [escDash(f.numero), fecha.slice(0,10)+"<br>"+fecha.slice(11,16), escDash(f.cliente), money(f.total), f.estado, escDash(f.usuario || "—"), acciones];
   }));
 }
 async function bajarFactura(id){
@@ -3412,7 +3430,7 @@ function graficaVentas(serie){
   const linea = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
   const area = linea + ` L${pts[pts.length-1][0].toFixed(1)},${h-pad} L${pts[0][0].toFixed(1)},${h-pad} Z`;
   const marcas = serie.map((s, i) => {
-    if (serie.length > 16 && i % 2) return "";
+    if (serie.length > 8 && i % 2 && i !== serie.length - 1) return "";
     return `<text x="${pts[i][0].toFixed(1)}" y="${h-8}" text-anchor="middle" fill="#8b95a8" font-size="11">${s.etiqueta}</text>`;
   }).join("");
   return `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Ventas del período">
