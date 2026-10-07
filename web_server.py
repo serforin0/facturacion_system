@@ -164,6 +164,34 @@ def _exigir(request: Request, modulo: str) -> str:
     return user
 
 
+def _exigir_alguno(request: Request, modulos: tuple[str, ...]) -> str:
+    user = _user(request)
+    tiene = _permisos(user)
+    if not any(modulo in tiene for modulo in modulos):
+        raise HTTPException(status_code=403, detail="No tienes permiso para este módulo")
+    return user
+
+
+def _armar_lineas(cur, items: list[ItemIn]):
+    subtotal = 0.0
+    impuesto = 0.0
+    det = []
+    for item in items:
+        if item.combo or item.cantidad <= 0:
+            continue
+        cur.execute(SQL_PRODUCTOS + " WHERE id=?", (item.id,))
+        row = cur.fetchone()
+        if not row:
+            continue
+        precio = round(float(item.precio), 2) if item.precio is not None else _precio(row, item.nivel)
+        bruto = round(precio * item.cantidad, 2)
+        itbis = round(bruto * TASA_ITBIS, 2) if int(row[8] or 1) else 0.0
+        subtotal += bruto
+        impuesto += itbis
+        det.append((row[0], row[1], item.cantidad, precio, itbis, round(bruto + itbis, 2)))
+    return det, subtotal, impuesto
+
+
 def _descuento_promo(cur, producto_id: int, cantidad: float, precio: float, bruto: float) -> float:
     cur.execute(
         """
@@ -238,6 +266,7 @@ class ItemIn(BaseModel):
     cantidad: float
     nivel: int = 1
     combo: bool = False
+    precio: float | None = None
 
 
 class PagoIn(BaseModel):
@@ -950,13 +979,14 @@ def tomar_espera(request: Request, espera_id: int):
 
 @app.get("/api/factura/{factura_id}")
 def ver_factura(request: Request, factura_id: int):
-    _exigir(request, "historial")
+    _exigir_alguno(request, ("historial", "cotizaciones"))
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT f.id, f.numero, f.fecha, f.total, f.estado, f.ncf, f.usuario,
-               COALESCE(c.nombre, 'Consumidor final'), f.subtotal, f.impuesto_total
+               COALESCE(c.nombre, 'Consumidor final'), f.subtotal, f.impuesto_total,
+               f.cliente_id
         FROM facturas f
         LEFT JOIN clientes c ON c.id = f.cliente_id
         WHERE f.id=?
@@ -982,7 +1012,7 @@ def ver_factura(request: Request, factura_id: int):
     return {
         "id": fac[0], "numero": fac[1], "fecha": fac[2], "total": fac[3],
         "estado": fac[4], "ncf": fac[5], "usuario": fac[6], "cliente": fac[7],
-        "subtotal": fac[8], "itbis": fac[9], "lineas": lineas,
+        "subtotal": fac[8], "itbis": fac[9], "cliente_id": fac[10], "lineas": lineas,
     }
 
 
@@ -1066,22 +1096,7 @@ def crear_cotizacion(request: Request, body: VentaIn):
     base = db()
     conn = base.get_connection()
     cur = conn.cursor()
-    subtotal = 0.0
-    impuesto = 0.0
-    det = []
-    for item in body.items:
-        if item.combo:
-            continue
-        cur.execute(SQL_PRODUCTOS + " WHERE id=?", (item.id,))
-        row = cur.fetchone()
-        if not row:
-            continue
-        precio = _precio(row, item.nivel)
-        bruto = round(precio * item.cantidad, 2)
-        itbis = round(bruto * TASA_ITBIS, 2) if int(row[8] or 1) else 0.0
-        subtotal += bruto
-        impuesto += itbis
-        det.append((row[0], row[1], item.cantidad, precio, itbis, round(bruto + itbis, 2)))
+    det, subtotal, impuesto = _armar_lineas(cur, body.items)
     if not det:
         conn.close()
         raise HTTPException(status_code=400, detail="La cotización necesita productos")
@@ -1110,6 +1125,49 @@ def crear_cotizacion(request: Request, body: VentaIn):
     conn.commit()
     conn.close()
     return {"ok": True, "numero": numero, "id": fid, "total": total}
+
+
+@app.post("/api/cotizaciones/{factura_id}")
+def editar_cotizacion(request: Request, factura_id: int, body: VentaIn):
+    _exigir(request, "cotizaciones")
+    base = db()
+    conn = base.get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT estado FROM facturas WHERE id=?", (factura_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Cotización no encontrada")
+    if row[0] != "cotizacion":
+        conn.close()
+        raise HTTPException(status_code=400, detail="La factura emitida se consulta. Solo la cotización se edita.")
+    det, subtotal, impuesto = _armar_lineas(cur, body.items)
+    if not det:
+        conn.close()
+        raise HTTPException(status_code=400, detail="La cotización necesita productos")
+    total = round(subtotal + impuesto, 2)
+    cur.execute("DELETE FROM factura_detalle WHERE factura_id=?", (factura_id,))
+    for pid, nombre, cant, precio, itbis, tl in det:
+        cur.execute(
+            """
+            INSERT INTO factura_detalle (
+                factura_id, producto_id, descripcion, cantidad, precio_unitario,
+                descuento_item, impuesto_item, total_linea
+            ) VALUES (?,?,?,?,?,0,?,?)
+            """,
+            (factura_id, pid, nombre, cant, precio, itbis, tl),
+        )
+    cur.execute(
+        """
+        UPDATE facturas
+        SET cliente_id=?, subtotal=?, impuesto_total=?, total=?
+        WHERE id=? AND estado='cotizacion'
+        """,
+        (body.cliente_id, round(subtotal, 2), round(impuesto, 2), total, factura_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": factura_id, "total": total}
 
 
 @app.post("/api/cotizaciones/confirmar")
@@ -1750,7 +1808,7 @@ def actualizar_permisos(request: Request, body: PermisosIn):
 
 @app.get("/api/clientes")
 def clientes(request: Request, q: str = ""):
-    _exigir(request, "clientes")
+    _exigir_alguno(request, ("clientes", "cotizaciones", "mostrador"))
     return {
         "items": [
             {"id": i, "nombre": n, "documento": d or "", "telefono": t or "", "email": em or ""}
@@ -1862,6 +1920,8 @@ HTML = """<!DOCTYPE html>
   th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #2a3348; }
   th { color:#8b95a8; font-weight:600; }
   .bajo { outline: 1px solid #f5a524; }
+  .doc { background:#141a27; border:1px solid #2a3348; border-radius:14px; padding:14px; margin:0 0 14px; }
+  .doc h3 { margin:0 0 6px; }
   .dash-head { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; margin-bottom:16px; flex-wrap:wrap; }
   .dash-head h2 { margin:0; font-size:28px; }
   .dash-head p { margin:4px 0 0; color:#8b95a8; }
@@ -2164,9 +2224,9 @@ async function pintarForm(nombre){
       `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button></div><div class="form" style="margin-top:14px"><label>Nombre<input id="invNom"/></label><label>Precio<input id="invPrecio" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button onclick="guardarProducto()">Crear producto</button></div><div id="invTabla"></div>`],
     kardex: ["Kardex", "Movimientos de un producto: ventas, compras, transferencias y devoluciones.",
       `<div class="form"><label>Producto<select id="kxProd">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
-    historial: ["Historial", "Descarga el PDF o envíalo al correo del cliente. Para anular, escribe el motivo.",
-      `<div class="form"><label>Estado<select id="histEstado"><option value="emitidas">Emitidas</option><option value="anuladas">Anuladas</option><option value="todos">Todas</option></select></label><label class="wide">Motivo de anulación<input id="motivoAnula"/></label><button class="sec" onclick="cargarHistorial()">Cargar</button></div><div id="histTabla"></div>`],
-    cotizaciones: ["Cotizaciones", "Presupuestos guardados, los mismos del escritorio.", ""],
+    historial: ["Historial", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
+      `<div class="form"><label>Estado<select id="histEstado"><option value="emitidas">Emitidas</option><option value="anuladas">Anuladas</option><option value="todos">Todas</option></select></label><label class="wide">Motivo de anulación<input id="motivoAnula"/></label><button class="sec" onclick="cargarHistorial()">Cargar</button></div><div id="docVista"></div><div id="histTabla"></div>`],
+    cotizaciones: ["Cotizaciones", "Abre el presupuesto para verlo o cambiar cantidades, productos y cliente.", ""],
     indicadores: ["Dashboard", "Ventas, cajeros, pagos e inventario.", ""],
     clientes: ["Clientes", "Nombre, documento, teléfono y correo. Ese correo recibe el comprobante.",
       `<div class="form"><label>Nombre<input id="cliNom"/></label><label>Documento<input id="cliDoc"/></label><label>Teléfono<input id="cliTel"/></label><label>Correo<input id="cliMail"/></label><button onclick="guardarCliente()">Crear cliente</button></div><div id="cliTabla"></div>`],
@@ -2363,7 +2423,7 @@ async function cargarHistorial(){
   const est = document.getElementById("histEstado");
   const d = await api("/api/historial?estado=" + encodeURIComponent(est ? est.value : "emitidas"));
   histTabla.innerHTML = tabla(["Número","Fecha","Cliente","Total","Estado","Usuario",""], d.items.map(f => {
-    const acciones = `<button class="sec" onclick="bajarFactura(${f.id})">PDF</button> <button class="sec" onclick="enviarFactura(${f.id}, '${String(f.email||"").replaceAll("'","")}')">Correo</button> <button class="sec" onclick="reimprimirFactura(${f.id})">Imprimir</button> <button class="sec" onclick="repetirFactura(${f.id})">Repetir</button>` +
+    const acciones = `<button class="sec" onclick="verDocumento(${f.id})">Ver</button> <button class="sec" onclick="bajarFactura(${f.id})">PDF</button> <button class="sec" onclick="enviarFactura(${f.id}, '${String(f.email||"").replaceAll("'","")}')">Correo</button> <button class="sec" onclick="reimprimirFactura(${f.id})">Imprimir</button> <button class="sec" onclick="repetirFactura(${f.id})">Repetir</button>` +
       (f.estado==="emitida" ? ` <button class="sec" onclick="anularFactura(${f.id})">Anular</button> <button class="sec" onclick="irDevolver('${f.numero}')">Devolver</button>` : "");
     return [f.numero, String(f.fecha||"").slice(0,16), f.cliente, money(f.total), f.estado, f.usuario || "—", acciones];
   }));
@@ -2415,9 +2475,76 @@ async function anularFactura(id){
     await cargarHistorial();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
+let editLineas = [];
+function htmlDocumento(f){
+  const lineas = tabla(["Producto","Cantidad","Precio","ITBIS","Total"], (f.lineas||[]).map(l => [escDash(l.nombre), l.cantidad, money(l.precio), money(l.itbis), money(l.total)]));
+  const editar = f.estado==="cotizacion" ? `<button onclick="editarCotizacion(${f.id})">Editar</button>` : "";
+  return `<div class="doc"><h3>${escDash(f.numero)}</h3><p>${escDash(f.cliente)} · ${escDash(f.estado)}${f.ncf ? " · "+escDash(f.ncf) : ""}</p>${lineas}<p>Subtotal ${money(f.subtotal)} · ITBIS ${money(f.itbis)} · <b>Total ${money(f.total)}</b></p>${editar}</div>`;
+}
+async function verDocumento(id){
+  try {
+    const f = await api("/api/factura/"+id);
+    let caja = document.getElementById("docVista");
+    if (!caja) {
+      formBody.insertAdjacentHTML("afterbegin", '<div id="docVista"></div>');
+      caja = document.getElementById("docVista");
+    }
+    caja.innerHTML = htmlDocumento(f);
+    caja.scrollIntoView({block:"nearest"});
+  } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
+}
+async function editarCotizacion(id){
+  try {
+    const f = await api("/api/factura/"+id);
+    editLineas = (f.lineas||[]).filter(l => l.producto_id).map(l => ({id:l.producto_id, nombre:l.nombre, cantidad:l.cantidad, precio:l.precio}));
+    window._editId = id;
+    window._editCliente = f.cliente_id || "";
+    await pintarEditor();
+  } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
+}
+async function pintarEditor(){
+  const lista = await productos();
+  let clientes = [];
+  try { clientes = (await api("/api/clientes")).items || []; } catch(e) { clientes = []; }
+  const opciones = lista.map(p => `<option value="${p.id}">${escDash(p.nombre)}</option>`).join("");
+  const clientesHtml = `<option value="">Consumidor final</option>` + clientes.map(c => `<option value="${c.id}" ${String(c.id)===String(window._editCliente)?"selected":""}>${escDash(c.nombre)}</option>`).join("");
+  const filas = editLineas.map((l,i) => `<div class="form"><span>${escDash(l.nombre)} · ${money(l.precio)}</span><label>Cantidad<input data-edit="${i}" type="number" step="0.01" value="${l.cantidad}"/></label><button class="sec" onclick="quitarLineaEdit(${i})">Quitar</button></div>`).join("");
+  document.getElementById("docVista").innerHTML = `<div class="doc"><h3>Editar cotización</h3><div class="form"><label>Cliente<select id="editCli">${clientesHtml}</select></label><label>Producto<select id="editProd">${opciones}</select></label><label>Cantidad<input id="editCant" type="number" step="0.01" value="1"/></label><button class="sec" onclick="agregarLineaEdit()">Agregar</button></div>${filas}<button onclick="guardarCotizacion()">Guardar cambios</button> <button class="sec" onclick="verDocumento(${window._editId})">Cancelar</button></div>`;
+  document.querySelectorAll("[data-edit]").forEach(el => el.oninput = () => { editLineas[Number(el.dataset.edit)].cantidad = Number(el.value||0); });
+}
+function quitarLineaEdit(i){
+  editLineas.splice(i, 1);
+  pintarEditor();
+}
+async function agregarLineaEdit(){
+  const lista = await productos();
+  const id = Number(editProd.value);
+  const cant = Number(editCant.value||0);
+  const prod = lista.find(p => p.id===id);
+  if (!prod || cant<=0) return;
+  const ya = editLineas.find(l => l.id===id);
+  if (ya) ya.cantidad = Number(ya.cantidad) + cant;
+  else editLineas.push({id, nombre: prod.nombre, cantidad: cant, precio: prod.precio});
+  await pintarEditor();
+}
+async function guardarCotizacion(){
+  document.querySelectorAll("[data-edit]").forEach(el => { editLineas[Number(el.dataset.edit)].cantidad = Number(el.value||0); });
+  const cliente = document.getElementById("editCli");
+  try {
+    await api("/api/cotizaciones/"+window._editId, {method:"POST", body: JSON.stringify({
+      items: editLineas.filter(l => l.cantidad>0).map(l => ({id:l.id, cantidad:Number(l.cantidad), precio:Number(l.precio)})),
+      cliente_id: cliente && cliente.value ? Number(cliente.value) : null,
+      lista: "Público"
+    })});
+    formMsg.style.color = "#86efac";
+    formMsg.textContent = "Cotización actualizada.";
+    await cargarCotizaciones();
+    await verDocumento(window._editId);
+  } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
+}
 async function cargarCotizaciones(){
   const d = await api("/api/historial?estado=presupuestos");
-  formBody.innerHTML = tabla(["Número","Fecha","Cliente","Total","Estado",""], d.items.map(f => [f.numero, String(f.fecha||"").slice(0,16), f.cliente, money(f.total), f.estado, f.estado==="cotizacion" ? `<button onclick="confirmarCoti(${f.id})">Confirmar</button>` : ""]));
+  formBody.innerHTML = `<div id="docVista"></div>` + tabla(["Número","Fecha","Cliente","Total","Estado",""], d.items.map(f => [f.numero, String(f.fecha||"").slice(0,16), f.cliente, money(f.total), f.estado, f.estado==="cotizacion" ? `<button class="sec" onclick="verDocumento(${f.id})">Ver</button> <button onclick="editarCotizacion(${f.id})">Editar</button> <button class="sec" onclick="confirmarCoti(${f.id})">Confirmar</button>` : `<button class="sec" onclick="verDocumento(${f.id})">Ver</button>`]));
 }
 async function confirmarCoti(id){
   try {
