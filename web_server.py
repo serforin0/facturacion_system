@@ -2330,8 +2330,14 @@ HTML = """<!DOCTYPE html>
   .card .foto { display:block; height:148px; background:#121826 center/cover no-repeat; }
   .card .info { width:100%; padding:12px; background:#1a2130; color:#fff; }
   .card .info b { display:block; margin-bottom:4px; color:#fff; }
-  .rail { width:340px; background:linear-gradient(180deg,#6d5ef5 0%, #4c3fd4 100%); padding:22px 18px; color:white; }
+  .rail { width:340px; background:linear-gradient(180deg,#6d5ef5 0%, #4c3fd4 100%); padding:22px 18px; color:white; position:sticky; top:0; max-height:100vh; overflow-y:auto; }
   .rail h3 { margin:0 0 8px; }
+  .ticket-acciones { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
+  .ticket-acciones label { grid-column:1 / -1; display:flex; flex-direction:column; gap:6px; font-size:13px; color:#efeaff; }
+  .ticket-acciones button { width:100%; }
+  #esperas { margin-top:14px; display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; padding-right:2px; }
+  #esperas h4 { margin:0 0 2px; font-size:13px; font-weight:700; color:#efeaff; position:sticky; top:0; background:#5646e4; padding:2px 0 6px; }
+  #esperas button.sec { width:100%; text-align:left; background:rgba(12,16,32,.35); border:1px solid rgba(255,255,255,.18); padding:8px 10px; }
   ul { list-style:none; padding:0; margin:0; max-height:280px; overflow:auto; }
   li { display:flex; justify-content:space-between; gap:8px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,.18); }
   .pagos { display:grid; gap:10px; margin-top:12px; }
@@ -2471,9 +2477,11 @@ HTML = """<!DOCTYPE html>
           <label>Ancho<select id="anchoTicket"><option value="80">80 mm</option><option value="58">58 mm</option></select></label>
           <p id="cambio">Cambio: RD$ 0.00</p>
           <button onclick="cobrar()">Cobrar</button>
+        </div>
+        <div class="ticket-acciones">
           <label>Apartar como<input id="esperaNom" placeholder="Mesa 1"/></label>
           <button class="sec" onclick="apartar()">Apartar</button>
-          <button class="sec" onclick="guardarCotizacion()">Cotizar</button>
+          <button onclick="guardarCotizacion()">Cotizar</button>
         </div>
         <div id="esperas"></div>
         <div class="msg" id="msg"></div>
@@ -3539,7 +3547,7 @@ async function apartar(){
 async function cargarEsperas(){
   try {
     const d = await api("/api/espera");
-    esperas.innerHTML = d.items.map(x => `<button class="sec" onclick="tomarEspera(${x.id})">${x.etiqueta} · ${money(x.total)}</button>`).join(" ");
+    esperas.innerHTML = d.items.length ? "<h4>Apartados</h4>" + d.items.map(x => `<button class="sec" onclick="tomarEspera(${x.id})">${x.etiqueta} · ${money(x.total)}</button>`).join("") : "";
   } catch(e) { esperas.innerHTML = ""; }
 }
 async function tomarEspera(id){
