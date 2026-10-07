@@ -290,6 +290,7 @@ class MovimientoIn(BaseModel):
     tipo: str
     monto: float
     motivo: str
+    id: int | None = None
 
 
 class CerrarCajaIn(BaseModel):
@@ -317,6 +318,7 @@ class PromoIn(BaseModel):
     tipo: str
     valor: float
     producto_id: int
+    activa: bool = True
 
 
 class DevolucionIn(BaseModel):
@@ -324,6 +326,10 @@ class DevolucionIn(BaseModel):
     motivo: str
     lineas: list[dict]
     reembolso_efectivo: bool = False
+
+
+class MotivoIn(BaseModel):
+    motivo: str
 
 
 class MetodoIn(BaseModel):
@@ -685,6 +691,32 @@ def movimiento(request: Request, body: MovimientoIn):
         raise HTTPException(status_code=400, detail="El tipo debe ser ingreso o retiro")
     if body.monto <= 0 or len((body.motivo or "").strip()) < 3:
         raise HTTPException(status_code=400, detail="Indica monto y un motivo")
+    if body.id:
+        conn = base.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT tipo, monto, cierre_id FROM movimientos_efectivo WHERE id=?",
+            (body.id,),
+        )
+        previo = cur.fetchone()
+        if not previo or int(previo[2]) != int(caja[0]):
+            conn.close()
+            raise HTTPException(status_code=400, detail="Ese movimiento no está en el turno abierto")
+        if tipo == "retiro":
+            ingresos, retiros = base.totales_movimientos_efectivo(caja[0])
+            esperado = float(caja[6] or 0) + _efectivo_ventas(base, caja[2], caja[0]) + ingresos - retiros
+            if (previo[0] or "").lower() == "retiro":
+                esperado += float(previo[1] or 0)
+            if body.monto > esperado + 0.01:
+                conn.close()
+                raise HTTPException(status_code=400, detail=f"El retiro supera el efectivo esperado ({esperado:.2f})")
+        cur.execute(
+            "UPDATE movimientos_efectivo SET tipo=?, monto=?, motivo=? WHERE id=?",
+            (tipo, round(float(body.monto), 2), body.motivo.strip(), body.id),
+        )
+        conn.commit()
+        conn.close()
+        return {"ok": True, "id": body.id}
     if tipo == "retiro":
         ingresos, retiros = base.totales_movimientos_efectivo(caja[0])
         esperado = float(caja[6] or 0) + _efectivo_ventas(base, caja[2], caja[0]) + ingresos - retiros
@@ -727,6 +759,132 @@ def cerrar_caja(request: Request, body: CerrarCajaIn):
     conn.commit()
     conn.close()
     return {"ok": True, "esperado": round(esperado, 2), "diferencia": diff}
+
+
+def _panel_caja(base: Database) -> dict:
+    caja = base.fetch_caja_abierta_row()
+    abierta = None
+    if caja is not None:
+        ingresos, retiros = base.totales_movimientos_efectivo(caja[0])
+        ventas = _efectivo_ventas(base, caja[2], caja[0])
+        fondo = float(caja[6] or 0)
+        abierta = {
+            "id": caja[0],
+            "nombre": caja[1],
+            "apertura": caja[2],
+            "usuario": caja[4],
+            "fondo": fondo,
+            "ventas_efectivo": ventas,
+            "ingresos": ingresos,
+            "retiros": retiros,
+            "esperado": round(fondo + ventas + ingresos - retiros, 2),
+            "movimientos": [
+                {"id": i, "tipo": t, "monto": m, "motivo": mot, "usuario": u, "fecha": f}
+                for i, t, m, mot, u, f in base.listar_movimientos_efectivo(caja[0])
+            ],
+        }
+    conn = base.get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, IFNULL(nombre_caja,'Caja'), fecha_apertura, fecha_cierre,
+               IFNULL(usuario_cierre, usuario_apertura), IFNULL(monto_inicial,0),
+               IFNULL(efectivo_contado,0), IFNULL(diferencia_efectivo,0),
+               IFNULL(observaciones,''), estado
+        FROM cierres_caja
+        ORDER BY id DESC
+        LIMIT 12
+        """
+    )
+    cierres = [
+        {
+            "id": i, "nombre": n, "apertura": a, "cierre": c, "usuario": u,
+            "fondo": f, "contado": cont, "diferencia": d, "observaciones": o, "estado": e,
+        }
+        for i, n, a, c, u, f, cont, d, o, e in cur.fetchall()
+    ]
+    cur.execute(
+        """
+        SELECT m.id, m.tipo, m.monto, IFNULL(m.motivo,''), IFNULL(m.usuario,''), m.fecha,
+               CASE WHEN c.fecha_cierre IS NULL THEN 1 ELSE 0 END
+        FROM movimientos_efectivo m
+        JOIN cierres_caja c ON c.id = m.cierre_id
+        ORDER BY m.id DESC
+        LIMIT 40
+        """
+    )
+    recientes = [
+        {"id": i, "tipo": t, "monto": m, "motivo": mot, "usuario": u, "fecha": f, "abierto": bool(ab)}
+        for i, t, m, mot, u, f, ab in cur.fetchall()
+    ]
+    conn.close()
+    return {"abierta": abierta, "cierres": cierres, "recientes": recientes}
+
+
+@app.get("/api/caja/panel")
+def panel_caja(request: Request):
+    _exigir(request, "caja")
+    return _panel_caja(db())
+
+
+class TurnoEditIn(BaseModel):
+    nombre: str
+    fondo: float
+
+
+@app.post("/api/caja/turno/{cierre_id}")
+def editar_turno(request: Request, cierre_id: int, body: TurnoEditIn):
+    _exigir(request, "caja")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE cierres_caja
+        SET nombre_caja=?, monto_inicial=?
+        WHERE id=? AND fecha_cierre IS NULL
+        """,
+        (body.nombre.strip() or "Caja 1", float(body.fondo or 0), cierre_id),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Solo se edita el turno que está abierto")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/caja/cierre/{cierre_id}")
+def editar_cierre(request: Request, cierre_id: int, body: CerrarCajaIn):
+    _exigir(request, "caja")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT IFNULL(efectivo_contado,0), IFNULL(diferencia_efectivo,0), estado
+        FROM cierres_caja WHERE id=?
+        """,
+        (cierre_id,),
+    )
+    row = cur.fetchone()
+    if not row or row[2] != "cerrado":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Ese turno no está cerrado")
+    esperado = round(float(row[0] or 0) - float(row[1] or 0), 2)
+    diff = round(float(body.contado) - esperado, 2)
+    if abs(diff) > 0.05 and len((body.observaciones or "").strip()) < 3:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Si no cuadra, escribe una observación")
+    cur.execute(
+        """
+        UPDATE cierres_caja
+        SET efectivo_contado=?, diferencia_efectivo=?, observaciones=?
+        WHERE id=?
+        """,
+        (round(float(body.contado), 2), diff, (body.observaciones or "").strip() or None, cierre_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "esperado": esperado, "diferencia": diff}
 
 
 def _filtro_fecha(desde: str | None, hasta: str | None, dias: int, columna: str) -> tuple[str, list]:
@@ -841,15 +999,74 @@ def compras(request: Request, body: CompraIn):
     return {"ok": True, "compra": compra_id, "lineas": len(lineas)}
 
 
+class NotaCompraIn(BaseModel):
+    nota: str
+
+
+@app.post("/api/compras/{compra_id}")
+def editar_compra_nota(request: Request, compra_id: int, body: NotaCompraIn):
+    _exigir(request, "compras")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE compras SET nota=? WHERE id=?", (body.nota.strip(), compra_id))
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Compra no encontrada")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.get("/api/compras/{compra_id}/lineas")
+def ver_compra(request: Request, compra_id: int):
+    _exigir(request, "compras")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT d.cantidad, d.costo, IFNULL(p.nombre,'Producto'), IFNULL(d.bodega,'Principal')
+        FROM compra_detalle d
+        LEFT JOIN productos p ON p.id = d.producto_id
+        WHERE d.compra_id=?
+        """,
+        (compra_id,),
+    )
+    lineas = [{"cantidad": c, "costo": k, "nombre": n, "bodega": b} for c, k, n, b in cur.fetchall()]
+    conn.close()
+    if not lineas:
+        raise HTTPException(status_code=404, detail="Compra no encontrada")
+    return {"lineas": lineas}
+
+
 @app.get("/api/promociones")
 def promociones(request: Request):
     _exigir(request, "promociones")
     return {
         "items": [
-            {"id": i, "nombre": n, "tipo": t, "valor": v, "activa": bool(a)}
-            for i, n, t, v, a, _c in db().listar_promociones()
+            {
+                "id": i, "nombre": n, "tipo": t, "valor": v, "activa": bool(a),
+                "producto_id": pid or 0,
+            }
+            for i, n, t, v, a, pid in _promos_web()
         ]
     }
+
+
+def _promos_web():
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT p.id, p.nombre, p.tipo_descuento, IFNULL(p.valor,0), IFNULL(p.activo,1),
+               IFNULL((SELECT d.producto_id FROM promociones_detalle d
+                       WHERE d.promocion_id = p.id LIMIT 1), 0)
+        FROM promociones p
+        ORDER BY p.id DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 @app.post("/api/promociones")
@@ -859,6 +1076,37 @@ def crear_promo(request: Request, body: PromoIn):
         raise HTTPException(status_code=400, detail="Tipo de promoción inválido")
     pid = db().guardar_promocion(body.nombre, body.tipo, body.valor, producto_id=body.producto_id)
     return {"ok": True, "id": pid}
+
+
+@app.post("/api/promociones/{promo_id}")
+def editar_promo(request: Request, promo_id: int, body: PromoIn):
+    _exigir(request, "promociones")
+    if body.tipo not in ("porcentaje", "fijo", "2x1", "3x2"):
+        raise HTTPException(status_code=400, detail="Tipo de promoción inválido")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE promociones SET nombre=?, tipo_descuento=?, valor=?, activo=? WHERE id=?",
+        (body.nombre.strip(), body.tipo, body.valor, 1 if body.activa else 0, promo_id),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Promoción no encontrada")
+    producto_id = body.producto_id or None
+    cur.execute("SELECT id FROM promociones_detalle WHERE promocion_id=? LIMIT 1", (promo_id,))
+    if cur.fetchone():
+        cur.execute(
+            "UPDATE promociones_detalle SET producto_id=? WHERE promocion_id=?",
+            (producto_id, promo_id),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO promociones_detalle (promocion_id, producto_id) VALUES (?,?)",
+            (promo_id, producto_id),
+        )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 @app.get("/api/devolucion")
@@ -921,6 +1169,64 @@ def devolver(request: Request, body: DevolucionIn):
         else:
             msg += " La caja está cerrada, así que el reembolso quedó solo como nota de crédito."
     return {"ok": True, "mensaje": msg}
+
+
+@app.get("/api/devoluciones")
+def listar_devoluciones(request: Request):
+    _exigir(request, "devoluciones")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT nc.id, nc.fecha, IFNULL(nc.motivo,''), nc.monto_total, IFNULL(f.numero,'')
+        FROM notas_credito nc
+        LEFT JOIN facturas f ON f.id = nc.factura_original_id
+        ORDER BY nc.id DESC
+        LIMIT 30
+        """
+    )
+    items = [
+        {"id": i, "fecha": f, "motivo": m, "total": t, "factura": n}
+        for i, f, m, t, n in cur.fetchall()
+    ]
+    conn.close()
+    return {"items": items}
+
+
+@app.post("/api/devolucion/{nota_id}")
+def editar_devolucion(request: Request, nota_id: int, body: MotivoIn):
+    _exigir(request, "devoluciones")
+    motivo = body.motivo.strip()
+    if len(motivo) < 3:
+        raise HTTPException(status_code=400, detail="Escribe el motivo")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE notas_credito SET motivo=? WHERE id=?", (motivo, nota_id))
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Devolución no encontrada")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.get("/api/devoluciones/{nota_id}")
+def ver_nota_credito(request: Request, nota_id: int):
+    _exigir(request, "devoluciones")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT IFNULL(p.nombre, 'Producto'), ncd.cantidad, ncd.monto
+        FROM notas_credito_detalle ncd
+        LEFT JOIN productos p ON p.id = ncd.producto_id
+        WHERE ncd.nota_credito_id=?
+        """,
+        (nota_id,),
+    )
+    lineas = [{"nombre": n, "cantidad": c, "monto": m} for n, c, m in cur.fetchall()]
+    conn.close()
+    return {"lineas": lineas}
 
 
 @app.post("/api/transferir")
@@ -1231,8 +1537,27 @@ def bodegas(request: Request):
     rows = [{"producto": n, "bodega": b, "cantidad": c} for n, b, c in cur.fetchall()]
     cur.execute("SELECT codigo FROM bodegas ORDER BY codigo COLLATE NOCASE")
     nombres = [r[0] for r in cur.fetchall()]
+    cur.execute(
+        """
+        SELECT m.id, m.producto_id, p.nombre, IFNULL(m.bodega_codigo,''), m.cantidad,
+               IFNULL(m.descripcion_mov,''), m.fecha
+        FROM movimientos_inventario m
+        JOIN productos p ON p.id = m.producto_id
+        WHERE m.tipo_movimiento = 'transferencia' AND m.cantidad < 0
+        ORDER BY m.id DESC
+        LIMIT 20
+        """
+    )
+    transferencias = [
+        {
+            "id": i, "producto_id": pid, "producto": n, "origen": o,
+            "cantidad": abs(float(c or 0)),
+            "destino": (d or "").replace("Sale hacia ", ""), "fecha": f,
+        }
+        for i, pid, n, o, c, d, f in cur.fetchall()
+    ]
     conn.close()
-    return {"items": rows, "bodegas": nombres}
+    return {"items": rows, "bodegas": nombres, "transferencias": transferencias}
 
 
 class BodegaIn(BaseModel):
@@ -1355,7 +1680,7 @@ class ProductoIn(BaseModel):
 
 class UsuarioIn(BaseModel):
     username: str
-    password: str
+    password: str = ""
     role: str = "user"
     modulos: list[str] = []
 
@@ -1492,6 +1817,57 @@ def crear_producto(request: Request, body: ProductoIn):
     conn.close()
     base.ajustar_stock_bodega(pid, 0, body.bodega.strip() or "Principal")
     return {"ok": True, "id": pid}
+
+
+def _categoria_id(cur, nombre: str):
+    if not nombre.strip():
+        return None
+    cur.execute("SELECT id FROM categorias WHERE nombre=?", (nombre.strip(),))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    cur.execute("INSERT INTO categorias (nombre) VALUES (?)", (nombre.strip(),))
+    return cur.lastrowid
+
+
+@app.post("/api/inventario/{producto_id}")
+def editar_producto(request: Request, producto_id: int, body: ProductoIn):
+    _exigir(request, "inventario")
+    nombre = body.nombre.strip()
+    if len(nombre) < 2:
+        raise HTTPException(status_code=400, detail="Indica el nombre del producto")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cat_id = _categoria_id(cur, body.categoria)
+    bodega = body.bodega.strip() or "Principal"
+    cur.execute(
+        """
+        UPDATE productos
+        SET nombre=?, precio=?, precio_base=?, stock=?, codigo_barras=?, bodega_codigo=?, categoria_id=?
+        WHERE id=?
+        """,
+        (nombre, body.precio, body.precio, body.stock, body.codigo.strip() or None, bodega, cat_id, producto_id),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    cur.execute(
+        "SELECT 1 FROM stock_bodega WHERE producto_id=? AND bodega=?",
+        (producto_id, bodega),
+    )
+    if cur.fetchone():
+        cur.execute(
+            "UPDATE stock_bodega SET cantidad=? WHERE producto_id=? AND bodega=?",
+            (body.stock, producto_id, bodega),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO stock_bodega (producto_id, bodega, cantidad) VALUES (?,?,?)",
+            (producto_id, bodega, body.stock),
+        )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 @app.post("/api/etiquetas")
@@ -1784,11 +2160,36 @@ def crear_usuario(request: Request, body: UsuarioIn):
     _exigir(request, "usuarios")
     if body.role not in ("admin", "user", "empleado"):
         raise HTTPException(status_code=400, detail="El rol debe ser admin, user o empleado")
+    if len((body.password or "").strip()) < 1:
+        raise HTTPException(status_code=400, detail="Indica una contraseña")
     try:
         db().create_user(body.username.strip(), body.password, body.role)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _guardar_permisos(body.username.strip(), body.modulos, body.role)
+    return {"ok": True}
+
+
+@app.post("/api/usuarios/editar")
+def editar_usuario(request: Request, body: UsuarioIn):
+    _exigir(request, "usuarios")
+    if body.role not in ("admin", "user", "empleado"):
+        raise HTTPException(status_code=400, detail="El rol debe ser admin, user o empleado")
+    usuario = body.username.strip()
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE username=?", (usuario,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if (body.password or "").strip():
+        cur.execute("UPDATE users SET password=?, role=? WHERE username=?", (body.password, body.role, usuario))
+    else:
+        cur.execute("UPDATE users SET role=? WHERE username=?", (body.role, usuario))
+    conn.commit()
+    conn.close()
+    _guardar_permisos(usuario, body.modulos, body.role)
     return {"ok": True}
 
 
@@ -1829,6 +2230,35 @@ def crear_cliente(request: Request, body: ClienteIn):
         body.email.strip() or None,
     )
     return {"ok": True, "id": nuevo}
+
+
+@app.post("/api/clientes/{cliente_id}")
+def editar_cliente(request: Request, cliente_id: int, body: ClienteIn):
+    _exigir(request, "clientes")
+    if len(body.nombre.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Indica el nombre")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE clientes
+        SET nombre=?, documento=?, telefono=?, email=?
+        WHERE id=?
+        """,
+        (
+            body.nombre.strip(),
+            body.documento.strip() or None,
+            body.telefono.strip() or None,
+            body.email.strip() or None,
+            cliente_id,
+        ),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 @app.get("/api/empresa")
@@ -2178,8 +2608,8 @@ async function productos(){
 function opcionesProductos(lista){
   return lista.map(p => `<option value="${p.id}">${String(p.nombre).replaceAll("<","&lt;")}</option>`).join("");
 }
-function tabla(headers, filas){
-  if(!filas.length) return "<p class='hint'>No hay datos en este período.</p>";
+function tabla(headers, filas, vacio){
+  if(!filas.length) return "<p class='hint'>" + (vacio || "No hay datos en este período.") + "</p>";
   return `<table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${
     filas.map(f=>`<tr>${f.map(c=>`<td>${c}</td>`).join("")}</tr>`).join("")
   }</tbody></table>`;
@@ -2199,29 +2629,29 @@ async function pintarForm(nombre){
   const lista = await productos();
   const opts = opcionesProductos(lista);
   const forms = {
-    caja: ["Abrir caja", "Indica el fondo con el que empieza el turno.",
-      `<div class="form"><label>Nombre<input id="cajaNombre" value="Caja 1"/></label><label>Fondo<input id="cajaFondo" type="number" step="0.01" value="0"/></label><button onclick="guardarCaja()">Abrir turno</button></div>`],
-    ingreso: ["Ingreso de efectivo", "El monto entra al efectivo esperado del turno.",
-      `<div class="form"><label>Monto<input id="movMonto" type="number" step="0.01"/></label><label class="wide">Motivo<input id="movMotivo"/></label><button onclick="guardarMov('ingreso')">Registrar ingreso</button></div>`],
-    retiro: ["Retiro de efectivo", "No puede superar el efectivo esperado del turno.",
-      `<div class="form"><label>Monto<input id="movMonto" type="number" step="0.01"/></label><label class="wide">Motivo<input id="movMotivo"/></label><button onclick="guardarMov('retiro')">Registrar retiro</button></div>`],
-    cerrar: ["Cerrar caja", "Cuenta el efectivo del cajón. Si no cuadra, escribe por qué.",
-      `<div class="form"><label>Efectivo contado<input id="cajaContado" type="number" step="0.01"/></label><label class="wide">Observación<input id="cajaObs"/></label><button onclick="guardarCierre()">Cerrar turno</button></div>`],
+    caja: ["Abrir caja", "Si el turno ya está abierto, puedes cambiar el nombre y el fondo.",
+      `<div class="form"><label>Nombre<input id="cajaNombre" value="Caja 1"/></label><label>Fondo<input id="cajaFondo" type="number" step="0.01" value="0"/></label><button id="btnCajaAbrir" onclick="guardarCaja()">Abrir turno</button></div><div id="cajaInfo"></div>`],
+    ingreso: ["Ingreso de efectivo", "El monto entra al efectivo esperado del turno. Abajo están los ingresos de este turno.",
+      `<div class="form"><label>Monto<input id="movMonto" type="number" step="0.01"/></label><label class="wide">Motivo<input id="movMotivo"/></label><button id="btnMov" onclick="guardarMov('ingreso')">Registrar ingreso</button></div><div id="movLista"></div>`],
+    retiro: ["Retiro de efectivo", "No puede superar el efectivo esperado del turno. Abajo están los retiros de este turno.",
+      `<div class="form"><label>Monto<input id="movMonto" type="number" step="0.01"/></label><label class="wide">Motivo<input id="movMotivo"/></label><button id="btnMov" onclick="guardarMov('retiro')">Registrar retiro</button></div><div id="movLista"></div>`],
+    cerrar: ["Cerrar caja", "Cuenta el efectivo del cajón. Si no cuadra, escribe por qué. Los cierres anteriores se pueden corregir.",
+      `<div class="form"><label>Efectivo contado<input id="cajaContado" type="number" step="0.01"/></label><label class="wide">Observación<input id="cajaObs"/></label><button id="btnCerrar" onclick="guardarCierre()">Cerrar turno</button></div><div id="cajaInfo"></div>`],
     compra: ["Compras", "Varias líneas entran en la misma compra. Suman existencia y quedan en el kardex.",
       `<div class="form"><label>Proveedor<input id="compProv"/></label><label>Bodega<select id="compBod"><option>Principal</option></select></label><label>Producto<select id="compProd">${opts}</select></label><label>Cantidad<input id="compCant" type="number" step="0.01"/></label><label>Costo<input id="compCosto" type="number" step="0.01"/></label><button class="sec" onclick="agregarLineaCompra()">Agregar línea</button><button onclick="guardarCompra()">Registrar compra</button></div><div id="compLineas"></div>`],
     promo: ["Promociones", "Se aplican en el mostrador cuando el producto está en la promoción.",
-      `<div class="form"><label>Nombre<input id="promoNom"/></label><label>Tipo<select id="promoTipo"><option>porcentaje</option><option>fijo</option><option>2x1</option><option>3x2</option></select></label><label>Valor<input id="promoVal" type="number" step="0.01" value="10"/></label><label>Producto<select id="promoProd">${opts}</select></label><button onclick="guardarPromo()">Crear promoción</button></div><div id="promoLista"></div>`],
-    dev: ["Devoluciones", "Busca la factura, indica cuánto vuelve y si el dinero sale de la caja.",
-      `<div class="form"><label class="wide">Número o id de factura<input id="devQ"/></label><button class="sec" onclick="buscarDev()">Cargar factura</button></div><div id="devLineas"></div>`],
+      `<div class="form"><label>Nombre<input id="promoNom"/></label><label>Tipo<select id="promoTipo"><option>porcentaje</option><option>fijo</option><option>2x1</option><option>3x2</option></select></label><label>Valor<input id="promoVal" type="number" step="0.01" value="10"/></label><label>Producto<select id="promoProd">${opts}</select></label><label>Estado<select id="promoActiva"><option value="1">Activa</option><option value="0">Inactiva</option></select></label><button id="btnPromo" onclick="guardarPromo()">Crear promoción</button></div><div id="promoLista"></div>`],
+    dev: ["Devoluciones", "Busca la factura, indica cuánto vuelve y si el dinero sale de la caja. Las notas ya hechas se editan abajo.",
+      `<div class="form"><label class="wide">Número o id de factura<input id="devQ"/></label><button class="sec" onclick="buscarDev()">Cargar factura</button></div><div id="devLineas"></div><div id="devLista"></div>`],
     tr: ["Transferir", "Mueve existencia de una bodega a otra. El stock total no cambia.",
       `<div class="form"><label>Nueva bodega<input id="bodNueva"/></label><button class="sec" onclick="crearBodega()">Crear bodega</button><label>Producto<select id="trProd">${opts}</select></label><label>Origen<select id="trOri"><option>Principal</option></select></label><label>Destino<select id="trDes"><option>Principal</option></select></label><label>Cantidad<input id="trCant" type="number" step="0.01"/></label><button onclick="guardarTr()">Transferir</button></div>`],
     reportes: ["Reportes", "Elige el rango. Si lo dejas vacío, usa los últimos 30 días.",
       `<div class="form"><label>Desde<input id="repDesde" type="date"/></label><label>Hasta<input id="repHasta" type="date"/></label><button class="sec" onclick="pintarReportes()">Ver</button></div><div id="repTabla"></div>`],
     metodos: ["Métodos de pago", "Los activos salen en el ticket. Si afecta caja, el vuelto se calcula sobre ese monto.",
-      `<div class="form"><label>Código<input id="metCod"/></label><label>Nombre<input id="metNom"/></label><label>Afecta caja<select id="metCaja"><option value="0">No</option><option value="1">Sí</option></select></label><button onclick="guardarMetodo()">Guardar</button></div><div id="metTabla"></div>`],
+      `<div class="form"><label>Código<input id="metCod"/></label><label>Nombre<input id="metNom"/></label><label>Afecta caja<select id="metCaja"><option value="0">No</option><option value="1">Sí</option></select></label><label>Activo<select id="metActivo"><option value="1">Sí</option><option value="0">No</option></select></label><button onclick="guardarMetodo()">Guardar</button></div><div id="metTabla"></div>`],
     ncf: ["Comprobantes NCF", "Secuencias que se imprimen en cada venta.", ""],
     inventario: ["Inventario", "Marca productos y descarga el PDF de etiquetas con código de barras.",
-      `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button></div><div class="form" style="margin-top:14px"><label>Nombre<input id="invNom"/></label><label>Precio<input id="invPrecio" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button onclick="guardarProducto()">Crear producto</button></div><div id="invTabla"></div>`],
+      `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button></div><div class="form" style="margin-top:14px"><label>Nombre<input id="invNom"/></label><label>Precio<input id="invPrecio" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div><div id="invTabla"></div>`],
     kardex: ["Kardex", "Movimientos de un producto: ventas, compras, transferencias y devoluciones.",
       `<div class="form"><label>Producto<select id="kxProd">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
     historial: ["Historial", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
@@ -2229,9 +2659,9 @@ async function pintarForm(nombre){
     cotizaciones: ["Cotizaciones", "Abre el presupuesto para verlo o cambiar cantidades, productos y cliente.", ""],
     indicadores: ["Dashboard", "Ventas, cajeros, pagos e inventario.", ""],
     clientes: ["Clientes", "Nombre, documento, teléfono y correo. Ese correo recibe el comprobante.",
-      `<div class="form"><label>Nombre<input id="cliNom"/></label><label>Documento<input id="cliDoc"/></label><label>Teléfono<input id="cliTel"/></label><label>Correo<input id="cliMail"/></label><button onclick="guardarCliente()">Crear cliente</button></div><div id="cliTabla"></div>`],
-    usuarios: ["Usuarios", "El administrador ve todo. Un cajero solo entra a los módulos que marques.",
-      `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password"/></label><label>Rol<select id="usuRol"><option>empleado</option><option>user</option><option>admin</option></select></label><button onclick="guardarUsuario()">Crear usuario</button></div><div id="usuMods" class="form"></div><div id="usuTabla"></div>`],
+      `<div class="form"><label>Nombre<input id="cliNom"/></label><label>Documento<input id="cliDoc"/></label><label>Teléfono<input id="cliTel"/></label><label>Correo<input id="cliMail"/></label><button id="btnCli" onclick="guardarCliente()">Crear cliente</button></div><div id="cliTabla"></div>`],
+    usuarios: ["Usuarios", "El administrador ve todo. Un cajero solo entra a los módulos que marques. La contraseña vacía, al editar, no la cambia.",
+      `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Obligatoria al crear"/></label><label>Rol<select id="usuRol"><option>empleado</option><option>user</option><option>admin</option></select></label><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div><div id="usuMods" class="form"></div><div id="usuTabla"></div>`],
     seguimiento: ["Seguimiento de cajeros", "Cuánto vendió cada cajero y qué turnos descuadraron. Deja una nota de seguimiento.", ""],
     empresa: ["Empresa", "Datos del ticket y el servidor que envía el comprobante por correo.",
       `<div class="form"><label>Nombre<input id="empNom"/></label><label class="wide">Dirección<input id="empDir"/></label><label>RNC<input id="empRnc"/></label><label>Servidor SMTP<input id="smtpHost" placeholder="smtp.hostinger.com"/></label><label>Puerto<input id="smtpPort" value="587"/></label><label>Usuario<input id="smtpUser"/></label><label>Contraseña<input id="smtpPass" type="password" placeholder="Vacía para no cambiarla"/></label><label>Remitente<input id="smtpFrom" placeholder="facturas@tudominio.com"/></label><button onclick="guardarEmpresa()">Guardar</button></div>`]
@@ -2241,6 +2671,15 @@ async function pintarForm(nombre){
   formTitle.textContent = item[0];
   formHint.textContent = item[1];
   formBody.innerHTML = item[2];
+  window._movId = null;
+  window._turnoId = null;
+  window._cierreEdit = null;
+  window._prodId = null;
+  window._cliId = null;
+  window._promoId = null;
+  window._usuEdit = false;
+  if(nombre==="ingreso" || nombre==="retiro") await cargarMovimientos(nombre);
+  if(nombre==="caja" || nombre==="cerrar") await cargarPanelCaja(nombre);
   if(nombre==="reportes") await pintarReportes();
   if(nombre==="ncf") await pintarNcf();
   if(nombre==="promo") await pintarPromos();
@@ -2255,30 +2694,121 @@ async function pintarForm(nombre){
   if(nombre==="compra"){ lineasCompra = []; await cargarCompras(); }
   if(nombre==="tr") await cargarBodegas();
   if(nombre==="metodos") await cargarPantallaMetodos();
-  if(nombre==="dev" && window._devNumero){ devQ.value = window._devNumero; window._devNumero = ""; buscarDev(); }
+  if(nombre==="dev"){
+    await cargarDevoluciones();
+    if(window._devNumero){ devQ.value = window._devNumero; window._devNumero = ""; buscarDev(); }
+  }
+}
+async function cargarPanelCaja(nombre){
+  const d = await api("/api/caja/panel");
+  window._cajaPanel = d;
+  const box = document.getElementById("cajaInfo");
+  if (!box) return;
+  if (nombre === "caja") {
+    const a = d.abierta;
+    box.innerHTML = a
+      ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · ${escDash(a.usuario || "—")} · ${escDash(String(a.apertura||"").slice(0,16))}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)} · esperado ${money(a.esperado)}</p><button class="sec" onclick="editarTurno()">Editar turno</button></div>`
+      : "<p class='hint'>No hay turno abierto.</p>";
+    return;
+  }
+  const a = d.abierta;
+  const resumen = a
+    ? `<div class="doc"><p>Efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p></div>`
+    : "<p class='hint'>No hay turno abierto.</p>";
+  const filas = (d.cierres || []).filter(c => c.estado === "cerrado");
+  box.innerHTML = resumen + "<h3>Cierres recientes</h3>" + tabla(
+    ["Cierre","Turno","Contado","Diferencia","Observación",""],
+    filas.map(c => [String(c.cierre||"").slice(0,16), escDash(c.nombre), money(c.contado), money(c.diferencia), escDash(c.observaciones || "—"), `<button class="sec" onclick="editarCierre(${c.id})">Editar</button>`])
+  );
+}
+function editarTurno(){
+  const a = window._cajaPanel && window._cajaPanel.abierta;
+  if (!a) return;
+  window._turnoId = a.id;
+  cajaNombre.value = a.nombre || "Caja 1";
+  cajaFondo.value = a.fondo;
+  const btn = document.getElementById("btnCajaAbrir");
+  if (btn) btn.textContent = "Guardar cambios";
+}
+function editarCierre(id){
+  const c = ((window._cajaPanel && window._cajaPanel.cierres) || []).find(x => x.id === id);
+  if (!c) return;
+  window._cierreEdit = id;
+  cajaContado.value = c.contado;
+  cajaObs.value = c.observaciones || "";
+  const btn = document.getElementById("btnCerrar");
+  if (btn) btn.textContent = "Guardar cambios";
 }
 async function guardarCaja(){
   try {
-    await api("/api/caja/abrir", {method:"POST", body: JSON.stringify({nombre: cajaNombre.value, fondo: Number(cajaFondo.value||0)})});
+    if (window._turnoId) {
+      await api("/api/caja/turno/" + window._turnoId, {method:"POST", body: JSON.stringify({nombre: cajaNombre.value, fondo: Number(cajaFondo.value||0)})});
+      formMsg.textContent = "Turno actualizado.";
+    } else {
+      await api("/api/caja/abrir", {method:"POST", body: JSON.stringify({nombre: cajaNombre.value, fondo: Number(cajaFondo.value||0)})});
+      formMsg.textContent = "Turno abierto.";
+    }
     formMsg.style.color = "#86efac";
-    formMsg.textContent = "Turno abierto.";
+    window._turnoId = null;
+    const btn = document.getElementById("btnCajaAbrir");
+    if (btn) btn.textContent = "Abrir turno";
     await refrescar();
+    await cargarPanelCaja("caja");
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
+}
+async function cargarMovimientos(tipo){
+  const d = await api("/api/caja/panel");
+  const box = document.getElementById("movLista");
+  if (!box) return;
+  const a = d.abierta;
+  const resumen = a
+    ? `<div class="doc"><p>${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p></div>`
+    : "<p class='hint'>No hay turno abierto. Los movimientos de turnos cerrados se consultan; solo se editan los del turno abierto.</p>";
+  window._movs = (d.recientes || []).filter(m => m.tipo === tipo);
+  box.innerHTML = resumen + tabla(["Fecha","Monto","Motivo","Usuario",""], window._movs.map(m => [
+    String(m.fecha||"").slice(0,16), money(m.monto), escDash(m.motivo), m.usuario || "—",
+      m.abierto ? `<button class="sec" onclick="editarMov(${m.id})">Editar</button>` : "Turno cerrado"
+  ]), "Todavía no hay movimientos en este turno.");
+}
+function editarMov(id){
+  const m = (window._movs || []).find(x => x.id === id);
+  if (!m) return;
+  window._movId = id;
+  movMonto.value = m.monto;
+  movMotivo.value = m.motivo || "";
+  const btn = document.getElementById("btnMov");
+  if (btn) btn.textContent = "Guardar cambios";
 }
 async function guardarMov(tipo){
   try {
-    await api("/api/caja/movimiento", {method:"POST", body: JSON.stringify({tipo, monto: Number(movMonto.value), motivo: movMotivo.value})});
+    const body = {tipo, monto: Number(movMonto.value), motivo: movMotivo.value};
+    if (window._movId) body.id = window._movId;
+    await api("/api/caja/movimiento", {method:"POST", body: JSON.stringify(body)});
     formMsg.style.color = "#86efac";
-    formMsg.textContent = "Movimiento guardado.";
+    formMsg.textContent = window._movId ? "Movimiento actualizado." : "Movimiento guardado.";
+    window._movId = null;
+    movMonto.value = "";
+    movMotivo.value = "";
+    const btn = document.getElementById("btnMov");
+    if (btn) btn.textContent = tipo === "ingreso" ? "Registrar ingreso" : "Registrar retiro";
     await refrescar();
+    await cargarMovimientos(tipo);
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 async function guardarCierre(){
   try {
-    const r = await api("/api/caja/cerrar", {method:"POST", body: JSON.stringify({contado: Number(cajaContado.value), observaciones: cajaObs.value})});
+    const payload = {contado: Number(cajaContado.value), observaciones: cajaObs.value};
+    const url = window._cierreEdit ? "/api/caja/cierre/" + window._cierreEdit : "/api/caja/cerrar";
+    const r = await api(url, {method:"POST", body: JSON.stringify(payload)});
     formMsg.style.color = "#86efac";
-    formMsg.textContent = "Cerrado. Esperado " + money(r.esperado) + " · diferencia " + money(r.diferencia);
+    formMsg.textContent = (window._cierreEdit ? "Cierre actualizado. " : "Cerrado. ") + "Esperado " + money(r.esperado) + " · diferencia " + money(r.diferencia);
+    window._cierreEdit = null;
+    cajaContado.value = "";
+    cajaObs.value = "";
+    const btn = document.getElementById("btnCerrar");
+    if (btn) btn.textContent = "Cerrar turno";
     await refrescar();
+    await cargarPanelCaja("cerrar");
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 let lineasCompra = [];
@@ -2307,17 +2837,39 @@ async function guardarCompra(){
 }
 async function guardarPromo(){
   try {
-    await api("/api/promociones", {method:"POST", body: JSON.stringify({
-      nombre: promoNom.value, tipo: promoTipo.value, valor: Number(promoVal.value), producto_id: Number(promoProd.value)
-    })});
+    const body = {
+      nombre: promoNom.value, tipo: promoTipo.value, valor: Number(promoVal.value),
+      producto_id: Number(promoProd.value), activa: promoActiva.value === "1"
+    };
+    const url = window._promoId ? "/api/promociones/" + window._promoId : "/api/promociones";
+    await api(url, {method:"POST", body: JSON.stringify(body)});
     formMsg.style.color = "#86efac";
-    formMsg.textContent = "Promoción creada.";
+    formMsg.textContent = window._promoId ? "Promoción actualizada." : "Promoción creada.";
+    window._promoId = null;
+    const btn = document.getElementById("btnPromo");
+    if (btn) btn.textContent = "Crear promoción";
     await pintarPromos();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
+function editarPromo(id){
+  const p = (window._promos || []).find(x => x.id === id);
+  if (!p) return;
+  window._promoId = id;
+  promoNom.value = p.nombre;
+  promoTipo.value = p.tipo;
+  promoVal.value = p.valor;
+  if (p.producto_id) promoProd.value = String(p.producto_id);
+  promoActiva.value = p.activa ? "1" : "0";
+  const btn = document.getElementById("btnPromo");
+  if (btn) btn.textContent = "Guardar cambios";
+}
 async function pintarPromos(){
   const data = await api("/api/promociones");
-  promoLista.innerHTML = tabla(["Nombre","Tipo","Valor","Estado"], data.items.map(p => [p.nombre, p.tipo, p.valor, p.activa ? "Activa" : "Inactiva"]));
+  window._promos = data.items || [];
+  promoLista.innerHTML = tabla(["Nombre","Tipo","Valor","Estado",""], window._promos.map(p => [
+    escDash(p.nombre), p.tipo, p.valor, p.activa ? "Activa" : "Inactiva",
+    `<button class="sec" onclick="editarPromo(${p.id})">Editar</button>`
+  ]));
 }
 async function buscarDev(){
   try {
@@ -2335,6 +2887,34 @@ async function guardarDev(){
     formMsg.style.color = "#86efac";
     formMsg.textContent = r.mensaje;
     productosCache = [];
+    await cargarDevoluciones();
+  } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
+}
+async function cargarDevoluciones(){
+  const d = await api("/api/devoluciones");
+  window._devs = d.items || [];
+  const box = document.getElementById("devLista");
+  if (!box) return;
+  box.innerHTML = "<h3>Notas de crédito</h3>" + tabla(["Fecha","Factura","Total","Motivo",""], window._devs.map(n => [
+    String(n.fecha||"").slice(0,16), n.factura || "—", money(n.total), escDash(n.motivo),
+    `<button class="sec" onclick="verDevolucion(${n.id})">Ver</button> <button class="sec" onclick="editarDevolucion(${n.id})">Editar</button>`
+  ]), "Todavía no hay notas de crédito.") + `<div id="devVista"></div>`;
+}
+async function verDevolucion(id){
+  const d = await api("/api/devoluciones/" + id);
+  const vista = document.getElementById("devVista");
+  if (vista) vista.innerHTML = tabla(["Producto","Cantidad","Monto"], (d.lineas||[]).map(l => [escDash(l.nombre), l.cantidad, money(l.monto)]));
+}
+async function editarDevolucion(id){
+  const n = (window._devs || []).find(x => x.id === id);
+  if (!n) return;
+  const motivo = prompt("Motivo de la devolución", n.motivo || "");
+  if (motivo === null) return;
+  try {
+    await api("/api/devolucion/" + id, {method:"POST", body: JSON.stringify({motivo})});
+    formMsg.style.color = "#86efac";
+    formMsg.textContent = "Motivo actualizado.";
+    await cargarDevoluciones();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 async function guardarTr(){
@@ -2344,6 +2924,7 @@ async function guardarTr(){
     })});
     formMsg.style.color = "#86efac";
     formMsg.textContent = "Transferencia registrada.";
+    await cargarBodegas();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 async function pintarReportes(){
@@ -2360,8 +2941,17 @@ async function pintarReportes(){
 }
 async function pintarNcf(){
   const d = await api("/api/ncf");
+  window._ncfs = d.secuencias || [];
   formBody.innerHTML = `<div class="form"><label>Tipo<input id="ncfTipo"/></label><label>Prefijo<input id="ncfPref"/></label><label>Siguiente<input id="ncfSig" type="number"/></label><label>Hasta<input id="ncfHasta" type="number"/></label><button onclick="guardarNcf()">Guardar secuencia</button></div>` +
-    tabla(["Tipo","Prefijo","Siguiente","Hasta"], d.secuencias.map(x => [x.tipo, x.prefijo, x.siguiente, x.hasta]));
+    tabla(["Tipo","Prefijo","Siguiente","Hasta",""], window._ncfs.map((x, i) => [escDash(x.tipo), escDash(x.prefijo), x.siguiente, x.hasta, `<button class="sec" onclick="editarNcf(${i})">Editar</button>`]));
+}
+function editarNcf(i){
+  const x = (window._ncfs || [])[i];
+  if (!x) return;
+  ncfTipo.value = x.tipo;
+  ncfPref.value = x.prefijo;
+  ncfSig.value = x.siguiente;
+  ncfHasta.value = x.hasta;
 }
 async function guardarNcf(){
   try {
@@ -2374,7 +2964,21 @@ async function guardarNcf(){
 async function cargarInventario(){
   const qv = document.getElementById("invQ");
   const d = await api("/api/inventario?q=" + encodeURIComponent(qv ? qv.value : ""));
-  invTabla.innerHTML = tabla(["","Producto","Precio","Stock","Código","Bodega","Categoría"], d.items.map(p => [`<input class="etiq" type="checkbox" value="${p.id}"/>`, p.nombre, money(p.precio), p.stock, p.codigo || "—", p.bodega, p.categoria || "—"]));
+  window._prods = d.items || [];
+  invTabla.innerHTML = tabla(["","Producto","Precio","Stock","Código","Bodega","Categoría",""], window._prods.map(p => [`<input class="etiq" type="checkbox" value="${p.id}"/>`, escDash(p.nombre), money(p.precio), p.stock, escDash(p.codigo || "—"), escDash(p.bodega), escDash(p.categoria || "—"), `<button class="sec" onclick="editarProducto(${p.id})">Editar</button>`]));
+}
+function editarProducto(id){
+  const p = (window._prods || []).find(x => x.id === id);
+  if (!p) return;
+  window._prodId = id;
+  invNom.value = p.nombre || "";
+  invPrecio.value = p.precio;
+  invStock.value = p.stock;
+  invCod.value = p.codigo || "";
+  invBod.value = p.bodega || "Principal";
+  invCat.value = p.categoria || "";
+  const btn = document.getElementById("btnProd");
+  if (btn) btn.textContent = "Guardar cambios";
 }
 async function bajarPdf(url, nombre, opt){
   const r = await fetch(url, Object.assign({credentials:"same-origin"}, opt||{}));
@@ -2405,12 +3009,17 @@ async function etiquetasPdf(){
 }
 async function guardarProducto(){
   try {
-    await api("/api/inventario", {method:"POST", body: JSON.stringify({
+    const body = {
       nombre: invNom.value, precio: Number(invPrecio.value), stock: Number(invStock.value||0),
       codigo: invCod.value, bodega: invBod.value, categoria: invCat.value
-    })});
+    };
+    const url = window._prodId ? "/api/inventario/" + window._prodId : "/api/inventario";
+    await api(url, {method:"POST", body: JSON.stringify(body)});
     formMsg.style.color = "#86efac";
-    formMsg.textContent = "Producto creado.";
+    formMsg.textContent = window._prodId ? "Producto actualizado." : "Producto creado.";
+    window._prodId = null;
+    const btn = document.getElementById("btnProd");
+    if (btn) btn.textContent = "Crear producto";
     productosCache = [];
     await cargarInventario();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
@@ -2652,39 +3261,91 @@ async function cargarIndicadores(){
 }
 async function cargarClientes(){
   const d = await api("/api/clientes");
-  cliTabla.innerHTML = tabla(["Nombre","Documento","Teléfono","Correo"], d.items.map(c => [c.nombre, c.documento || "—", c.telefono || "—", c.email || "—"]));
+  window._clis = d.items || [];
+  cliTabla.innerHTML = tabla(["Nombre","Documento","Teléfono","Correo",""], window._clis.map(c => [
+    escDash(c.nombre), c.documento || "—", c.telefono || "—", c.email || "—",
+    `<button class="sec" onclick="editarCliente(${c.id})">Editar</button>`
+  ]));
+}
+function editarCliente(id){
+  const c = (window._clis || []).find(x => x.id === id);
+  if (!c) return;
+  window._cliId = id;
+  cliNom.value = c.nombre || "";
+  cliDoc.value = c.documento || "";
+  cliTel.value = c.telefono || "";
+  cliMail.value = c.email || "";
+  const btn = document.getElementById("btnCli");
+  if (btn) btn.textContent = "Guardar cambios";
 }
 async function guardarCliente(){
   try {
-    await api("/api/clientes", {method:"POST", body: JSON.stringify({nombre: cliNom.value, documento: cliDoc.value, telefono: cliTel.value, email: cliMail.value})});
+    const body = {nombre: cliNom.value, documento: cliDoc.value, telefono: cliTel.value, email: cliMail.value};
+    const url = window._cliId ? "/api/clientes/" + window._cliId : "/api/clientes";
+    await api(url, {method:"POST", body: JSON.stringify(body)});
     formMsg.style.color = "#86efac";
-    formMsg.textContent = "Cliente creado.";
+    formMsg.textContent = window._cliId ? "Cliente actualizado." : "Cliente creado.";
+    window._cliId = null;
+    const btn = document.getElementById("btnCli");
+    if (btn) btn.textContent = "Crear cliente";
     await cargarClientes();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 async function cargarUsuarios(){
   const d = await api("/api/usuarios");
+  window._usus = d.items || [];
   usuMods.innerHTML = d.modulos.map(m => `<label><input type="checkbox" class="mod" value="${m}" ${m==="mostrador"?"checked":""}/> ${m}</label>`).join("");
-  usuTabla.innerHTML = tabla(["Usuario","Rol","Módulos"], d.items.map(u => [u.username, u.role, (u.modulos||[]).join(", ")]));
+  usuTabla.innerHTML = tabla(["Usuario","Rol","Módulos",""], window._usus.map((u, i) => [
+    escDash(u.username), u.role, escDash((u.modulos||[]).join(", ")),
+    `<button class="sec" onclick="editarUsuario(${i})">Editar</button>`
+  ]));
+}
+function editarUsuario(i){
+  const u = (window._usus || [])[i];
+  if (!u) return;
+  window._usuEdit = true;
+  usuNom.value = u.username;
+  usuNom.readOnly = true;
+  usuPass.value = "";
+  usuPass.placeholder = "Vacía para no cambiarla";
+  usuRol.value = u.role;
+  document.querySelectorAll(".mod").forEach(el => { el.checked = (u.modulos || []).includes(el.value); });
+  const btn = document.getElementById("btnUsu");
+  if (btn) btn.textContent = "Guardar cambios";
 }
 async function guardarUsuario(){
   const modulos = [...document.querySelectorAll(".mod:checked")].map(x => x.value);
   try {
-    await api("/api/usuarios", {method:"POST", body: JSON.stringify({username: usuNom.value, password: usuPass.value, role: usuRol.value, modulos})});
+    const url = window._usuEdit ? "/api/usuarios/editar" : "/api/usuarios";
+    await api(url, {method:"POST", body: JSON.stringify({username: usuNom.value, password: usuPass.value, role: usuRol.value, modulos})});
     formMsg.style.color = "#86efac";
-    formMsg.textContent = "Usuario creado con sus módulos.";
+    formMsg.textContent = window._usuEdit ? "Usuario actualizado." : "Usuario creado con sus módulos.";
+    window._usuEdit = false;
+    usuNom.readOnly = false;
+    usuPass.placeholder = "Obligatoria al crear";
+    const btn = document.getElementById("btnUsu");
+    if (btn) btn.textContent = "Crear usuario";
     await cargarUsuarios();
   } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 async function cargarSeguimiento(){
   const d = await api("/api/seguimiento");
   const cajeros = tabla(["Cajero","Facturas","Generado"], d.cajeros.map(c => [c.usuario, c.facturas, money(c.total)]));
-  const turnos = tabla(["Turno","Cajero","Estado","Diferencia","Seguimiento","Nota"], d.turnos.map(t => [
-    t.id, t.usuario || "—", t.estado, money(t.diferencia), t.seguimiento, t.nota || t.observaciones || "—"
+  window._turnos = d.turnos || [];
+  const turnos = tabla(["Turno","Cajero","Estado","Diferencia","Seguimiento","Nota",""], window._turnos.map(t => [
+    t.id, t.usuario || "—", t.estado, money(t.diferencia), t.seguimiento, escDash(t.nota || t.observaciones || "—"),
+    `<button class="sec" onclick="editarSeg(${t.id})">Editar</button>`
   ]));
   formBody.innerHTML = "<h3>Lo que generó cada cajero en 30 días</h3>" + cajeros +
     "<h3>Turnos y descuadre</h3>" + turnos +
     `<div class="form"><label>Turno<input id="segId" type="number"/></label><label>Estado<select id="segEst"><option>pendiente</option><option>en_seguimiento</option><option>resuelto</option></select></label><label class="wide">Nota<input id="segNota"/></label><button onclick="guardarSeguimiento()">Guardar seguimiento</button></div>`;
+}
+function editarSeg(id){
+  const t = (window._turnos || []).find(x => x.id === id);
+  if (!t) return;
+  segId.value = t.id;
+  if ([...segEst.options].some(o => o.value === t.seguimiento)) segEst.value = t.seguimiento;
+  segNota.value = t.nota || t.observaciones || "";
 }
 async function guardarSeguimiento(){
   try {
@@ -2706,7 +3367,28 @@ async function cargarCompras(){
   if (!extra) {
     formBody.insertAdjacentHTML("beforeend", '<div id="compLista"></div>');
   }
-  document.getElementById("compLista").innerHTML = tabla(["Fecha","Proveedor","Total","Nota"], d.items.map(c => [String(c.fecha||"").slice(0,16), c.proveedor, money(c.total), c.nota || "—"]));
+  window._compras = d.items || [];
+  document.getElementById("compLista").innerHTML = "<h3>Compras recientes</h3>" + tabla(["Fecha","Proveedor","Total","Nota",""], window._compras.map(c => [
+    String(c.fecha||"").slice(0,16), escDash(c.proveedor), money(c.total), escDash(c.nota || "—"),
+    `<button class="sec" onclick="verCompra(${c.id})">Ver</button> <button class="sec" onclick="editarCompra(${c.id})">Editar</button>`
+  ]), "Todavía no hay compras.") + `<div id="compVista"></div>`;
+}
+async function verCompra(id){
+  const d = await api("/api/compras/" + id + "/lineas");
+  const vista = document.getElementById("compVista");
+  if (vista) vista.innerHTML = tabla(["Producto","Cantidad","Costo","Bodega"], (d.lineas||[]).map(l => [escDash(l.nombre), l.cantidad, money(l.costo), escDash(l.bodega)]));
+}
+async function editarCompra(id){
+  const c = (window._compras || []).find(x => x.id === id);
+  if (!c) return;
+  const nota = prompt("Nota de la compra", c.nota || "");
+  if (nota === null) return;
+  try {
+    await api("/api/compras/" + id, {method:"POST", body: JSON.stringify({nota})});
+    formMsg.style.color = "#86efac";
+    formMsg.textContent = "Nota actualizada.";
+    await cargarCompras();
+  } catch(e){ formMsg.style.color="#fca5a5"; formMsg.textContent = e.message; }
 }
 function opcionesBodega(nombres, actual){
   const lista = nombres && nombres.length ? nombres : ["Principal"];
@@ -2718,7 +3400,22 @@ async function cargarBodegas(){
   if (document.getElementById("trDes")) trDes.innerHTML = opcionesBodega(d.bodegas, d.bodegas.find(b => b!=="Principal") || "Principal");
   const extra = document.getElementById("bodLista");
   if (!extra) formBody.insertAdjacentHTML("beforeend", '<div id="bodLista"></div>');
-  document.getElementById("bodLista").innerHTML = tabla(["Producto","Bodega","Cantidad"], d.items.map(x => [x.producto, x.bodega, x.cantidad]));
+  window._trs = d.transferencias || [];
+  document.getElementById("bodLista").innerHTML = tabla(["Producto","Bodega","Cantidad"], d.items.map(x => [escDash(x.producto), escDash(x.bodega), x.cantidad])) +
+    "<h3>Transferencias recientes</h3>" + tabla(["Fecha","Producto","Origen","Destino","Cantidad",""], window._trs.map(t => [
+      String(t.fecha||"").slice(0,16), escDash(t.producto), escDash(t.origen), escDash(t.destino), t.cantidad,
+      `<button class="sec" onclick="editarTransfer(${t.id})">Editar</button>`
+    ]), "Todavía no hay transferencias.");
+}
+function editarTransfer(id){
+  const t = (window._trs || []).find(x => x.id === id);
+  if (!t) return;
+  trProd.value = String(t.producto_id);
+  trOri.value = t.origen;
+  trDes.value = t.destino;
+  trCant.value = t.cantidad;
+  formMsg.style.color = "#e7e9ee";
+  formMsg.textContent = "Datos cargados. Al guardar se registra un movimiento nuevo.";
 }
 async function crearBodega(){
   try {
@@ -2731,11 +3428,23 @@ async function crearBodega(){
 }
 async function cargarPantallaMetodos(){
   const d = await api("/api/metodos");
-  metTabla.innerHTML = tabla(["Código","Nombre","Afecta caja","Activo"], d.items.map(m => [m.codigo, m.nombre, m.afecta_caja ? "Sí" : "No", m.activo ? "Sí" : "No"]));
+  window._mets = d.items || [];
+  metTabla.innerHTML = tabla(["Código","Nombre","Afecta caja","Activo",""], window._mets.map((m, i) => [
+    escDash(m.codigo), escDash(m.nombre), m.afecta_caja ? "Sí" : "No", m.activo ? "Sí" : "No",
+    `<button class="sec" onclick="editarMetodo(${i})">Editar</button>`
+  ]));
+}
+function editarMetodo(i){
+  const m = (window._mets || [])[i];
+  if (!m) return;
+  metCod.value = m.codigo;
+  metNom.value = m.nombre;
+  metCaja.value = m.afecta_caja ? "1" : "0";
+  metActivo.value = m.activo ? "1" : "0";
 }
 async function guardarMetodo(){
   try {
-    await api("/api/metodos", {method:"POST", body: JSON.stringify({codigo: metCod.value, nombre: metNom.value, afecta_caja: metCaja.value==="1", activo: true})});
+    await api("/api/metodos", {method:"POST", body: JSON.stringify({codigo: metCod.value, nombre: metNom.value, afecta_caja: metCaja.value==="1", activo: metActivo.value==="1"})});
     formMsg.style.color = "#86efac";
     formMsg.textContent = "Método guardado.";
     await cargarPantallaMetodos();
