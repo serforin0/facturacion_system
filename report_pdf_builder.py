@@ -296,7 +296,8 @@ def build_factura_comprobante_pdf(db: Database, factura_id: int) -> bytes | None
                f.subtotal, f.descuento_total, f.impuesto_total, f.total,
                IFNULL(f.observaciones,''), IFNULL(f.referencia_entrega,''),
                IFNULL(f.fecha_vencimiento,''), IFNULL(f.moneda,'DOP'),
-               COALESCE(c.nombre,'Consumidor final'), COALESCE(TRIM(c.documento),'')
+               COALESCE(c.nombre,'Consumidor final'), COALESCE(TRIM(c.documento),''),
+               IFNULL(f.ncf,'')
         FROM facturas f
         LEFT JOIN clientes c ON c.id = f.cliente_id
         WHERE f.id = ?
@@ -334,6 +335,7 @@ def build_factura_comprobante_pdf(db: Database, factura_id: int) -> bytes | None
         moneda,
         cli_nom,
         cli_doc,
+        ncf,
     ) = row
 
     emp = db.get_empresa_info()
@@ -359,10 +361,12 @@ def build_factura_comprobante_pdf(db: Database, factura_id: int) -> bytes | None
 
     hdr = (
         f"<b><font size=14>{emp.get('nombre') or 'Empresa'}</font></b><br/>"
-        f"<font size=9>{(emp.get('direccion') or '').replace(chr(10), '<br/>')}</font>"
+        f"<font size=9>{(emp.get('direccion') or '').replace(chr(10), '<br/>')}</font><br/>"
+        f"<font size=9>RNC {emp.get('rnc') or '—'}</font>"
     )
     meta = (
         f"<b>Nº:</b> {numero or '—'}<br/>"
+        f"<b>NCF:</b> {ncf or '—'}<br/>"
         f"<b>Fecha:</b> {str(fecha or '')[:19]}<br/>"
         f"<b>Estado:</b> {etiqueta}<br/>"
         f"<b>Comprobante:</b> {tipo_txt}"

@@ -396,6 +396,9 @@ class Database:
         self._migrate_facturas_anulacion(cursor)
         self._migrate_facturacion_extendida(cursor)
         self._migrate_cierres_caja_estado(cursor)
+        self._migrate_pos_turno(cursor)
+        self._migrate_resto_pos(cursor)
+        self._migrate_permisos_seguimiento(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pagos_factura_factura ON pagos_factura(factura_id)")
 
         # =========================
@@ -418,6 +421,678 @@ class Database:
         conn.commit()
         conn.close()
         print("✅ Base de datos inicializada correctamente")
+
+    def _migrate_pos_turno(self, cursor):
+        """Tickets en espera y movimientos de efectivo del turno."""
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS movimientos_efectivo (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cierre_id INTEGER NOT NULL,
+                tipo TEXT NOT NULL,
+                monto REAL NOT NULL,
+                motivo TEXT,
+                usuario TEXT,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cierre_id) REFERENCES cierres_caja(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ventas_espera (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                etiqueta TEXT NOT NULL,
+                usuario TEXT,
+                cliente_id INTEGER,
+                cliente_codigo TEXT,
+                documento_cliente TEXT,
+                condicion_pago_id INTEGER,
+                tipo_comprobante TEXT,
+                descuento_global REAL NOT NULL DEFAULT 0,
+                items_json TEXT NOT NULL,
+                total REAL NOT NULL DEFAULT 0,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mov_ef_cierre ON movimientos_efectivo(cierre_id)"
+        )
+
+    def totales_movimientos_efectivo(self, cierre_id: int) -> tuple[float, float]:
+        """Suma de ingresos y retiros de efectivo de un turno."""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT tipo, SUM(monto)
+            FROM movimientos_efectivo
+            WHERE cierre_id = ?
+            GROUP BY tipo
+            """,
+            (int(cierre_id),),
+        )
+        ingresos = 0.0
+        retiros = 0.0
+        for tipo, monto in cur.fetchall():
+            t = (tipo or "").strip().lower()
+            if t == "ingreso":
+                ingresos += float(monto or 0)
+            elif t == "retiro":
+                retiros += float(monto or 0)
+        conn.close()
+        return ingresos, retiros
+
+    def listar_movimientos_efectivo(self, cierre_id: int) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, tipo, monto, IFNULL(motivo, ''), IFNULL(usuario, ''), fecha
+            FROM movimientos_efectivo
+            WHERE cierre_id = ?
+            ORDER BY datetime(fecha), id
+            """,
+            (int(cierre_id),),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def registrar_movimiento_efectivo(
+        self,
+        cierre_id: int,
+        tipo: str,
+        monto: float,
+        motivo: str,
+        usuario: str | None,
+    ) -> None:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO movimientos_efectivo (cierre_id, tipo, monto, motivo, usuario)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(cierre_id),
+                tipo,
+                round(float(monto), 2),
+                (motivo or "").strip(),
+                (usuario or "").strip() or None,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def contar_ventas_espera(self) -> int:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM ventas_espera")
+        n = int(cur.fetchone()[0] or 0)
+        conn.close()
+        return n
+
+    def listar_ventas_espera(self) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, etiqueta, IFNULL(usuario, ''), total, fecha, IFNULL(cliente_codigo, '')
+            FROM ventas_espera
+            ORDER BY datetime(fecha), id
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def obtener_venta_espera(self, espera_id: int) -> tuple | None:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, etiqueta, usuario, cliente_id, cliente_codigo, documento_cliente,
+                   condicion_pago_id, tipo_comprobante, descuento_global, items_json, total, fecha
+            FROM ventas_espera
+            WHERE id = ?
+            """,
+            (int(espera_id),),
+        )
+        row = cur.fetchone()
+        conn.close()
+        return row
+
+    def guardar_venta_espera(
+        self,
+        etiqueta: str,
+        usuario: str | None,
+        cliente_id: int | None,
+        cliente_codigo: str,
+        documento_cliente: str,
+        condicion_pago_id: int | None,
+        tipo_comprobante: str,
+        descuento_global: float,
+        items_json: str,
+        total: float,
+    ) -> int:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO ventas_espera (
+                etiqueta, usuario, cliente_id, cliente_codigo, documento_cliente,
+                condicion_pago_id, tipo_comprobante, descuento_global, items_json, total
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                etiqueta.strip(),
+                (usuario or "").strip() or None,
+                cliente_id,
+                (cliente_codigo or "").strip() or "MOSTRADOR",
+                (documento_cliente or "").strip() or None,
+                condicion_pago_id,
+                (tipo_comprobante or "").strip() or "Consumidor final",
+                round(float(descuento_global or 0), 2),
+                items_json,
+                round(float(total or 0), 2),
+            ),
+        )
+        new_id = int(cur.lastrowid)
+        conn.commit()
+        conn.close()
+        return new_id
+
+    def eliminar_venta_espera(self, espera_id: int) -> None:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM ventas_espera WHERE id = ?", (int(espera_id),))
+        conn.commit()
+        conn.close()
+
+    def _migrate_resto_pos(self, cursor):
+        """Listas, métodos, bodegas, compras, NCF y la venta amarrada al turno."""
+        cursor.execute("PRAGMA table_info(facturas)")
+        fcols = {row[1] for row in cursor.fetchall()}
+        for name, decl in (
+            ("cierre_id", "INTEGER"),
+            ("ncf", "TEXT"),
+            ("lista_precio", "TEXT"),
+        ):
+            if name not in fcols:
+                cursor.execute(f"ALTER TABLE facturas ADD COLUMN {name} {decl}")
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metodos_pago (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codigo TEXT UNIQUE NOT NULL,
+                nombre TEXT NOT NULL,
+                afecta_caja INTEGER NOT NULL DEFAULT 0,
+                activo INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        cursor.execute("SELECT COUNT(*) FROM metodos_pago")
+        if cursor.fetchone()[0] == 0:
+            for cod, nom, caja in (
+                ("efectivo", "Efectivo", 1),
+                ("tarjeta", "Tarjeta", 0),
+                ("transferencia", "Transferencia", 0),
+            ):
+                cursor.execute(
+                    "INSERT INTO metodos_pago (codigo, nombre, afecta_caja, activo) VALUES (?,?,?,1)",
+                    (cod, nom, caja),
+                )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_bodega (
+                producto_id INTEGER NOT NULL,
+                bodega TEXT NOT NULL,
+                cantidad REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (producto_id, bodega),
+                FOREIGN KEY (producto_id) REFERENCES productos(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO stock_bodega (producto_id, bodega, cantidad)
+            SELECT id,
+                   CASE WHEN TRIM(IFNULL(bodega_codigo,'')) = '' THEN 'Principal'
+                        ELSE TRIM(bodega_codigo) END,
+                   IFNULL(stock, 0)
+            FROM productos
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS compras (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proveedor_id INTEGER,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total REAL NOT NULL DEFAULT 0,
+                usuario TEXT,
+                nota TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS compra_detalle (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                compra_id INTEGER NOT NULL,
+                producto_id INTEGER NOT NULL,
+                cantidad REAL NOT NULL,
+                costo REAL NOT NULL,
+                bodega TEXT,
+                FOREIGN KEY (compra_id) REFERENCES compras(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS secuencias_ncf (
+                tipo TEXT PRIMARY KEY,
+                prefijo TEXT NOT NULL,
+                siguiente INTEGER NOT NULL DEFAULT 1,
+                hasta INTEGER NOT NULL DEFAULT 1000
+            )
+            """
+        )
+        cursor.execute("SELECT COUNT(*) FROM secuencias_ncf")
+        if cursor.fetchone()[0] == 0:
+            for tipo, pref in (
+                ("consumidor_final", "B02"),
+                ("credito_fiscal", "B01"),
+                ("gubernamental", "B15"),
+                ("especial", "B14"),
+            ):
+                cursor.execute(
+                    "INSERT INTO secuencias_ncf (tipo, prefijo, siguiente, hasta) VALUES (?,?,1,500)",
+                    (tipo, pref),
+                )
+
+    def listar_metodos_pago(self, solo_activos: bool = True) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        q = "SELECT codigo, nombre, afecta_caja, activo FROM metodos_pago"
+        if solo_activos:
+            q += " WHERE IFNULL(activo,1) = 1"
+        q += " ORDER BY id"
+        cur.execute(q)
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def guardar_metodo_pago(self, codigo: str, nombre: str, afecta_caja: bool, activo: bool = True):
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO metodos_pago (codigo, nombre, afecta_caja, activo)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(codigo) DO UPDATE SET
+                nombre = excluded.nombre,
+                afecta_caja = excluded.afecta_caja,
+                activo = excluded.activo
+            """,
+            (codigo.strip().lower(), nombre.strip(), 1 if afecta_caja else 0, 1 if activo else 0),
+        )
+        conn.commit()
+        conn.close()
+
+    def codigos_afectan_caja(self) -> set[str]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT codigo FROM metodos_pago WHERE IFNULL(activo,1)=1 AND IFNULL(afecta_caja,0)=1"
+        )
+        codes = {r[0] for r in cur.fetchall()}
+        conn.close()
+        return codes or {"efectivo"}
+
+    def ajustar_stock_bodega(self, producto_id: int, delta: float, bodega: str | None = None, conn=None):
+        """Mueve solo la existencia de la bodega. No toca productos.stock."""
+        close_after = conn is None
+        if conn is None:
+            conn = self.get_connection()
+        cur = conn.cursor()
+        if not bodega:
+            cur.execute(
+                "SELECT IFNULL(NULLIF(TRIM(bodega_codigo),''), 'Principal') FROM productos WHERE id=?",
+                (producto_id,),
+            )
+            row = cur.fetchone()
+            bodega = (row[0] if row else None) or "Principal"
+        bodega = bodega.strip() or "Principal"
+        cur.execute(
+            "SELECT cantidad FROM stock_bodega WHERE producto_id=? AND bodega=?",
+            (producto_id, bodega),
+        )
+        if cur.fetchone() is None:
+            cur.execute(
+                "SELECT COUNT(*) FROM stock_bodega WHERE producto_id=?",
+                (producto_id,),
+            )
+            otras = int(cur.fetchone()[0] or 0)
+            if otras == 0:
+                cur.execute(
+                    "SELECT IFNULL(stock, 0) FROM productos WHERE id=?",
+                    (producto_id,),
+                )
+                base = cur.fetchone()
+                cantidad = float(base[0] if base else delta)
+            else:
+                cantidad = float(delta)
+            cur.execute(
+                "INSERT INTO stock_bodega (producto_id, bodega, cantidad) VALUES (?,?,?)",
+                (producto_id, bodega, cantidad),
+            )
+        else:
+            cur.execute(
+                "UPDATE stock_bodega SET cantidad = cantidad + ? WHERE producto_id=? AND bodega=?",
+                (float(delta), producto_id, bodega),
+            )
+        if close_after:
+            conn.commit()
+            conn.close()
+        return bodega
+
+    def transferir_entre_bodegas(self, producto_id: int, origen: str, destino: str, cantidad: float, usuario: str | None):
+        origen = (origen or "Principal").strip() or "Principal"
+        destino = (destino or "").strip()
+        if not destino or origen.lower() == destino.lower():
+            raise ValueError("Elija una bodega de destino distinta al origen.")
+        if cantidad <= 0:
+            raise ValueError("La cantidad debe ser mayor que cero.")
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT cantidad FROM stock_bodega WHERE producto_id=? AND bodega=?",
+            (producto_id, origen),
+        )
+        row = cur.fetchone()
+        disponible = float(row[0] if row else 0)
+        if cantidad > disponible + 0.0001:
+            conn.close()
+            raise ValueError(f"En {origen} hay {disponible:.2f}. No alcanza para transferir {cantidad:.2f}.")
+        self.ajustar_stock_bodega(producto_id, -cantidad, origen, conn=conn)
+        self.ajustar_stock_bodega(producto_id, cantidad, destino, conn=conn)
+        self.insert_movimiento_kardex(
+            producto_id, "transferencia", -cantidad, ajustar_stock=False,
+            usuario=usuario, bodega_codigo=origen, tipo_codigo="TR",
+            descripcion_mov=f"Sale hacia {destino}", conn=conn,
+        )
+        self.insert_movimiento_kardex(
+            producto_id, "transferencia", cantidad, ajustar_stock=False,
+            usuario=usuario, bodega_codigo=destino, tipo_codigo="TR",
+            descripcion_mov=f"Entra desde {origen}", conn=conn,
+        )
+        conn.commit()
+        conn.close()
+
+    def registrar_compra(self, proveedor_id, producto_id, cantidad, costo, bodega, usuario, nota=""):
+        if cantidad <= 0:
+            raise ValueError("La cantidad debe ser mayor que cero.")
+        bodega = (bodega or "Principal").strip() or "Principal"
+        conn = self.get_connection()
+        cur = conn.cursor()
+        total = round(float(cantidad) * float(costo), 2)
+        cur.execute(
+            "INSERT INTO compras (proveedor_id, total, usuario, nota) VALUES (?,?,?,?)",
+            (proveedor_id, total, usuario, nota or None),
+        )
+        compra_id = cur.lastrowid
+        cur.execute(
+            """
+            INSERT INTO compra_detalle (compra_id, producto_id, cantidad, costo, bodega)
+            VALUES (?,?,?,?,?)
+            """,
+            (compra_id, producto_id, cantidad, costo, bodega),
+        )
+        cur.execute(
+            "UPDATE productos SET stock = IFNULL(stock,0) + ? WHERE id=?",
+            (cantidad, producto_id),
+        )
+        self.ajustar_stock_bodega(producto_id, cantidad, bodega, conn=conn)
+        cur.execute("SELECT nombre FROM proveedores WHERE id=?", (proveedor_id,))
+        prov = cur.fetchone()
+        self.insert_movimiento_kardex(
+            producto_id, "compra", cantidad, ajustar_stock=False,
+            usuario=usuario, bodega_codigo=bodega, precio_unitario=costo,
+            tipo_codigo="CO", entidad_nombre=(prov[0] if prov else None),
+            referencia=f"COMPRA-{compra_id}",
+            descripcion_mov=f"Compra {compra_id}", conn=conn,
+        )
+        conn.commit()
+        conn.close()
+        return compra_id
+
+    def tomar_siguiente_ncf(self, tipo: str, conn=None) -> str | None:
+        close_after = conn is None
+        if conn is None:
+            conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT prefijo, siguiente, hasta FROM secuencias_ncf WHERE tipo=?",
+            (tipo,),
+        )
+        row = cur.fetchone()
+        if not row:
+            if close_after:
+                conn.close()
+            return None
+        prefijo, siguiente, hasta = row
+        if int(siguiente) > int(hasta):
+            if close_after:
+                conn.close()
+            return None
+        ncf = f"{prefijo}{int(siguiente):08d}"
+        cur.execute(
+            "UPDATE secuencias_ncf SET siguiente = siguiente + 1 WHERE tipo=?",
+            (tipo,),
+        )
+        if close_after:
+            conn.commit()
+            conn.close()
+        return ncf
+
+    def listar_secuencias_ncf(self) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT tipo, prefijo, siguiente, hasta FROM secuencias_ncf ORDER BY tipo")
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def guardar_secuencia_ncf(self, tipo: str, prefijo: str, siguiente: int, hasta: int):
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO secuencias_ncf (tipo, prefijo, siguiente, hasta)
+            VALUES (?,?,?,?)
+            ON CONFLICT(tipo) DO UPDATE SET
+                prefijo=excluded.prefijo,
+                siguiente=excluded.siguiente,
+                hasta=excluded.hasta
+            """,
+            (tipo, prefijo.strip().upper(), int(siguiente), int(hasta)),
+        )
+        conn.commit()
+        conn.close()
+
+    def desglose_pagos_turno(self, fecha_apertura: str, cierre_id: int | None = None) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        if cierre_id:
+            cur.execute(
+                """
+                SELECT p.tipo_pago, SUM(p.monto)
+                FROM pagos_factura p
+                JOIN facturas f ON f.id = p.factura_id
+                WHERE f.estado = 'emitida'
+                  AND (f.cierre_id = ? OR (f.cierre_id IS NULL AND datetime(f.fecha) >= datetime(?)))
+                GROUP BY p.tipo_pago
+                ORDER BY SUM(p.monto) DESC
+                """,
+                (cierre_id, fecha_apertura),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT p.tipo_pago, SUM(p.monto)
+                FROM pagos_factura p
+                JOIN facturas f ON f.id = p.factura_id
+                WHERE f.estado = 'emitida' AND datetime(f.fecha) >= datetime(?)
+                GROUP BY p.tipo_pago
+                ORDER BY SUM(p.monto) DESC
+                """,
+                (fecha_apertura,),
+            )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def reporte_mas_vendidos(self, dias: int = 30) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.descripcion, SUM(d.cantidad), SUM(d.total_linea)
+            FROM factura_detalle d
+            JOIN facturas f ON f.id = d.factura_id
+            WHERE f.estado = 'emitida'
+              AND datetime(f.fecha) >= datetime('now', ?)
+            GROUP BY d.descripcion
+            ORDER BY SUM(d.cantidad) DESC
+            LIMIT 20
+            """,
+            (f"-{int(dias)} days",),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def reporte_por_cajero(self, dias: int = 30) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT IFNULL(usuario, '—'), COUNT(*), SUM(total)
+            FROM facturas
+            WHERE estado = 'emitida'
+              AND datetime(fecha) >= datetime('now', ?)
+            GROUP BY usuario
+            ORDER BY SUM(total) DESC
+            """,
+            (f"-{int(dias)} days",),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def reporte_por_forma_pago(self, dias: int = 30) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT p.tipo_pago, COUNT(*), SUM(p.monto)
+            FROM pagos_factura p
+            JOIN facturas f ON f.id = p.factura_id
+            WHERE f.estado = 'emitida'
+              AND datetime(f.fecha) >= datetime('now', ?)
+            GROUP BY p.tipo_pago
+            ORDER BY SUM(p.monto) DESC
+            """,
+            (f"-{int(dias)} days",),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def listar_promociones(self) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT p.id, p.nombre, p.tipo_descuento, IFNULL(p.valor,0), IFNULL(p.activo,1),
+                   (SELECT COUNT(*) FROM promociones_detalle d WHERE d.promocion_id = p.id)
+            FROM promociones p
+            ORDER BY p.id DESC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def guardar_promocion(self, nombre, tipo, valor, producto_id=None, categoria_id=None):
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO promociones (nombre, tipo_descuento, valor, aplica_por, activo)
+            VALUES (?, ?, ?, 'producto', 1)
+            """,
+            (nombre.strip(), tipo, valor),
+        )
+        pid = cur.lastrowid
+        cur.execute(
+            """
+            INSERT INTO promociones_detalle (promocion_id, producto_id, categoria_id, cliente_id)
+            VALUES (?, ?, ?, NULL)
+            """,
+            (pid, producto_id, categoria_id),
+        )
+        conn.commit()
+        conn.close()
+        return pid
+
+    def set_promocion_activa(self, promo_id: int, activo: bool):
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE promociones SET activo=? WHERE id=?",
+            (1 if activo else 0, promo_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def listar_combos_venta(self) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, nombre, IFNULL(precio_combo,0)
+            FROM combos
+            WHERE IFNULL(activo,1)=1
+            ORDER BY nombre
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def componentes_combo(self, combo_id: int) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT c.producto_id, c.cantidad, p.nombre, IFNULL(p.stock,0),
+                   IFNULL(p.facturar_sin_stock,1)
+            FROM combos_detalle c
+            JOIN productos p ON p.id = c.producto_id
+            WHERE c.combo_id=?
+            """,
+            (combo_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
 
     def _migrate_cierres_caja_estado(self, cursor):
         """
@@ -843,10 +1518,19 @@ class Database:
             """
         )
         rows = [r[0] for r in cur.fetchall() if r[0]]
+        cur.execute(
+            """
+            SELECT DISTINCT TRIM(bodega) FROM stock_bodega
+            WHERE bodega IS NOT NULL AND TRIM(bodega) != ''
+            """
+        )
+        for (b,) in cur.fetchall():
+            if b and b not in rows:
+                rows.append(b)
         conn.close()
-        if not rows:
-            rows = ["Principal"]
-        return rows
+        if "Principal" not in rows:
+            rows.insert(0, "Principal")
+        return rows or ["Principal"]
 
     def list_ids_productos_activos(self):
         conn = self.get_connection()
@@ -1128,6 +1812,53 @@ class Database:
             return row[0]  # role
         return None
 
+    def _migrate_permisos_seguimiento(self, cursor):
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usuario_permisos (
+                username TEXT NOT NULL,
+                modulo TEXT NOT NULL,
+                PRIMARY KEY (username, modulo)
+            )
+            """
+        )
+        cursor.execute("PRAGMA table_info(cierres_caja)")
+        cols = {row[1] for row in cursor.fetchall()}
+        for name, decl in (
+            ("seguimiento_estado", "TEXT"),
+            ("seguimiento_nota", "TEXT"),
+            ("seguimiento_usuario", "TEXT"),
+            ("seguimiento_fecha", "TEXT"),
+        ):
+            if name not in cols:
+                cursor.execute(f"ALTER TABLE cierres_caja ADD COLUMN {name} {decl}")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bodegas (
+                codigo TEXT PRIMARY KEY
+            )
+            """
+        )
+        cursor.execute("INSERT OR IGNORE INTO bodegas (codigo) VALUES ('Principal')")
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO bodegas (codigo)
+            SELECT DISTINCT TRIM(bodega) FROM stock_bodega
+            WHERE TRIM(IFNULL(bodega, '')) != ''
+            """
+        )
+
+    def usuario_existe(self, username: str) -> bool:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM users WHERE username = ? LIMIT 1",
+            ((username or "").strip(),),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None
+
     # ==========================
     #   USUARIOS: CRUD BÁSICO
     # ==========================
@@ -1271,6 +2002,7 @@ class Database:
         return {
             "nombre": self.get_config("empresa_nombre", "Mi empresa"),
             "direccion": self.get_config("empresa_direccion", "") or "",
+            "rnc": self.get_config("empresa_rnc", "") or "",
         }
 
     def get_app_logo_path(self):
@@ -1624,7 +2356,7 @@ class Database:
         if not q:
             cur.execute(
                 """
-                SELECT id, nombre, documento, telefono
+                SELECT id, nombre, documento, telefono, IFNULL(email, '')
                 FROM clientes
                 ORDER BY nombre
                 LIMIT ?
@@ -1635,7 +2367,7 @@ class Database:
             like = f"%{q}%"
             cur.execute(
                 """
-                SELECT id, nombre, documento, telefono
+                SELECT id, nombre, documento, telefono, IFNULL(email, '')
                 FROM clientes
                 WHERE nombre LIKE ? OR IFNULL(documento,'') LIKE ?
                 ORDER BY nombre
@@ -1648,16 +2380,25 @@ class Database:
         return rows
 
     def crear_cliente_rapido(
-        self, nombre: str, documento: str | None = None, telefono: str | None = None
+        self,
+        nombre: str,
+        documento: str | None = None,
+        telefono: str | None = None,
+        email: str | None = None,
     ) -> int:
         conn = self.get_connection()
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO clientes (nombre, documento, telefono)
-            VALUES (?, ?, ?)
+            INSERT INTO clientes (nombre, documento, telefono, email)
+            VALUES (?, ?, ?, ?)
             """,
-            ((nombre or "").strip() or "Cliente", (documento or "").strip() or None, (telefono or "").strip() or None),
+            (
+                (nombre or "").strip() or "Cliente",
+                (documento or "").strip() or None,
+                (telefono or "").strip() or None,
+                (email or "").strip() or None,
+            ),
         )
         new_id = cur.lastrowid
         conn.commit()
@@ -1771,8 +2512,33 @@ class Database:
             _id, pid, cant_orig, total_linea, desc = dr
             cant_orig = float(cant_orig or 0)
             if pid is None:
-                conn.close()
-                return False, "Las líneas sin producto no generan movimiento de inventario."
+                cur.execute(
+                    "SELECT id FROM combos WHERE nombre = ? LIMIT 1",
+                    (desc,),
+                )
+                combo = cur.fetchone()
+                comps = []
+                if combo:
+                    cur.execute(
+                        "SELECT producto_id, cantidad FROM combos_detalle WHERE combo_id=?",
+                        (combo[0],),
+                    )
+                    comps = cur.fetchall()
+                if not comps:
+                    conn.close()
+                    return False, "Las líneas sin producto no generan movimiento de inventario."
+                ya = self._cantidad_ya_devuelta_linea(cur, int(det_id), int(factura_id))
+                max_q = cant_orig - ya
+                if qty_ret > max_q + 0.0001:
+                    conn.close()
+                    return False, f"Cantidad a devolver excede lo disponible en la línea ({max_q:.2f})."
+                frac = qty_ret / cant_orig if cant_orig else 0
+                monto_linea = float(total_linea or 0) * frac
+                monto_total += monto_linea
+                detalles_proc.append(
+                    (int(det_id), None, qty_ret, monto_linea, desc, list(comps))
+                )
+                continue
             ya = self._cantidad_ya_devuelta_linea(cur, int(det_id), int(factura_id))
             max_q = cant_orig - ya
             if qty_ret > max_q + 0.0001:
@@ -1781,7 +2547,7 @@ class Database:
             frac = qty_ret / cant_orig if cant_orig else 0
             monto_linea = float(total_linea or 0) * frac
             monto_total += monto_linea
-            detalles_proc.append((int(det_id), int(pid), qty_ret, monto_linea, desc))
+            detalles_proc.append((int(det_id), int(pid), qty_ret, monto_linea, desc, []))
 
         if not detalles_proc:
             conn.close()
@@ -1810,7 +2576,7 @@ class Database:
             )
             nc_id = cur.lastrowid
 
-            for det_id, pid, qty_ret, monto_linea, desc in detalles_proc:
+            for det_id, pid, qty_ret, monto_linea, desc, comps in detalles_proc:
                 cur.execute(
                     """
                     INSERT INTO notas_credito_detalle (
@@ -1827,6 +2593,34 @@ class Database:
                         round(monto_linea, 2),
                     ),
                 )
+                if comps:
+                    for cpid, ccant in comps:
+                        mover = float(ccant or 0) * float(qty_ret)
+                        cur.execute(
+                            """
+                            SELECT IFNULL(NULLIF(TRIM(bodega_codigo), ''), '')
+                            FROM productos WHERE id = ?
+                            """,
+                            (int(cpid),),
+                        )
+                        br = cur.fetchone()
+                        bod = (br[0] or "").strip() or None
+                        self.insert_movimiento_kardex(
+                            int(cpid),
+                            "devolucion_cliente",
+                            mover,
+                            ajustar_stock=True,
+                            referencia=nro,
+                            factura_id=int(factura_id),
+                            usuario=usuario,
+                            tipo_codigo="NC",
+                            entidad_nombre=(desc or "")[:80],
+                            bodega_codigo=bod,
+                            descripcion_mov=f"Devolución combo {nro} — fact. {numero_fac}",
+                            conn=conn,
+                        )
+                        self.ajustar_stock_bodega(int(cpid), mover, bod, conn=conn)
+                    continue
                 cur.execute(
                     """
                     SELECT IFNULL(NULLIF(TRIM(bodega_codigo), ''), '')
@@ -1851,6 +2645,7 @@ class Database:
                     descripcion_mov=f"Devolución {nro} — fact. {numero_fac}",
                     conn=conn,
                 )
+                self.ajustar_stock_bodega(pid, qty_ret, bod, conn=conn)
 
             conn.commit()
         except Exception as e:
@@ -1871,7 +2666,7 @@ class Database:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT IFNULL(estado,''), numero, total
+            SELECT IFNULL(estado,''), numero, total, IFNULL(tipo_comprobante,'consumidor_final')
             FROM facturas WHERE id = ?
             """,
             (int(factura_id),),
@@ -1880,7 +2675,7 @@ class Database:
         if not row:
             conn.close()
             return False, "Documento no encontrado."
-        estado, numero, total = row
+        estado, numero, total, tipo_comp = row
         if (estado or "").lower() != "cotizacion":
             conn.close()
             return False, "Solo los presupuestos pendientes pueden confirmarse como venta."
@@ -1931,6 +2726,7 @@ class Database:
                     descripcion_mov=f"Venta confirmada: {numero}",
                     conn=conn,
                 )
+                self.ajustar_stock_bodega(int(pid), -qty, bod, conn=conn)
 
             pago_sum = sum(float(p.get("monto") or 0) for p in pagos)
             if abs(pago_sum - float(total or 0)) > 0.05:
@@ -1953,9 +2749,16 @@ class Database:
                     (int(factura_id), (p.get("tipo") or "efectivo").strip(), m),
                 )
 
+            caja = self.fetch_caja_abierta_row()
+            cierre_id = int(caja[0]) if caja else None
+            ncf = self.tomar_siguiente_ncf(tipo_comp or "consumidor_final", conn=conn)
             cur.execute(
-                "UPDATE facturas SET estado = 'emitida' WHERE id = ?",
-                (int(factura_id),),
+                """
+                UPDATE facturas
+                SET estado = 'emitida', cierre_id = ?, ncf = ?
+                WHERE id = ?
+                """,
+                (cierre_id, ncf, int(factura_id)),
             )
             conn.commit()
         except Exception as e:
