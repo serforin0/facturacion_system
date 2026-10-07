@@ -3,9 +3,13 @@ Mostrador web. Usa la misma base SQLite que el programa de escritorio.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -132,11 +136,42 @@ def _secret() -> str:
 
 
 _secret()
+_SESION_SEGUNDOS = 12 * 3600
+
+
+def _token_sesion(usuario: str) -> str:
+    expira = int(time.time()) + _SESION_SEGUNDOS
+    cuerpo = base64.urlsafe_b64encode(
+        json.dumps({"u": usuario, "e": expira}, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    firma = hmac.new(_secret().encode(), cuerpo.encode(), hashlib.sha256).hexdigest()
+    return f"{cuerpo}.{firma}"
+
+
+def _usuario_de_token(token: str) -> str | None:
+    guardado = _sessions.get(token)
+    if guardado:
+        return guardado
+    if "." not in token:
+        return None
+    cuerpo, firma = token.rsplit(".", 1)
+    buena = hmac.new(_secret().encode(), cuerpo.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(firma, buena):
+        return None
+    relleno = "=" * (-len(cuerpo) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cuerpo + relleno))
+        if int(data["e"]) < time.time():
+            return None
+        usuario = str(data["u"]).strip()
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return usuario or None
 
 
 def _user(request: Request) -> str:
     token = request.cookies.get("sesion") or ""
-    user = _sessions.get(token)
+    user = _usuario_de_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Inicia sesión")
     return user
@@ -360,10 +395,17 @@ def login(body: LoginIn):
     role = db().validate_user(body.username.strip(), body.password)
     if not role:
         raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
-    token = secrets.token_urlsafe(32)
+    token = _token_sesion(body.username.strip())
     _sessions[token] = body.username.strip()
     resp = JSONResponse({"ok": True, "usuario": body.username.strip(), "rol": role})
-    resp.set_cookie("sesion", token, httponly=True, samesite="lax")
+    resp.set_cookie(
+        "sesion",
+        token,
+        httponly=True,
+        samesite="lax",
+        path="/",
+        max_age=_SESION_SEGUNDOS,
+    )
     return resp
 
 
@@ -371,7 +413,7 @@ def login(body: LoginIn):
 def logout(request: Request):
     _sessions.pop(request.cookies.get("sesion") or "", None)
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie("sesion")
+    resp.delete_cookie("sesion", path="/")
     return resp
 
 
@@ -2614,6 +2656,20 @@ async function entrar(){
     await refrescar(); await cargar();
   } catch(e){ loginMsg.textContent = e.message; }
 }
+async function sesionInicial(){
+  try {
+    await api("/api/estado");
+  } catch(e) {
+    return;
+  }
+  login.style.display = "none";
+  app.style.display = "block";
+  try {
+    await refrescar();
+    await cargar();
+  } catch(e) {}
+}
+sesionInicial();
 let permisos = [];
 function aplicarPermisos(mods){
   permisos = mods || [];
