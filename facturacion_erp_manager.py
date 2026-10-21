@@ -16,7 +16,11 @@ from urllib.parse import urlencode
 import customtkinter as ctk
 from tkinter import StringVar, messagebox, ttk
 
-from caja_manager import calcular_totales_desde_apertura, ejecutar_cierre_caja_desde_fila
+from caja_manager import (
+    calcular_totales_desde_apertura,
+    efectivo_esperado_turno,
+    ejecutar_cierre_caja_desde_fila,
+)
 from database import Database
 from devoluciones_facturacion import DevolucionesFacturacionFrame
 from factura_manager import FacturaManager
@@ -104,9 +108,10 @@ def _texto_cierre_caja_turno(
     ) = caja_row
     monto_inicial = float(monto_inicial or 0)
     total_ventas, ef_sis, tar_sis, otros_sis = calcular_totales_desde_apertura(
-        db, fecha_ap
+        db, fecha_ap, _cid
     )
-    esperado = ef_sis + monto_inicial
+    ingresos_ef, retiros_ef = db.totales_movimientos_efectivo(_cid)
+    esperado = efectivo_esperado_turno(monto_inicial, ef_sis, ingresos_ef, retiros_ef)
     diff = efectivo_contado - esperado
     lines = [
         "=== CIERRE DE CAJA O TURNO ===",
@@ -121,8 +126,10 @@ def _texto_cierre_caja_turno(
         f"  — Efectivo (sistema): RD$ {ef_sis:,.2f}",
         f"  — Tarjeta:           RD$ {tar_sis:,.2f}",
         f"  — Otros:             RD$ {otros_sis:,.2f}",
+        f"Ingresos de efectivo: RD$ {ingresos_ef:,.2f}",
+        f"Retiros de efectivo:  RD$ {retiros_ef:,.2f}",
         "",
-        f"Efectivo esperado (fondo + efectivo ventas): RD$ {esperado:,.2f}",
+        f"Efectivo esperado (fondo + efectivo + ingresos − retiros): RD$ {esperado:,.2f}",
         f"Efectivo contado:                            RD$ {efectivo_contado:,.2f}",
         f"Diferencia (contado − esperado):             RD$ {diff:,.2f}",
         "",
@@ -1203,14 +1210,9 @@ class FacturacionERPManager:
             return
         vals = self.tree.item(str(fid), "values")
         nro = vals[0] if vals else str(fid)
-        q = urlencode(
-            {
-                "subject": f"Documento {nro}",
-                "body": "Adjunto: puede generar el comprobante en PDF desde Imprimir "
-                "en el módulo de facturación.\n",
-            }
-        )
-        webbrowser.open(f"mailto:{em.strip()}?{q}")
+        from operaciones_pos import enviar_pdf_factura
+
+        enviar_pdf_factura(self._toplevel(), self.db, fid, em.strip(), str(nro))
 
     def _accion_cerrar(self):
         """Cierre de caja o turno (estilo MONICA)."""

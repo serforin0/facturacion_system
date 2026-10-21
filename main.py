@@ -1,4 +1,5 @@
 import os
+import threading
 
 import customtkinter as ctk
 import tkinterdnd2 as tkdnd   # lo dejamos importado por si lo usas en otros módulos
@@ -8,6 +9,7 @@ from PIL import Image  # Para cargar el logo
 from config_impresion_dialog import open_config_impresion
 from inventory_manager import InventoryManager
 from styles import Styles
+from cuenta_servidor import ServidorInalcanzable, consultar_usuario, url_servidor
 from database import Database
 from facturacion_erp_manager import FacturacionERPManager
 from factura_manager import FacturaManager              # Módulo de facturación (punto de venta)
@@ -172,7 +174,7 @@ class BarSystemApp:
         )
         self.entry_pass.pack(pady=(0, 18))
 
-        ctk.CTkButton(
+        self.btn_login = ctk.CTkButton(
             inner,
             text="Entrar",
             width=300,
@@ -182,7 +184,17 @@ class BarSystemApp:
             fg_color="#2563eb",
             hover_color="#1d4ed8",
             command=self.handle_login,
-        ).pack(pady=(0, 8))
+        )
+        self.btn_login.pack(pady=(0, 8))
+
+        self.lbl_login_estado = ctk.CTkLabel(
+            inner,
+            text="Si el usuario no está en esta computadora, se busca en el servidor.",
+            font=("Arial", 10),
+            text_color="#64748b",
+            wraplength=300,
+        )
+        self.lbl_login_estado.pack(pady=(4, 0))
 
         ctk.CTkLabel(
             inner,
@@ -197,6 +209,8 @@ class BarSystemApp:
         self.handle_login()
 
     def handle_login(self):
+        if getattr(self, "_login_buscando", False):
+            return
         username = self.entry_user.get().strip()
         password = self.entry_pass.get().strip()
 
@@ -205,19 +219,63 @@ class BarSystemApp:
             return
 
         role = self.db.validate_user(username, password)
+        if role:
+            self._abrir_sesion(username, role)
+            return
 
-        if role is None:
+        if self.db.usuario_existe(username):
             messagebox.showerror("Error", "Usuario o contraseña incorrectos")
             return
 
-        # Login correcto
+        self._login_buscando = True
+        self.btn_login.configure(state="disabled", text="Buscando en el servidor...")
+        self.lbl_login_estado.configure(text="Comprobando el usuario en el servidor...")
+
+        def trabajo():
+            rol = None
+            error = None
+            try:
+                rol = consultar_usuario(url_servidor(self.db), username, password)
+            except ServidorInalcanzable as exc:
+                error = str(exc)
+            self.root.after(0, lambda: self._aplicar_usuario_servidor(username, password, rol, error))
+
+        threading.Thread(target=trabajo, daemon=True).start()
+
+    def _aplicar_usuario_servidor(self, username, password, rol, error):
+        self._login_buscando = False
+        if not getattr(self, "btn_login", None):
+            return
+        self.btn_login.configure(state="normal", text="Entrar")
+        self.lbl_login_estado.configure(
+            text="Si el usuario no está en esta computadora, se busca en el servidor."
+        )
+        if error:
+            messagebox.showerror("Servidor", error)
+            return
+        if not rol:
+            messagebox.showerror("Error", "Usuario o contraseña incorrectos")
+            return
+        try:
+            self.db.create_user(username, password, rol)
+        except ValueError:
+            rol = self.db.validate_user(username, password)
+            if not rol:
+                messagebox.showerror("Error", "El usuario ya existe en esta computadora con otra contraseña.")
+                return
+        self.db.set_config("pendiente_sync_datos", username)
+        messagebox.showinfo(
+            "Usuario guardado",
+            "El usuario quedó guardado en esta computadora.\n"
+            "El siguiente paso es sincronizar los datos.",
+        )
+        self._abrir_sesion(username, rol)
+
+    def _abrir_sesion(self, username, role):
         self.current_user = username
-        self.current_role = role  # "admin", "cajero", etc.
+        self.current_role = role
 
-        # Dejar de escuchar Enter para login
         self.root.unbind("<Return>")
-
-        # Destruir login y mostrar el sistema
         self.login_frame.destroy()
         self.setup_ui()
 
@@ -290,24 +348,24 @@ class BarSystemApp:
             r2,
             "compras",
             "Compras",
-            lambda: self._nav_stub("Compras"),
+            self.show_compras,
             width=100,
         )
         add_btn(
             r2,
             "cotizaciones",
             "Cotizaciones",
-            lambda: self._nav_stub("Cotizaciones"),
+            self.show_facturacion,
             width=100,
         )
         add_btn(
             r2,
             "devoluciones",
             "Devoluciones",
-            lambda: self._nav_stub("Devoluciones"),
+            self.show_devoluciones,
             width=100,
         )
-        add_btn(r2, "otros", "Otros", lambda: self._nav_stub("Otros"), width=88)
+        add_btn(r2, "otros", "Promociones", self.show_promociones, width=110)
         if self.current_role == "admin":
             add_btn(r2, "users", "👤 Usuarios", self.show_usuarios, width=110)
         add_btn(
@@ -627,6 +685,31 @@ class BarSystemApp:
             on_refresh_products=None,
         ).pack(fill="both", expand=True)
         self._set_active_nav("kardex")
+
+    def show_compras(self):
+        from operaciones_pos import ComprasFrame
+
+        self.clear_main_container()
+        ComprasFrame(self.main_container, current_user=self.current_user).pack(
+            fill="both", expand=True, padx=8, pady=8
+        )
+        self._set_active_nav("compras")
+
+    def show_devoluciones(self):
+        from devoluciones_facturacion import DevolucionesFacturacionFrame
+
+        self.clear_main_container()
+        DevolucionesFacturacionFrame(
+            self.main_container, current_user=self.current_user
+        ).pack(fill="both", expand=True, padx=8, pady=8)
+        self._set_active_nav("devoluciones")
+
+    def show_promociones(self):
+        from operaciones_pos import PromocionesFrame
+
+        self.clear_main_container()
+        PromocionesFrame(self.main_container).pack(fill="both", expand=True, padx=8, pady=8)
+        self._set_active_nav("otros")
 
     def show_facturacion(self):
         self.clear_main_container()

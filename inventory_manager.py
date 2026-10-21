@@ -412,9 +412,20 @@ class InventoryManager:
         self.edit_product()
 
     def _transferir(self):
-        messagebox.showinfo(
-            "Transferir",
-            "Transferencias entre bodegas no están implementadas aún.",
+        from operaciones_pos import abrir_transferencia
+
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Transferir", "Seleccione un producto en la lista.")
+            return
+        usuario = None
+        if getattr(self, "app", None) is not None:
+            usuario = getattr(self.app, "current_user", None)
+        abrir_transferencia(
+            self._toplevel_for_dialogs(),
+            self.db,
+            int(sel[0]),
+            usuario,
         )
 
     def _ver_producto(self):
@@ -433,10 +444,31 @@ class InventoryManager:
         )
 
     def _etiquetas(self):
-        messagebox.showinfo(
-            "Etiquetas",
-            "Impresión de etiquetas: pendiente de integrar.",
-        )
+        from operaciones_pos import imprimir_etiquetas
+
+        sel = self.tree.selection()
+        ids = [int(i) for i in sel] if sel else []
+        if not ids:
+            messagebox.showwarning("Etiquetas", "Seleccione uno o más productos.")
+            return
+        conn = self.db.get_connection()
+        cur = conn.cursor()
+        productos = []
+        for pid in ids:
+            cur.execute(
+                """
+                SELECT nombre,
+                       IFNULL(NULLIF(TRIM(codigo_barras), ''), IFNULL(codigo_producto, '')),
+                       IFNULL(precio, 0)
+                FROM productos WHERE id = ?
+                """,
+                (pid,),
+            )
+            row = cur.fetchone()
+            if row:
+                productos.append({"nombre": row[0], "codigo": row[1], "precio": row[2]})
+        conn.close()
+        imprimir_etiquetas(self._toplevel_for_dialogs(), productos)
 
     def _notas_producto(self):
         sel = self.tree.selection()

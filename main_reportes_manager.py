@@ -53,6 +53,7 @@ class MainReportesManager:
         self.tabview.add("📊 Ventas")
         self.tabview.add("📄 Historial de facturas")
         self.tabview.add("📦 Valorización de Inventario")
+        self.tabview.add("🧾 Resumen POS")
 
         tab_ventas = self.tabview.tab("📊 Ventas")
         self.reporte_ventas = ReporteVentasManager(tab_ventas)
@@ -62,6 +63,12 @@ class MainReportesManager:
 
         tab_inventario = self.tabview.tab("📦 Valorización de Inventario")
         self.reporte_inventario = ReporteInventarioManager(tab_inventario)
+
+        from operaciones_pos import ResumenPosFrame
+
+        ResumenPosFrame(self.tabview.tab("🧾 Resumen POS")).pack(
+            fill="both", expand=True
+        )
 
         # Seleccionar la pestaña por defecto
         try:

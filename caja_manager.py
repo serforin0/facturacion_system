@@ -4,26 +4,46 @@ from datetime import datetime
 from database import Database
 
 
-def calcular_totales_desde_apertura(db: Database, fecha_apertura: str) -> tuple[float, float, float, float]:
+def calcular_totales_desde_apertura(
+    db: Database, fecha_apertura: str, cierre_id: int | None = None
+) -> tuple[float, float, float, float]:
     """
-    Total ventas y desglose por forma de pago desde fecha_apertura (pagos en facturas emitidas).
+    Total ventas y desglose por forma de pago del turno.
+    Si hay cierre_id, solo entran facturas de ese turno (y las viejas sin turno, por fecha).
     """
     conn = db.get_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT p.tipo_pago, SUM(p.monto)
-        FROM pagos_factura p
-        JOIN facturas f ON f.id = p.factura_id
-        WHERE f.estado = 'emitida'
-          AND datetime(f.fecha) >= datetime(?)
-        GROUP BY p.tipo_pago
-        """,
-        (fecha_apertura,),
-    )
+    if cierre_id:
+        cursor.execute(
+            """
+            SELECT p.tipo_pago, SUM(p.monto)
+            FROM pagos_factura p
+            JOIN facturas f ON f.id = p.factura_id
+            WHERE f.estado = 'emitida'
+              AND (
+                f.cierre_id = ?
+                OR (f.cierre_id IS NULL AND datetime(f.fecha) >= datetime(?))
+              )
+            GROUP BY p.tipo_pago
+            """,
+            (cierre_id, fecha_apertura),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT p.tipo_pago, SUM(p.monto)
+            FROM pagos_factura p
+            JOIN facturas f ON f.id = p.factura_id
+            WHERE f.estado = 'emitida'
+              AND datetime(f.fecha) >= datetime(?)
+            GROUP BY p.tipo_pago
+            """,
+            (fecha_apertura,),
+        )
     rows = cursor.fetchall()
     conn.close()
 
+    afecta = {c.lower() for c in db.codigos_afectan_caja()}
     total_ventas = 0.0
     efectivo = 0.0
     tarjeta = 0.0
@@ -33,7 +53,7 @@ def calcular_totales_desde_apertura(db: Database, fecha_apertura: str) -> tuple[
         monto = float(monto or 0)
         total_ventas += monto
         t = (tipo_pago or "").lower()
-        if t == "efectivo":
+        if t in afecta:
             efectivo += monto
         elif "tarjeta" in t:
             tarjeta += monto
@@ -41,6 +61,103 @@ def calcular_totales_desde_apertura(db: Database, fecha_apertura: str) -> tuple[
             otros += monto
 
     return total_ventas, efectivo, tarjeta, otros
+
+
+def efectivo_esperado_turno(
+    monto_inicial: float,
+    efectivo_ventas: float,
+    ingresos: float,
+    retiros: float,
+) -> float:
+    """Fondo + ventas en efectivo + ingresos − retiros."""
+    return (
+        float(monto_inicial or 0)
+        + float(efectivo_ventas or 0)
+        + float(ingresos or 0)
+        - float(retiros or 0)
+    )
+
+
+def abrir_dialogo_movimiento_efectivo(parent, db: Database, usuario, tipo: str, on_saved=None) -> bool:
+    """
+    Registra un ingreso o un retiro de efectivo en el turno abierto.
+    Devuelve True si se guardó.
+    """
+    tipo = (tipo or "").strip().lower()
+    if tipo not in ("ingreso", "retiro"):
+        return False
+    caja = db.fetch_caja_abierta_row()
+    if caja is None:
+        messagebox.showwarning(
+            "Caja cerrada",
+            "Abra el turno en el módulo Caja antes de mover efectivo.",
+            parent=parent,
+        )
+        return False
+
+    titulo = "Ingreso de efectivo" if tipo == "ingreso" else "Retiro de efectivo"
+    dlg = ctk.CTkToplevel(parent)
+    dlg.title(titulo)
+    dlg.geometry("420x240")
+    dlg.resizable(False, False)
+    dlg.transient(parent)
+    dlg.grab_set()
+
+    ctk.CTkLabel(dlg, text=titulo, font=("Arial", 15, "bold")).pack(
+        anchor="w", padx=16, pady=(14, 6)
+    )
+    ctk.CTkLabel(dlg, text="Monto", font=("Arial", 12)).pack(anchor="w", padx=16)
+    entry_monto = ctk.CTkEntry(dlg, width=180, placeholder_text="0.00")
+    entry_monto.pack(anchor="w", padx=16, pady=(0, 8))
+    ctk.CTkLabel(dlg, text="Motivo", font=("Arial", 12)).pack(anchor="w", padx=16)
+    entry_motivo = ctk.CTkEntry(dlg, width=360, placeholder_text="Ej. cambio, pago a proveedor")
+    entry_motivo.pack(anchor="w", padx=16, pady=(0, 12))
+
+    guardado = {"ok": False}
+
+    def aceptar():
+        try:
+            monto = float((entry_monto.get() or "").replace(",", "").strip())
+        except ValueError:
+            messagebox.showerror("Efectivo", "El monto debe ser un número.", parent=dlg)
+            return
+        if monto <= 0:
+            messagebox.showerror("Efectivo", "El monto debe ser mayor que cero.", parent=dlg)
+            return
+        motivo = (entry_motivo.get() or "").strip()
+        if len(motivo) < 2:
+            messagebox.showerror("Efectivo", "Indique el motivo del movimiento.", parent=dlg)
+            return
+        if tipo == "retiro":
+            cid, _nombre, fecha_ap = caja[0], caja[1], caja[2]
+            monto_inicial = float(caja[6] or 0)
+            _tv, ef_sis, _tar, _ot = calcular_totales_desde_apertura(db, fecha_ap, cid)
+            ingresos, retiros = db.totales_movimientos_efectivo(cid)
+            esperado = efectivo_esperado_turno(monto_inicial, ef_sis, ingresos, retiros)
+            if monto > esperado + 0.01:
+                messagebox.showerror(
+                    "Efectivo",
+                    f"El retiro supera el efectivo esperado del turno (RD$ {esperado:.2f}).",
+                    parent=dlg,
+                )
+                return
+        db.registrar_movimiento_efectivo(caja[0], tipo, monto, motivo, usuario)
+        guardado["ok"] = True
+        dlg.destroy()
+        if callable(on_saved):
+            on_saved()
+
+    btns = ctk.CTkFrame(dlg, fg_color="transparent")
+    btns.pack(fill="x", padx=16, pady=(4, 12))
+    ctk.CTkButton(btns, text="Guardar", fg_color="#15803d", command=aceptar).pack(
+        side="left"
+    )
+    ctk.CTkButton(btns, text="Cancelar", fg_color="#64748b", command=dlg.destroy).pack(
+        side="left", padx=8
+    )
+    entry_monto.focus_set()
+    dlg.wait_window()
+    return bool(guardado["ok"])
 
 
 def ejecutar_cierre_caja_desde_fila(
@@ -86,9 +203,12 @@ def ejecutar_cierre_caja_desde_fila(
     obs = (observaciones or "").strip() or None
 
     total_ventas, ef_sis, tar_sis, otros_sis = calcular_totales_desde_apertura(
-        db, fecha_ap
+        db, fecha_ap, cid
     )
-    efectivo_sistema_total = ef_sis + float(monto_inicial or 0)
+    ingresos_ef, retiros_ef = db.totales_movimientos_efectivo(cid)
+    efectivo_sistema_total = efectivo_esperado_turno(
+        monto_inicial, ef_sis, ingresos_ef, retiros_ef
+    )
     diferencia = efectivo_contado - efectivo_sistema_total
     tolerance = 0.01
 
@@ -101,7 +221,11 @@ def ejecutar_cierre_caja_desde_fila(
         msg = (
             "La caja NO CUADRA.\n\n"
             f"{texto_diff}\n\n"
-            f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
+            f"Efectivo esperado: RD$ {efectivo_sistema_total:.2f}\n"
+            f"  Fondo RD$ {float(monto_inicial or 0):.2f}"
+            f" + ventas efectivo RD$ {ef_sis:.2f}"
+            f" + ingresos RD$ {ingresos_ef:.2f}"
+            f" − retiros RD$ {retiros_ef:.2f}\n"
             f"Efectivo contado: RD$ {efectivo_contado:.2f}\n\n"
             "¿Deseas cerrar la caja de todos modos?"
         )
@@ -161,9 +285,10 @@ def ejecutar_cierre_caja_desde_fila(
         """
     )
     for oid, fap, mi_orf in cursor.fetchall():
-        tv_o, ef_o, tar_o, ot_o = calcular_totales_desde_apertura(db, fap)
+        tv_o, ef_o, tar_o, ot_o = calcular_totales_desde_apertura(db, fap, oid)
+        ing_o, ret_o = db.totales_movimientos_efectivo(oid)
         mi_f = float(mi_orf or 0)
-        ef_esp_o = ef_o + mi_f
+        ef_esp_o = efectivo_esperado_turno(mi_f, ef_o, ing_o, ret_o)
         obs_o = (
             "Cierre automático: había otro turno sin cerrar en la base de datos "
             "(duplicado). Revise el historial."
@@ -204,7 +329,8 @@ def ejecutar_cierre_caja_desde_fila(
         msg = (
             f"Caja '{nombre_caja}' cerrada y CUADRADA.\n\n"
             f"Total ventas (sistema): RD$ {total_ventas:.2f}\n"
-            f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
+            f"Efectivo esperado: RD$ {efectivo_sistema_total:.2f}\n"
+            f"  Fondo + ventas efectivo + ingresos − retiros\n"
             f"Efectivo contado: RD$ {efectivo_contado:.2f}\n"
             f"Diferencia: RD$ 0.00"
         )
@@ -216,7 +342,7 @@ def ejecutar_cierre_caja_desde_fila(
         msg = (
             f"Caja '{nombre_caja}' cerrada con DESCUADRE.\n\n"
             f"Total ventas (sistema): RD$ {total_ventas:.2f}\n"
-            f"Efectivo esperado (sistema + fondo): RD$ {efectivo_sistema_total:.2f}\n"
+            f"Efectivo esperado: RD$ {efectivo_sistema_total:.2f}\n"
             f"Efectivo contado: RD$ {efectivo_contado:.2f}\n"
             f"Diferencia: RD$ {diferencia:.2f}\n\n"
             f"{texto_diff}\n"
@@ -273,7 +399,16 @@ class CajaManager:
             font=("Arial", 20, "bold"),
             text_color="white"
         )
-        title.pack(pady=(0, 10))
+        title.pack(pady=(0, 6))
+        extra = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        extra.pack(fill="x", padx=5, pady=(0, 8))
+        ctk.CTkButton(
+            extra,
+            text="Métodos de pago",
+            width=150,
+            fg_color="#334155",
+            command=self._abrir_metodos,
+        ).pack(side="left", padx=4)
 
         # ------------------------------
         #   ESTADO ACTUAL + ACCIONES
@@ -362,26 +497,52 @@ class CajaManager:
         )
         self.lbl_totales_info.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 5), sticky="w")
 
+        mov_btns = ctk.CTkFrame(self.frame_caja_abierta, fg_color="transparent")
+        mov_btns.grid(row=2, column=0, columnspan=3, padx=10, pady=(0, 4), sticky="w")
+        ctk.CTkButton(
+            mov_btns,
+            text="Ingreso de efectivo",
+            width=160,
+            fg_color="#15803d",
+            command=lambda: self._dialogo_movimiento("ingreso"),
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            mov_btns,
+            text="Retiro de efectivo",
+            width=160,
+            fg_color="#b45309",
+            command=lambda: self._dialogo_movimiento("retiro"),
+        ).pack(side="left")
+
+        self.lbl_movimientos = ctk.CTkLabel(
+            self.frame_caja_abierta,
+            text="",
+            font=("Arial", 11),
+            text_color="#e2e8f0",
+            justify="left",
+        )
+        self.lbl_movimientos.grid(row=3, column=0, columnspan=3, padx=10, pady=(0, 4), sticky="w")
+
         # Entrada efectivo contado
         ctk.CTkLabel(
             self.frame_caja_abierta,
             text="Efectivo contado por cajero:",
             font=("Arial", 12),
-        ).grid(row=2, column=0, padx=10, pady=5, sticky="e")
+        ).grid(row=4, column=0, padx=10, pady=5, sticky="e")
 
         self.entry_efectivo_contado = ctk.CTkEntry(
             self.frame_caja_abierta,
             width=140,
             placeholder_text="Ej: 8500.00"
         )
-        self.entry_efectivo_contado.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.entry_efectivo_contado.grid(row=4, column=1, padx=5, pady=5, sticky="w")
 
         # Observaciones
         ctk.CTkLabel(
             self.frame_caja_abierta,
             text="Observaciones:",
             font=("Arial", 12),
-        ).grid(row=3, column=0, padx=10, pady=5, sticky="ne")
+        ).grid(row=5, column=0, padx=10, pady=5, sticky="ne")
 
         self.txt_observaciones = ctk.CTkTextbox(
             self.frame_caja_abierta,
@@ -389,7 +550,7 @@ class CajaManager:
             height=60,
             font=("Arial", 11)
         )
-        self.txt_observaciones.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+        self.txt_observaciones.grid(row=5, column=1, padx=5, pady=5, sticky="w")
 
         # Botón cerrar caja
         btn_cerrar = ctk.CTkButton(
@@ -399,7 +560,7 @@ class CajaManager:
             width=140,
             command=self.cerrar_caja
         )
-        btn_cerrar.grid(row=4, column=0, columnspan=3, padx=5, pady=(8, 10))
+        btn_cerrar.grid(row=6, column=0, columnspan=3, padx=5, pady=(8, 10))
 
         self.frame_caja_abierta.grid_columnconfigure(1, weight=1)
 
@@ -531,7 +692,10 @@ class CajaManager:
             )
 
             # Actualizar totales en tiempo real (según ventas desde apertura hasta ahora)
-            total_ventas, ef_sis, tar_sis, otros_sis = self._calcular_totales_desde_apertura(fecha_ap)
+            total_ventas, ef_sis, tar_sis, otros_sis = calcular_totales_desde_apertura(
+                self.db, fecha_ap, cid
+            )
+            desglose = self.db.desglose_pagos_turno(fecha_ap, cid)
             texto_caja = (
                 f"Caja: {nombre_caja}\n"
                 f"Apertura: {fecha_ap}\n"
@@ -540,16 +704,41 @@ class CajaManager:
             )
             self.lbl_caja_info.configure(text=texto_caja)
 
+            ingresos_ef, retiros_ef = self.db.totales_movimientos_efectivo(cid)
+            esperado_ef = efectivo_esperado_turno(
+                monto_inicial, ef_sis, ingresos_ef, retiros_ef
+            )
             texto_totales = (
                 f"TOTAL VENTAS (sistema): RD$ {total_ventas:.2f}\n"
                 f"   - Efectivo (sistema): RD$ {ef_sis:.2f}\n"
                 f"   - Tarjetas (sistema): RD$ {tar_sis:.2f}\n"
-                f"   - Otros (sistema):    RD$ {otros_sis:.2f}"
+                f"   - Otros (sistema):    RD$ {otros_sis:.2f}\n"
+                f"Ingresos de efectivo: RD$ {ingresos_ef:.2f}\n"
+                f"Retiros de efectivo:  RD$ {retiros_ef:.2f}\n"
+                f"EFECTIVO ESPERADO: RD$ {esperado_ef:.2f}\n"
+                + (
+                    "Por método: "
+                    + ", ".join(f"{t} RD$ {float(m):.2f}" for t, m in desglose)
+                    if desglose
+                    else "Por método: sin cobros en este turno"
+                )
             )
             self.lbl_totales_info.configure(text=texto_totales)
+            movs = self.db.listar_movimientos_efectivo(cid)
+            if not movs:
+                self.lbl_movimientos.configure(text="Sin ingresos ni retiros en este turno.")
+            else:
+                lineas = []
+                for _mid, tipo, monto, motivo, _usu, fecha in movs[-6:]:
+                    signo = "+" if (tipo or "") == "ingreso" else "−"
+                    hora = str(fecha or "")[11:16]
+                    lineas.append(f"{signo} RD$ {float(monto):.2f}  {motivo}  {hora}")
+                extra = ""
+                if len(movs) > 6:
+                    extra = f"\n… y {len(movs) - 6} movimiento(s) anterior(es)"
+                self.lbl_movimientos.configure(text="\n".join(lineas) + extra)
 
-            # Sugerir efectivo esperado (fondo + ventas en efectivo) para cuadrar sin descuadre
-            esperado_ef = ef_sis + float(monto_inicial or 0)
+            # Sugerir el efectivo esperado para cuadrar sin descuadre
             self.entry_efectivo_contado.delete(0, "end")
             self.entry_efectivo_contado.insert(0, f"{esperado_ef:.2f}")
 
@@ -558,6 +747,23 @@ class CajaManager:
 
     def _calcular_totales_desde_apertura(self, fecha_apertura: str):
         return calcular_totales_desde_apertura(self.db, fecha_apertura)
+
+    def _abrir_metodos(self):
+        from operaciones_pos import MetodosPagoFrame
+
+        top = ctk.CTkToplevel(self.parent.winfo_toplevel())
+        top.title("Métodos de pago")
+        top.geometry("640x420")
+        MetodosPagoFrame(top).pack(fill="both", expand=True)
+
+    def _dialogo_movimiento(self, tipo: str):
+        abrir_dialogo_movimiento_efectivo(
+            self.parent.winfo_toplevel(),
+            self.db,
+            self.current_user,
+            tipo,
+            on_saved=self._load_estado_caja,
+        )
 
     def abrir_caja(self):
         """Abre una nueva caja si no hay otra abierta."""
