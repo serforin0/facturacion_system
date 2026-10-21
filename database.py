@@ -399,6 +399,9 @@ class Database:
         self._migrate_pos_turno(cursor)
         self._migrate_resto_pos(cursor)
         self._migrate_permisos_seguimiento(cursor)
+        self._migrate_credito_vendedores(cursor)
+        self._migrate_ecf(cursor)
+        self._migrate_terminales(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pagos_factura_factura ON pagos_factura(factura_id)")
 
         # =========================
@@ -936,7 +939,8 @@ class Database:
                 FROM pagos_factura p
                 JOIN facturas f ON f.id = p.factura_id
                 WHERE f.estado = 'emitida'
-                  AND (f.cierre_id = ? OR (f.cierre_id IS NULL AND datetime(f.fecha) >= datetime(?)))
+                  AND (COALESCE(p.cierre_id, f.cierre_id) = ?
+                       OR (COALESCE(p.cierre_id, f.cierre_id) IS NULL AND datetime(COALESCE(p.fecha, f.fecha)) >= datetime(?)))
                 GROUP BY p.tipo_pago
                 ORDER BY SUM(p.monto) DESC
                 """,
@@ -1848,6 +1852,168 @@ class Database:
             """
         )
 
+    def _migrate_credito_vendedores(self, cursor):
+        """Ventas a crédito con abonos por turno, saldo a favor del cliente y vendedores."""
+        for tabla, specs in (
+            ("pagos_factura", (
+                ("cierre_id", "INTEGER"),
+                ("fecha", "TEXT"),
+                ("usuario", "TEXT"),
+                ("es_abono", "INTEGER DEFAULT 0"),
+            )),
+            ("clientes", (
+                ("limite_credito", "REAL DEFAULT 0"),
+                ("dias_credito", "INTEGER DEFAULT 30"),
+                ("lista_precio", "INTEGER DEFAULT 1"),
+                ("activo", "INTEGER DEFAULT 1"),
+            )),
+            ("facturas", (
+                ("vendedor_id", "INTEGER"),
+            )),
+        ):
+            cursor.execute(f"PRAGMA table_info({tabla})")
+            cols = {row[1] for row in cursor.fetchall()}
+            for name, decl in specs:
+                if name not in cols:
+                    cursor.execute(f"ALTER TABLE {tabla} ADD COLUMN {name} {decl}")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saldos_cliente (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id INTEGER NOT NULL,
+                monto REAL NOT NULL,
+                concepto TEXT NOT NULL,
+                nota_credito_id INTEGER,
+                factura_id INTEGER,
+                usuario TEXT,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_saldos_cliente ON saldos_cliente(cliente_id)")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vendedores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT NOT NULL,
+                documento TEXT,
+                activo INTEGER NOT NULL DEFAULT 1,
+                creado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pagos_factura_cierre ON pagos_factura(cierre_id)")
+        cursor.execute("INSERT OR IGNORE INTO config (clave, valor) VALUES ('precios_incluyen_itbis', '0')")
+
+    def _migrate_terminales(self, cursor):
+        """Puntos de venta: numeración, bodega, lista de precios y usuarios por caja."""
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS terminales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT NOT NULL UNIQUE,
+                prefijo TEXT NOT NULL UNIQUE,
+                siguiente INTEGER NOT NULL DEFAULT 1,
+                bodega TEXT,
+                lista_precio INTEGER NOT NULL DEFAULT 1,
+                comprobante TEXT NOT NULL DEFAULT 'consumidor_final',
+                vendedor_id INTEGER,
+                usuarios TEXT NOT NULL DEFAULT '',
+                activo INTEGER NOT NULL DEFAULT 1,
+                creado TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute("PRAGMA table_info(facturas)")
+        if "terminal_id" not in {row[1] for row in cursor.fetchall()}:
+            cursor.execute("ALTER TABLE facturas ADD COLUMN terminal_id INTEGER")
+
+    def _migrate_ecf(self, cursor):
+        """Facturación electrónica DGII: secuencias e-NCF y bitácora de envíos."""
+        cursor.execute("PRAGMA table_info(facturas)")
+        cols = {row[1] for row in cursor.fetchall()}
+        for name, decl in (("encf", "TEXT"), ("ecf_estado", "TEXT"), ("id_local", "TEXT")):
+            if name not in cols:
+                cursor.execute(f"ALTER TABLE facturas ADD COLUMN {name} {decl}")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_id_local ON facturas(id_local) WHERE id_local IS NOT NULL")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ecf_secuencias (
+                tipo INTEGER PRIMARY KEY,
+                siguiente INTEGER NOT NULL DEFAULT 1,
+                hasta INTEGER NOT NULL DEFAULT 0,
+                vencimiento TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ecf_documentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                factura_id INTEGER,
+                nota_credito_id INTEGER,
+                tipo INTEGER NOT NULL,
+                encf TEXT NOT NULL UNIQUE,
+                total REAL NOT NULL DEFAULT 0,
+                estado TEXT NOT NULL,
+                mensaje TEXT,
+                codigo_seguridad TEXT,
+                fecha_firma TEXT,
+                track_id TEXT,
+                url_qr TEXT,
+                xml TEXT,
+                xml_envio TEXT,
+                ambiente TEXT,
+                intentos INTEGER NOT NULL DEFAULT 0,
+                creado TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ecf_doc_factura ON ecf_documentos(factura_id)")
+        for clave, valor in (("ecf_activo", "0"), ("ecf_ambiente", "testecf")):
+            cursor.execute("INSERT OR IGNORE INTO config (clave, valor) VALUES (?, ?)", (clave, valor))
+
+    def tomar_siguiente_encf(self, tipo: int, conn) -> tuple[str, str | None] | None:
+        """Reserva el siguiente e-NCF del tipo (E + tipo + 10 dígitos). Devuelve (encf, vencimiento) o None."""
+        cur = conn.cursor()
+        cur.execute("SELECT siguiente, hasta, vencimiento FROM ecf_secuencias WHERE tipo = ?", (int(tipo),))
+        fila = cur.fetchone()
+        if not fila or int(fila[0]) > int(fila[1] or 0):
+            return None
+        cur.execute("UPDATE ecf_secuencias SET siguiente = siguiente + 1 WHERE tipo = ?", (int(tipo),))
+        return f"E{int(tipo):02d}{int(fila[0]):010d}", fila[2]
+
+    def saldo_favor_cliente(self, cliente_id: int, conn=None) -> float:
+        propio = conn is None
+        conn = conn or self.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT IFNULL(SUM(monto), 0) FROM saldos_cliente WHERE cliente_id = ?", (int(cliente_id),))
+        saldo = round(float(cur.fetchone()[0] or 0), 2)
+        if propio:
+            conn.close()
+        return saldo
+
+    def deuda_cliente(self, cliente_id: int, conn=None) -> float:
+        """Suma de lo que falta por cobrar en las facturas emitidas del cliente."""
+        propio = conn is None
+        conn = conn or self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT IFNULL(SUM(f.total - IFNULL((SELECT SUM(p.monto) FROM pagos_factura p WHERE p.factura_id = f.id), 0)), 0)
+            FROM facturas f
+            WHERE f.cliente_id = ? AND f.estado = 'emitida'
+              AND f.total - IFNULL((SELECT SUM(p.monto) FROM pagos_factura p WHERE p.factura_id = f.id), 0) > 0.009
+            """,
+            (int(cliente_id),),
+        )
+        deuda = round(float(cur.fetchone()[0] or 0), 2)
+        if propio:
+            conn.close()
+        return deuda
+
     def usuario_existe(self, username: str) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -2555,7 +2721,13 @@ class Database:
 
         from datetime import datetime
 
-        nro = f"NC-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        base_nro = f"NC-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        nro, n = base_nro, 2
+        cur.execute("SELECT 1 FROM notas_credito WHERE numero = ?", (nro,))
+        while cur.fetchone() is not None:
+            nro = f"{base_nro}-{n}"
+            n += 1
+            cur.execute("SELECT 1 FROM notas_credito WHERE numero = ?", (nro,))
 
         try:
             cur.execute(

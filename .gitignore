@@ -8,3 +8,10 @@ build/
 *.db
 *.log
 .gemini/
+certificados/
+.pruebas/
+.taste-skill/
+*.p12
+.session_secret
+Yordy
+Yordy.pub

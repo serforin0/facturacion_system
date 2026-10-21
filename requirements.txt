@@ -4,3 +4,8 @@ pillow>=10.0.0
 reportlab
 matplotlib
 pymupdf>=1.24.0
+fastapi
+uvicorn
+lxml>=5.0
+cryptography>=42
+qrcode>=7.4
