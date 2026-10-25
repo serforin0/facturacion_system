@@ -402,6 +402,7 @@ class Database:
         self._migrate_credito_vendedores(cursor)
         self._migrate_ecf(cursor)
         self._migrate_terminales(cursor)
+        self._migrate_conduces(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pagos_factura_factura ON pagos_factura(factura_id)")
 
         # =========================
@@ -606,6 +607,125 @@ class Database:
         conn.commit()
         conn.close()
         return new_id
+
+    def _migrate_conduces(self, cursor):
+        """Pedidos de la tablet. El código se cobra después en la caja principal."""
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conduces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codigo TEXT NOT NULL UNIQUE,
+                mesa TEXT NOT NULL,
+                usuario TEXT,
+                items_json TEXT NOT NULL,
+                subtotal REAL NOT NULL DEFAULT 0,
+                itbis REAL NOT NULL DEFAULT 0,
+                total REAL NOT NULL DEFAULT 0,
+                estado TEXT NOT NULL DEFAULT 'pendiente',
+                factura_id INTEGER,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_conduces_estado ON conduces(estado)")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mesa_ocupada (
+                mesa TEXT PRIMARY KEY,
+                usuario TEXT NOT NULL,
+                conduce_id INTEGER,
+                desde TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute("PRAGMA table_info(conduces)")
+        ccols = {row[1] for row in cursor.fetchall()}
+        if "cocina" not in ccols:
+            cursor.execute("ALTER TABLE conduces ADD COLUMN cocina TEXT NOT NULL DEFAULT 'nueva'")
+        cursor.execute("PRAGMA table_info(facturas)")
+        fcols = {row[1] for row in cursor.fetchall()}
+        if "propina" not in fcols:
+            cursor.execute("ALTER TABLE facturas ADD COLUMN propina REAL NOT NULL DEFAULT 0")
+        cursor.execute("PRAGMA table_info(clientes)")
+        kcols = {row[1] for row in cursor.fetchall()}
+        if "puntos" not in kcols:
+            cursor.execute("ALTER TABLE clientes ADD COLUMN puntos INTEGER NOT NULL DEFAULT 0")
+        cursor.execute("PRAGMA table_info(compras)")
+        ocols = {row[1] for row in cursor.fetchall()}
+        if "pagada" not in ocols:
+            cursor.execute("ALTER TABLE compras ADD COLUMN pagada INTEGER NOT NULL DEFAULT 0")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cuentas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codigo TEXT NOT NULL UNIQUE,
+                nombre TEXT NOT NULL,
+                tipo TEXT NOT NULL
+            )
+            """
+        )
+        for codigo, nombre, tipo in (
+            ("1.1", "Caja", "activo"),
+            ("1.2", "Banco", "activo"),
+            ("1.3", "Cuentas por cobrar", "activo"),
+            ("2.1", "ITBIS por pagar", "pasivo"),
+            ("2.2", "Propinas por pagar", "pasivo"),
+            ("2.3", "Saldo a favor de clientes", "pasivo"),
+            ("2.4", "Cuentas por pagar", "pasivo"),
+            ("4.1", "Ventas", "ingreso"),
+            ("5.1", "Compras", "gasto"),
+            ("6.1", "Gastos", "gasto"),
+        ):
+            cursor.execute(
+                "INSERT OR IGNORE INTO cuentas (codigo, nombre, tipo) VALUES (?,?,?)",
+                (codigo, nombre, tipo),
+            )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS asientos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha TEXT NOT NULL,
+                concepto TEXT NOT NULL,
+                origen TEXT NOT NULL,
+                origen_id INTEGER NOT NULL,
+                usuario TEXT,
+                UNIQUE (origen, origen_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS asiento_lineas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asiento_id INTEGER NOT NULL,
+                cuenta_id INTEGER NOT NULL,
+                debito REAL NOT NULL DEFAULT 0,
+                credito REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS modificadores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                producto_id INTEGER NOT NULL,
+                nombre TEXT NOT NULL,
+                precio REAL NOT NULL DEFAULT 0,
+                activo INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gastos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha TEXT NOT NULL,
+                monto REAL NOT NULL,
+                nota TEXT,
+                usuario TEXT
+            )
+            """
+        )
 
     def eliminar_venta_espera(self, espera_id: int) -> None:
         conn = self.get_connection()
@@ -1071,7 +1191,7 @@ class Database:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, nombre, IFNULL(precio_combo,0)
+            SELECT id, nombre, IFNULL(precio_combo,0), IFNULL(descripcion,'')
             FROM combos
             WHERE IFNULL(activo,1)=1
             ORDER BY nombre
@@ -2169,6 +2289,7 @@ class Database:
             "nombre": self.get_config("empresa_nombre", "Mi empresa"),
             "direccion": self.get_config("empresa_direccion", "") or "",
             "rnc": self.get_config("empresa_rnc", "") or "",
+            "telefono": self.get_config("empresa_telefono", "") or "",
         }
 
     def get_app_logo_path(self):

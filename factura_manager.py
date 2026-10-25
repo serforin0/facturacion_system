@@ -809,7 +809,8 @@ class FacturaManager:
             )
         combos = self.db.listar_combos_venta()
         base = len(rows) if rows else columnas
-        for j, (cid, nombre, precio_combo) in enumerate(combos):
+        for j, combo in enumerate(combos):
+            cid, nombre, precio_combo = combo[0], combo[1], combo[2]
             i = base + j
             texto = f"Combo · {(nombre or '')[:18]}\nRD$ {float(precio_combo or 0):.2f}"
             btn = ctk.CTkButton(

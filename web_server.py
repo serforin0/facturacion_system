@@ -20,6 +20,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from database import Database
+from operacion_local import (
+    asiento_simple,
+    asiento_venta,
+    autorizacion_ok,
+    limpiar_nota,
+    precio_con_extras,
+    propina_legal,
+    puntos_ganados,
+    rebaja_puntos,
+)
 
 TASA_ITBIS = 0.18
 SECRET_PATH = Path(os.environ.get("FACTURACION_SECRET", ".session_secret"))
@@ -187,6 +197,9 @@ def _permisos(username: str) -> list[str]:
     if role == "admin":
         conn.close()
         return list(MODULOS)
+    if role == "mesero":
+        conn.close()
+        return ["pedidos"]
     cur.execute("SELECT modulo FROM usuario_permisos WHERE username=? ORDER BY modulo", (username,))
     mods = [r[0] for r in cur.fetchall() if r[0] in MODULOS]
     conn.close()
@@ -288,7 +301,7 @@ MODULOS = [
     "mostrador", "inventario", "kardex", "historial", "cotizaciones", "indicadores",
     "clientes", "usuarios", "apariencia", "caja", "reportes", "compras",
     "promociones", "devoluciones", "transferir", "ncf", "seguimiento", "metodos",
-    "cobros", "vendedores", "terminales",
+    "cobros", "vendedores", "terminales", "pedidos",
 ]
 
 
@@ -314,7 +327,7 @@ class LoginIn(BaseModel):
 
 class AbrirCajaIn(BaseModel):
     nombre: str = "Caja 1"
-    fondo: float = 0
+    fondo: float | None = None
 
 
 class ItemIn(BaseModel):
@@ -323,6 +336,8 @@ class ItemIn(BaseModel):
     nivel: int = 1
     combo: bool = False
     precio: float | None = None
+    nota: str = ""
+    extras: list[int] = []
 
 
 class PagoIn(BaseModel):
@@ -344,6 +359,9 @@ class VentaIn(BaseModel):
     vendedor_id: int | None = None
     observaciones: str = ""
     id_local: str = ""
+    propina: bool = False
+    autorizacion: str = ""
+    usar_puntos: int = 0
     terminal_id: int | None = None
     fecha_local: str = ""
 
@@ -383,6 +401,23 @@ class PromoIn(BaseModel):
     activa: bool = True
 
 
+class LineaComboIn(BaseModel):
+    producto_id: int
+    cantidad: float = 1
+
+
+class ComboIn(BaseModel):
+    nombre: str
+    precio: float
+    lineas: list[LineaComboIn]
+
+
+class EspecialIn(BaseModel):
+    producto_id: int
+    tipo: str
+    nombre: str = ""
+
+
 class DevolucionIn(BaseModel):
     factura: str
     motivo: str
@@ -409,13 +444,127 @@ class TransferIn(BaseModel):
     cantidad: float
 
 
+COCINA_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Cocina</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e0d0c; --card:#181716; --ink:#f3f2f0; --muted:#b4b0a8; --line:#262422; --accent:#ffd23f; --on:#1f1803; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family: "Segoe UI", sans-serif; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:16px 20px; }
+  h1 { margin:0; font-size:22px; }
+  a { color:var(--accent); }
+  main { display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:12px; padding:0 16px 24px; }
+  article { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; display:grid; gap:8px; }
+  article.lista { opacity:.55; }
+  b { font-size:20px; }
+  li { margin:4px 0; }
+  button { min-height:44px; border:0; border-radius:12px; background:var(--accent); color:var(--on); font-weight:700; }
+  .vacio { color:var(--muted); padding:12px; }
+</style>
+</head>
+<body>
+<header><h1>Cocina</h1><a href="/">Volver a la caja</a></header>
+<main id="lista"><p class="vacio">Cargando pedidos…</p></main>
+<script>
+async function cargar(){
+  const r = await fetch("/api/cocina");
+  if (r.status === 401) { location.href = "/"; return; }
+  const d = await r.json();
+  const root = document.getElementById("lista");
+  const items = d.items || [];
+  if (!items.length) { root.innerHTML = "<p class='vacio'>No hay pedidos en cocina.</p>"; return; }
+  root.innerHTML = items.map(x => {
+    const lineas = (x.lineas || []).map(l => `<li>${l.cantidad} ${esc(l.nombre)}${l.nota ? " · " + esc(l.nota) : ""}</li>`).join("");
+    const lista = x.cocina === "lista";
+    return `<article class="${lista ? "lista" : ""}"><b>${esc(x.mesa)}</b><small>${esc(x.codigo)} · ${esc(x.usuario || "")}</small><ul>${lineas}</ul><button type="button" onclick="marcar(${x.id}, ${lista ? "false" : "true"})">${lista ? "Volver a cocina" : "Listo"}</button></article>`;
+  }).join("");
+}
+function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;"); }
+async function marcar(id, lista){
+  await fetch("/api/cocina/" + id, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({lista})});
+  cargar();
+}
+cargar();
+setInterval(cargar, 5000);
+</script>
+</body>
+</html>"""
+
+PANTALLA_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Tu cuenta</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e0d0c; --ink:#f3f2f0; --muted:#b4b0a8; --accent:#ffd23f; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--ink); font-family: "Segoe UI", sans-serif; display:grid; place-items:center; }
+  main { width:min(520px, calc(100% - 32px)); }
+  h1 { margin:0 0 12px; font-size:18px; color:var(--muted); font-weight:600; }
+  li { display:flex; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px solid #262422; font-size:20px; }
+  small { display:block; color:var(--muted); font-size:14px; }
+  .total { margin-top:18px; font-size:42px; font-weight:800; color:var(--accent); }
+  #promos { color:var(--accent); font-size:18px; min-height:1.2em; }
+  .vacio { color:var(--muted); font-size:22px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tu cuenta</h1>
+  <p id="promos"></p>
+  <ul id="lineas"></ul>
+  <p id="vacio" class="vacio">Cuando la caja arme el ticket, se ve aquí.</p>
+  <p id="total" class="total" hidden></p>
+</main>
+<script>
+function pintar(data){
+  const lineas = (data && data.lineas) || [];
+  document.getElementById("lineas").innerHTML = lineas.map(l => `<li><span>${esc(l.cantidad)} ${esc(l.nombre)}${l.nota ? `<small>${esc(l.nota)}</small>` : ""}</span><span>${money(l.total)}</span></li>`).join("");
+  document.getElementById("vacio").hidden = lineas.length > 0;
+  const total = document.getElementById("total");
+  total.hidden = !lineas.length;
+  total.textContent = lineas.length ? money(data.total) : "";
+  const promos = (data && data.promos) || [];
+  document.getElementById("promos").textContent = promos.map(p => p.nombre + (p.tipo === "porcentaje" ? " " + p.valor + "%" : "")).join(" · ");
+}
+function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;"); }
+function money(n){ return "RD$ " + Number(n||0).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function leer(){ try { return JSON.parse(localStorage.getItem("ticket-vivo") || "{}"); } catch(e) { return {}; } }
+pintar(leer());
+window.addEventListener("storage", ev => { if (ev.key === "ticket-vivo") pintar(leer()); });
+try {
+  const canal = new BroadcastChannel("ticket-vivo");
+  canal.onmessage = ev => pintar(ev.data || {});
+} catch (e) {}
+</script>
+</body>
+</html>"""
+
+@app.get("/cocina", response_class=HTMLResponse)
+def cocina_pagina():
+    return COCINA_HTML
+
+
+@app.get("/pantalla", response_class=HTMLResponse)
+def pantalla_pagina():
+    return PANTALLA_HTML
+
+
 @app.get("/", response_class=HTMLResponse)
 def inicio():
     return HTML
 
 
+@app.get("/tablet", response_class=HTMLResponse)
+def tablet():
+    return TABLET_HTML
+
+
 SW_JS = r"""
-const CACHE = "pos-v1";
+const CACHE = "pos-v4";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -453,6 +602,7 @@ self.addEventListener("fetch", ev => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.origin !== location.origin) return;
+  if (url.pathname === "/tablet" || url.pathname === "/pantalla" || url.pathname === "/cocina") return;
   if (req.mode === "navigate" || url.pathname === "/") {
     ev.respondWith(redPrimero(new Request("/"), false));
   } else if (url.pathname.startsWith("/estaticos/")) {
@@ -519,6 +669,7 @@ def estado(request: Request):
             "nombre": caja[1],
             "apertura": caja[2],
             "fondo": caja[6],
+            "usuario": caja[4],
         },
     }
 
@@ -542,6 +693,7 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
         params.extend([f"%{q.strip()}%", f"%{q.strip()}%"])
     sql += " ORDER BY nombre COLLATE NOCASE LIMIT 80"
     cur.execute(sql, params)
+    filas_producto = cur.fetchall()
 
     def _nivel(base_precio: float, guardado, porcentaje: float) -> float:
         monto = float(guardado or 0)
@@ -549,8 +701,14 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
             return monto
         return round(base_precio * (1 - porcentaje / 100.0), 2)
 
+    cur.execute("SELECT producto_id, id, nombre, precio FROM modificadores WHERE activo=1 ORDER BY nombre")
+    extras_por_producto: dict[int, list[dict]] = {}
+    for producto_id, extra_id, extra_nombre, extra_precio in cur.fetchall():
+        extras_por_producto.setdefault(producto_id, []).append(
+            {"id": extra_id, "nombre": extra_nombre, "precio": float(extra_precio or 0)}
+        )
     productos = []
-    for row in cur.fetchall():
+    for row in filas_producto:
         base_precio = float(row[2] or 0)
         productos.append(
             {
@@ -566,11 +724,12 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
                 "imagen": _imagen_de(row[1]),
                 "minimo": float(row[17] or 0),
                 "combo": False,
+                "extras": extras_por_producto.get(row[0], []),
             }
         )
     combos = [
-        {"id": i, "nombre": n, "precio": float(p), "combo": True, "stock": None, "imagen": _imagen_de(n), "itbis": True, "codigo": "", "minimo": 0}
-        for i, n, p in db().listar_combos_venta()
+        {"id": i, "nombre": n, "precio": float(p), "descripcion": d or "", "combo": True, "stock": None, "imagen": _imagen_de(n), "itbis": True, "codigo": "", "minimo": 0, "extras": []}
+        for i, n, p, d in db().listar_combos_venta()
     ]
     conn.close()
     return {
@@ -581,9 +740,19 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
     }
 
 
+def _fondo_caja(valor: float | None) -> float:
+    if valor is None:
+        raise HTTPException(status_code=400, detail="Indica la caja chica. Si abres sin efectivo, escribe 0.")
+    fondo = round(float(valor), 2)
+    if fondo < 0:
+        raise HTTPException(status_code=400, detail="La caja chica no puede ser negativa")
+    return fondo
+
+
 @app.post("/api/caja/abrir")
 def abrir_caja(request: Request, body: AbrirCajaIn):
     usuario = _exigir(request, "caja")
+    fondo = _fondo_caja(body.fondo)
     base = db()
     if base.fetch_caja_abierta_row() is not None:
         raise HTTPException(status_code=400, detail="Ya hay un turno abierto")
@@ -598,7 +767,7 @@ def abrir_caja(request: Request, body: AbrirCajaIn):
              observaciones, estado)
         VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, NULL, 'abierto')
         """,
-        (body.nombre.strip() or "Caja 1", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), usuario, float(body.fondo or 0)),
+        (body.nombre.strip() or "Caja 1", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), usuario, fondo),
     )
     conn.commit()
     conn.close()
@@ -612,7 +781,9 @@ def _venta_previa(base: Database, id_local: str) -> dict | None:
     cur.execute(
         """
         SELECT f.id, f.numero, IFNULL(f.ncf,''), f.subtotal, f.impuesto_total, f.total, IFNULL(c.nombre,'Consumidor final'),
-               f.fecha_vencimiento, IFNULL((SELECT SUM(p.monto) FROM pagos_factura p WHERE p.factura_id=f.id),0)
+               f.fecha_vencimiento, IFNULL((SELECT SUM(p.monto) FROM pagos_factura p WHERE p.factura_id=f.id),0),
+               IFNULL(f.propina,0), IFNULL(f.descuento_total,0), IFNULL(f.usuario,''), IFNULL(f.fecha,''),
+               IFNULL(f.observaciones,''), TRIM(IFNULL(c.documento,''))
         FROM facturas f LEFT JOIN clientes c ON c.id=f.cliente_id WHERE f.id_local=?
         """,
         (id_local,),
@@ -621,14 +792,34 @@ def _venta_previa(base: Database, id_local: str) -> dict | None:
     if not fila:
         conn.close()
         return None
-    cur.execute("SELECT descripcion, cantidad, total_linea FROM factura_detalle WHERE factura_id=?", (fila[0],))
-    lineas = [{"nombre": d, "cantidad": c, "total": t} for d, c, t in cur.fetchall()]
+    cur.execute(
+        "SELECT descripcion, cantidad, precio_unitario, total_linea FROM factura_detalle WHERE factura_id=?",
+        (fila[0],),
+    )
+    lineas = [{"nombre": d, "cantidad": c, "precio": p, "total": t} for d, c, p, t in cur.fetchall()]
+    cur.execute(
+        "SELECT tipo_pago, monto, IFNULL(referencia,'') FROM pagos_factura WHERE factura_id=? AND IFNULL(es_abono,0)=0",
+        (fila[0],),
+    )
+    nombres_pago = {codigo: nombre for codigo, nombre, *_resto in base.listar_metodos_pago(False)}
+    nombres_pago.setdefault("saldo_favor", "Saldo a favor")
+    pagos = [
+        {"codigo": codigo, "nombre": nombres_pago.get(codigo, codigo), "monto": round(float(monto or 0), 2), "referencia": ref}
+        for codigo, monto, ref in cur.fetchall()
+    ]
     conn.close()
+    propina = round(float(fila[9] or 0), 2)
+    a_cobrar = round(float(fila[5] or 0) + propina, 2)
+    pagado = float(fila[8] or 0)
     return {
         "ok": True, "duplicada": True, "id": fila[0], "numero": fila[1], "ncf": fila[2],
-        "ecf": _ecf_de_factura(fila[0]), "subtotal": fila[3], "itbis": fila[4], "total": fila[5],
-        "cliente": fila[6], "cambio": 0, "pendiente": round(max(0.0, float(fila[5] or 0) - float(fila[8] or 0)), 2),
-        "vencimiento": fila[7], "lineas": lineas,
+        "ecf": _ecf_de_factura(fila[0]), "subtotal": fila[3], "itbis": fila[4],
+        "total": a_cobrar, "a_cobrar": a_cobrar, "propina": propina,
+        "descuento": round(float(fila[10] or 0), 2),
+        "cliente": fila[6], "documento": fila[14] or "", "cambio": 0,
+        "pendiente": round(max(0.0, a_cobrar - pagado), 2),
+        "vencimiento": fila[7], "usuario": fila[11], "fecha": fila[12], "observaciones": fila[13],
+        "pagos": pagos, "lineas": lineas,
     }
 
 
@@ -651,6 +842,47 @@ def _terminal_para_vender(base: Database, terminal_id: int | None, usuario: str)
     return {"id": fila[0], "nombre": fila[1], "prefijo": fila[2], "bodega": fila[3] or None, "vendedor_id": fila[4]}
 
 
+def _extras_producto(cur, producto_id: int, ids: list[int]) -> tuple[float, str, list[dict]]:
+    limpios = []
+    for valor in ids or []:
+        try:
+            numero = int(valor)
+        except (TypeError, ValueError):
+            continue
+        if numero > 0 and numero not in limpios:
+            limpios.append(numero)
+    if not limpios:
+        return 0.0, "", []
+    marcas = ",".join("?" for _ in limpios)
+    cur.execute(
+        f"SELECT id, nombre, precio FROM modificadores WHERE producto_id=? AND activo=1 AND id IN ({marcas})",
+        [producto_id, *limpios],
+    )
+    filas = [{"id": i, "nombre": n, "precio": round(float(p or 0), 2)} for i, n, p in cur.fetchall()]
+    precio, texto = precio_con_extras(0, filas)
+    return precio, texto, filas
+
+
+def _guardar_asiento(cur, concepto: str, origen: str, origen_id: int, lineas: list[tuple[str, float, float]], usuario: str) -> None:
+    cur.execute("SELECT id FROM asientos WHERE origen=? AND origen_id=?", (origen, int(origen_id)))
+    if cur.fetchone():
+        return
+    cur.execute(
+        "INSERT INTO asientos (fecha, concepto, origen, origen_id, usuario) VALUES (?,?,?,?,?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), concepto[:180], origen, int(origen_id), usuario),
+    )
+    asiento_id = int(cur.lastrowid)
+    for codigo, debito, credito in lineas:
+        cur.execute("SELECT id FROM cuentas WHERE codigo=?", (codigo,))
+        cuenta = cur.fetchone()
+        if not cuenta:
+            raise HTTPException(status_code=500, detail=f"Falta la cuenta {codigo}")
+        cur.execute(
+            "INSERT INTO asiento_lineas (asiento_id, cuenta_id, debito, credito) VALUES (?,?,?,?)",
+            (asiento_id, cuenta[0], debito, credito),
+        )
+
+
 @app.post("/api/vender")
 def vender(request: Request, body: VentaIn):
     usuario = _exigir(request, "mostrador")
@@ -671,6 +903,7 @@ def vender(request: Request, body: VentaIn):
     subtotal = 0.0
     impuesto = 0.0
     cliente_nombre = "Consumidor final"
+    cliente_documento = ""
     descuentos = _descuentos_mayor(base)
     incluido = _itbis_incluido(base)
     conn = base.get_connection()
@@ -693,7 +926,11 @@ def vender(request: Request, body: VentaIn):
                 bruto = round(precio * item.cantidad, 2)
                 desc = 0.0
                 neto, itbis = _partir_itbis(bruto, True, incluido)
-                lineas.append((None, combo[0], item.cantidad, precio, neto, itbis, desc, comps))
+                etiqueta = combo[0]
+                nota = limpiar_nota(item.nota)
+                if nota:
+                    etiqueta = f"{etiqueta} · {nota}"
+                lineas.append((None, etiqueta, item.cantidad, precio, neto, itbis, desc, comps))
                 subtotal += neto
                 impuesto += itbis
                 continue
@@ -702,15 +939,30 @@ def vender(request: Request, body: VentaIn):
             if not row:
                 raise HTTPException(status_code=400, detail=f"Producto {item.id} no existe")
             precio = _precio(row, item.nivel, descuentos)
+            extra, extra_txt, _filas = _extras_producto(cur, row[0], item.extras)
+            precio = round(precio + extra, 2)
             bruto = round(precio * item.cantidad, 2)
             desc = _descuento_promo(cur, row[0], item.cantidad, precio, bruto)
             neto, itbis = _partir_itbis(bruto - desc, bool(int(row[8] or 1)), incluido)
             if int(row[9] or 1) == 0 and item.cantidad > float(row[5] or 0):
                 raise HTTPException(status_code=400, detail=f"Sin stock de {row[1]}")
-            lineas.append((row, row[1], item.cantidad, precio, neto, itbis, desc, None))
+            etiqueta = row[1]
+            nota = limpiar_nota(item.nota)
+            detalle = " · ".join(parte for parte in (extra_txt, nota) if parte)
+            if detalle:
+                etiqueta = f"{etiqueta} · {detalle}"
+            lineas.append((row, etiqueta, item.cantidad, precio, neto, itbis, desc, None))
             subtotal += neto
             impuesto += itbis
         descuento = round(max(0.0, float(body.descuento or 0)), 2)
+        puntos_usados = 0
+        if int(body.usar_puntos or 0) > 0:
+            if not body.cliente_id:
+                raise HTTPException(status_code=400, detail="Para usar puntos elige el cliente")
+            cur.execute("SELECT IFNULL(puntos,0) FROM clientes WHERE id=?", (body.cliente_id,))
+            saldo_puntos = int((cur.fetchone() or [0])[0] or 0)
+            puntos_usados, rebaja = rebaja_puntos(saldo_puntos, int(body.usar_puntos))
+            descuento = round(descuento + rebaja, 2)
         if incluido:
             bruto_total = round(subtotal + impuesto, 2)
             descuento = min(descuento, bruto_total)
@@ -726,6 +978,8 @@ def vender(request: Request, body: VentaIn):
                 impuesto = round(impuesto * factor, 2)
                 subtotal = round(subtotal - descuento, 2)
         total = round(subtotal + impuesto, 2)
+        propina = propina_legal(subtotal, body.propina)
+        a_cobrar = round(total + propina, 2)
         afectan = base.codigos_afectan_caja()
         activos = {codigo for codigo, *_rest in base.listar_metodos_pago(True)}
         if body.pagos:
@@ -752,7 +1006,7 @@ def vender(request: Request, body: VentaIn):
         cliente_row = None
         if body.cliente_id:
             cur.execute(
-                "SELECT nombre, IFNULL(activo,1), IFNULL(limite_credito,0), IFNULL(dias_credito,30) FROM clientes WHERE id=?",
+                "SELECT nombre, IFNULL(activo,1), IFNULL(limite_credito,0), IFNULL(dias_credito,30), TRIM(IFNULL(documento,'')) FROM clientes WHERE id=?",
                 (body.cliente_id,),
             )
             cliente_row = cur.fetchone()
@@ -769,12 +1023,12 @@ def vender(request: Request, body: VentaIn):
                 raise HTTPException(status_code=400, detail=f"El cliente solo tiene {disponible:.2f} de saldo a favor")
         fuera = round(sum(monto for codigo, monto in entradas if codigo not in afectan), 2)
         entregado_caja = round(sum(monto for codigo, monto in entradas if codigo in afectan), 2)
-        if fuera > total + 0.02:
+        if fuera > a_cobrar + 0.02:
             raise HTTPException(status_code=400, detail="Los pagos que no entran a caja no pueden superar el total")
-        por_cubrir_caja = round(max(0.0, total - fuera), 2)
+        por_cubrir_caja = round(max(0.0, a_cobrar - fuera), 2)
         ef_guardar = round(min(entregado_caja, por_cubrir_caja), 2)
         cambio = round(max(0.0, entregado_caja - por_cubrir_caja), 2)
-        pendiente = round(max(0.0, total - fuera - ef_guardar), 2)
+        pendiente = round(max(0.0, a_cobrar - fuera - ef_guardar), 2)
         vencimiento = None
         if pendiente > 0.009:
             if not body.a_credito:
@@ -792,6 +1046,7 @@ def vender(request: Request, body: VentaIn):
                 )
             vencimiento = (datetime.now() + timedelta(days=int(cliente_row[3] or 30))).strftime("%Y-%m-%d")
         vendedor_id = None
+        vendedor_nombre = ""
         pedido_vendedor = body.vendedor_id or (terminal["vendedor_id"] if terminal else None)
         if pedido_vendedor:
             cur.execute("SELECT id FROM vendedores WHERE id=? AND IFNULL(activo,1)=1", (pedido_vendedor,))
@@ -799,6 +1054,10 @@ def vender(request: Request, body: VentaIn):
                 vendedor_id = int(pedido_vendedor)
             elif body.vendedor_id:
                 raise HTTPException(status_code=400, detail="El vendedor no existe o está inactivo")
+        if vendedor_id:
+            cur.execute("SELECT IFNULL(nombre,'') FROM vendedores WHERE id=?", (vendedor_id,))
+            hallado_v = cur.fetchone()
+            vendedor_nombre = hallado_v[0] if hallado_v else ""
 
         tipo = body.comprobante if body.comprobante in (
             "consumidor_final", "credito_fiscal", "gubernamental", "especial"
@@ -815,6 +1074,7 @@ def vender(request: Request, body: VentaIn):
                 raise HTTPException(status_code=400, detail="El cliente necesita RNC o cédula para el crédito fiscal")
         if cliente_row:
             cliente_nombre = cliente_row[0]
+            cliente_documento = cliente_row[4] or ""
         encf = None
         tipo_electronico = None
         if (base.get_config("ecf_activo", "0") or "0") == "1":
@@ -850,18 +1110,25 @@ def vender(request: Request, body: VentaIn):
         observaciones = (body.observaciones or "").strip()
         if body.fecha_local.strip():
             observaciones = f"Vendida sin conexión el {body.fecha_local.strip()[:19]}" + (f". {observaciones}" if observaciones else "")
+        try:
+            monto_tarjeta = round(sum(monto for codigo, monto in entradas if codigo == "tarjeta"), 2)
+            auth = autorizacion_ok(monto_tarjeta, body.autorizacion)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if auth:
+            observaciones = (observaciones + f" Tarjeta {auth}").strip()
         cur.execute(
             """
             INSERT INTO facturas
                 (numero, tipo_comprobante, cliente_id, subtotal, descuento_total,
                  impuesto_total, total, estado, usuario, caja, condicion_pago_id,
                  fecha_vencimiento, moneda, tasa_cambio, cierre_id, ncf, lista_precio,
-                 vendedor_id, observaciones, encf, precio_incluye_itbis, id_local, terminal_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'emitida', ?, NULL, NULL, ?, 'DOP', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 vendedor_id, observaciones, encf, precio_incluye_itbis, id_local, terminal_id, propina)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'emitida', ?, NULL, NULL, ?, 'DOP', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (numero, tipo, body.cliente_id, round(subtotal, 2), descuento, round(impuesto, 2), total, usuario,
              vencimiento, caja[0], ncf, body.lista, vendedor_id, observaciones[:500] or None,
-             encf, 1 if incluido else 0, id_local, terminal["id"] if terminal else None),
+             encf, 1 if incluido else 0, id_local, terminal["id"] if terminal else None, propina),
         )
         factura_id = cur.lastrowid
         for row, descripcion, cant, precio, neto, itbis, desc, comps in lineas:
@@ -896,20 +1163,54 @@ def vender(request: Request, body: VentaIn):
             codigo_caja = next((codigo for codigo, _monto in entradas if codigo in afectan), "efectivo")
             guardados.append((codigo_caja, ef_guardar))
         ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("SELECT codigo, nombre FROM metodos_pago")
+        nombres_pago = {codigo: nombre for codigo, nombre in cur.fetchall()}
+        nombres_pago.setdefault("saldo_favor", "Saldo a favor")
+        pagos_ticket = []
         for tipo_pago, monto in guardados:
             if monto > 0:
+                ref = auth if tipo_pago == "tarjeta" else ""
                 cur.execute(
                     """
-                    INSERT INTO pagos_factura (factura_id, tipo_pago, monto, cierre_id, fecha, usuario, es_abono)
-                    VALUES (?,?,?,?,?,?,0)
+                    INSERT INTO pagos_factura (factura_id, tipo_pago, monto, referencia, cierre_id, fecha, usuario, es_abono)
+                    VALUES (?,?,?,?,?,?,?,0)
                     """,
-                    (factura_id, tipo_pago, round(monto, 2), caja[0], ahora, usuario),
+                    (factura_id, tipo_pago, round(monto, 2), ref or None, caja[0], ahora, usuario),
                 )
+                pagos_ticket.append({
+                    "codigo": tipo_pago,
+                    "nombre": nombres_pago.get(tipo_pago, tipo_pago),
+                    "monto": round(monto, 2),
+                    "referencia": ref,
+                })
         if usar_saldo > 0:
             cur.execute(
                 "INSERT INTO saldos_cliente (cliente_id, monto, concepto, factura_id, usuario) VALUES (?,?,?,?,?)",
                 (body.cliente_id, -usar_saldo, f"Usado en {numero}", factura_id, usuario),
             )
+        if body.cliente_id:
+            ganados = puntos_ganados(total)
+            cur.execute(
+                "UPDATE clientes SET puntos = MAX(0, IFNULL(puntos,0) - ? + ?) WHERE id=?",
+                (puntos_usados, ganados, body.cliente_id),
+            )
+        banco = round(sum(monto for codigo, monto in entradas if codigo not in afectan and codigo != "saldo_favor"), 2)
+        _guardar_asiento(
+            cur,
+            f"Venta {numero}",
+            "factura",
+            factura_id,
+            asiento_venta(
+                caja=ef_guardar,
+                banco=banco,
+                saldo=usar_saldo,
+                fiado=pendiente,
+                ventas=subtotal,
+                itbis=impuesto,
+                propina=propina,
+            ),
+            usuario,
+        )
         conn.commit()
     except HTTPException:
         conn.rollback()
@@ -944,15 +1245,26 @@ def vender(request: Request, body: VentaIn):
         "ncf": ncf,
         "ecf": electronico,
         "subtotal": round(subtotal, 2),
+        "descuento": descuento,
         "itbis": round(impuesto, 2),
         "cliente": cliente_nombre,
-        "total": total,
+        "documento": cliente_documento,
+        "total": a_cobrar,
+        "a_cobrar": a_cobrar,
+        "propina": propina,
         "cambio": cambio,
         "pendiente": pendiente,
         "vencimiento": vencimiento,
+        "fecha": ahora,
+        "usuario": usuario,
+        "vendedor": vendedor_nombre,
+        "comprobante": tipo,
+        "observaciones": observaciones,
+        "puntos": puntos_usados,
+        "pagos": pagos_ticket,
         "lineas": [
-            {"nombre": d, "cantidad": c, "total": round(n + i, 2)}
-            for _row, d, c, _p, n, i, _desc, _comps in lineas
+            {"nombre": d, "cantidad": c, "precio": round(p, 2), "itbis": round(i, 2), "total": round(n + i, 2)}
+            for _row, d, c, p, n, i, _desc, _comps in lineas
         ],
     }
 
@@ -1426,12 +1738,13 @@ def pdf_cuadre(request: Request, cierre_id: int, descarga: int = 0):
 
 class TurnoEditIn(BaseModel):
     nombre: str
-    fondo: float
+    fondo: float | None = None
 
 
 @app.post("/api/caja/turno/{cierre_id}")
 def editar_turno(request: Request, cierre_id: int, body: TurnoEditIn):
     _exigir(request, "caja")
+    fondo = _fondo_caja(body.fondo)
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1440,7 +1753,7 @@ def editar_turno(request: Request, cierre_id: int, body: TurnoEditIn):
         SET nombre_caja=?, monto_inicial=?
         WHERE id=? AND fecha_cierre IS NULL
         """,
-        (body.nombre.strip() or "Caja 1", float(body.fondo or 0), cierre_id),
+        (body.nombre.strip() or "Caja 1", fondo, cierre_id),
     )
     if cur.rowcount == 0:
         conn.close()
@@ -1611,6 +1924,14 @@ def compras(request: Request, body: CompraIn):
                 referencia=f"COMPRA-{compra_id}",
                 descripcion_mov=f"Compra {compra_id}", conn=conn,
             )
+        _guardar_asiento(
+            cur,
+            f"Compra {compra_id}",
+            "compra",
+            compra_id,
+            asiento_simple("5.1", "2.4", total),
+            usuario,
+        )
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -1673,6 +1994,18 @@ def promociones(request: Request):
     }
 
 
+@app.get("/api/promociones/vitrina")
+def vitrina_promociones(request: Request):
+    _exigir_alguno(request, ("mostrador", "promociones"))
+    return {
+        "items": [
+            {"nombre": n, "tipo": t, "valor": v}
+            for _i, n, t, v, a, _pid in _promos_web()
+            if a
+        ]
+    }
+
+
 def _promos_web():
     conn = db().get_connection()
     cur = conn.cursor()
@@ -1728,6 +2061,168 @@ def editar_promo(request: Request, promo_id: int, body: PromoIn):
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+def _lineas_combo(cur, lineas: list[LineaComboIn]) -> list[tuple[int, float, str]]:
+    juntas: dict[int, float] = {}
+    for linea in lineas:
+        cantidad = float(linea.cantidad or 0)
+        if cantidad <= 0:
+            raise HTTPException(status_code=400, detail="Cada producto del combo necesita una cantidad")
+        juntas[int(linea.producto_id)] = juntas.get(int(linea.producto_id), 0) + cantidad
+    if not juntas:
+        raise HTTPException(status_code=400, detail="Agrega los productos del combo")
+    armadas = []
+    for producto_id, cantidad in juntas.items():
+        cur.execute("SELECT nombre FROM productos WHERE id=? AND IFNULL(activo,1)=1", (producto_id,))
+        fila = cur.fetchone()
+        if not fila:
+            raise HTTPException(status_code=400, detail="Uno de los productos del combo no existe")
+        armadas.append((producto_id, round(cantidad, 2), fila[0]))
+    return armadas
+
+
+def _texto_componentes(lineas: list[tuple[int, float, str]]) -> str:
+    return " + ".join(f"{nombre} ×{cantidad:g}" for _pid, cantidad, nombre in lineas)[:180]
+
+
+@app.get("/api/combos")
+def listar_combos_admin(request: Request):
+    _exigir(request, "inventario")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, nombre, IFNULL(precio_combo,0), IFNULL(descripcion,''), IFNULL(activo,1)
+        FROM combos
+        ORDER BY id DESC
+        """
+    )
+    combos = []
+    for combo_id, nombre, precio, descripcion, activo in cur.fetchall():
+        cur.execute(
+            """
+            SELECT d.producto_id, d.cantidad, p.nombre
+            FROM combos_detalle d
+            JOIN productos p ON p.id = d.producto_id
+            WHERE d.combo_id=?
+            ORDER BY d.id
+            """,
+            (combo_id,),
+        )
+        combos.append({
+            "id": combo_id,
+            "nombre": nombre,
+            "precio": float(precio or 0),
+            "descripcion": descripcion or "",
+            "activo": bool(activo),
+            "lineas": [
+                {"producto_id": pid, "cantidad": float(cant or 0), "nombre": prod}
+                for pid, cant, prod in cur.fetchall()
+            ],
+        })
+    cur.execute(
+        """
+        SELECT p.id, p.nombre, p.tipo_descuento, IFNULL(d.producto_id,0), IFNULL(pr.nombre,'')
+        FROM promociones p
+        LEFT JOIN promociones_detalle d ON d.promocion_id = p.id
+        LEFT JOIN productos pr ON pr.id = d.producto_id
+        WHERE IFNULL(p.activo,1)=1 AND p.tipo_descuento IN ('2x1', '3x2')
+        ORDER BY p.id DESC
+        """
+    )
+    especiales = [
+        {"id": i, "nombre": n, "tipo": t, "producto_id": pid, "producto": prod}
+        for i, n, t, pid, prod in cur.fetchall()
+    ]
+    conn.close()
+    return {"combos": combos, "especiales": especiales}
+
+
+@app.post("/api/combos")
+def crear_combo(request: Request, body: ComboIn):
+    usuario = _exigir(request, "inventario")
+    return _guardar_combo_http(body, usuario, None)
+
+
+@app.post("/api/combos/{combo_id}")
+def editar_combo(request: Request, combo_id: int, body: ComboIn):
+    usuario = _exigir(request, "inventario")
+    return _guardar_combo_http(body, usuario, combo_id)
+
+
+def _guardar_combo_http(body: ComboIn, usuario: str, combo_id: int | None):
+    nombre = " ".join((body.nombre or "").split())[:80]
+    if len(nombre) < 2:
+        raise HTTPException(status_code=400, detail="Ponle nombre al combo")
+    precio = round(float(body.precio or 0), 2)
+    if precio <= 0:
+        raise HTTPException(status_code=400, detail="El combo necesita un precio")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    try:
+        lineas = _lineas_combo(cur, body.lineas)
+        if len(lineas) < 2 and not (len(lineas) == 1 and lineas[0][1] >= 2):
+            raise HTTPException(status_code=400, detail="Un combo junta productos. Agrega al menos dos, por ejemplo el ron y la gaseosa.")
+        texto = _texto_componentes(lineas)
+        if combo_id:
+            cur.execute("SELECT id FROM combos WHERE id=?", (combo_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Combo no encontrado")
+            cur.execute(
+                "UPDATE combos SET nombre=?, descripcion=?, precio_combo=?, activo=1 WHERE id=?",
+                (nombre, texto, precio, combo_id),
+            )
+            cur.execute("DELETE FROM combos_detalle WHERE combo_id=?", (combo_id,))
+        else:
+            cur.execute(
+                "INSERT INTO combos (nombre, descripcion, precio_combo, activo) VALUES (?,?,?,1)",
+                (nombre, texto, precio),
+            )
+            combo_id = int(cur.lastrowid)
+        for producto_id, cantidad, _prod in lineas:
+            cur.execute(
+                "INSERT INTO combos_detalle (combo_id, producto_id, cantidad) VALUES (?,?,?)",
+                (combo_id, producto_id, cantidad),
+            )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    return {"ok": True, "id": combo_id, "usuario": usuario}
+
+
+@app.post("/api/combos/{combo_id}/quitar")
+def quitar_combo(request: Request, combo_id: int):
+    _exigir(request, "inventario")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE combos SET activo=0 WHERE id=?", (combo_id,))
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Combo no encontrado")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/especiales")
+def crear_especial(request: Request, body: EspecialIn):
+    _exigir(request, "inventario")
+    if body.tipo not in ("2x1", "3x2"):
+        raise HTTPException(status_code=400, detail="El especial es 2x1 o 3x2")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT nombre FROM productos WHERE id=? AND IFNULL(activo,1)=1", (body.producto_id,))
+    fila = cur.fetchone()
+    conn.close()
+    if not fila:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    nombre = " ".join((body.nombre or "").split())[:80] or f"{body.tipo} {fila[0]}"
+    nuevo = db().guardar_promocion(nombre, body.tipo, 0, producto_id=body.producto_id)
+    return {"ok": True, "id": nuevo}
 
 
 @app.get("/api/devolucion")
@@ -1862,7 +2357,7 @@ def saldo_cliente(request: Request, cliente_id: int):
     )
     movimientos = [{"fecha": f, "monto": m, "concepto": c, "usuario": u} for f, m, c, u in cur.fetchall()]
     cur.execute(
-        "SELECT IFNULL(limite_credito,0), IFNULL(dias_credito,30), IFNULL(lista_precio,1), nombre FROM clientes WHERE id=?",
+        "SELECT IFNULL(limite_credito,0), IFNULL(dias_credito,30), IFNULL(lista_precio,1), nombre, IFNULL(puntos,0) FROM clientes WHERE id=?",
         (cliente_id,),
     )
     fila = cur.fetchone()
@@ -1875,6 +2370,7 @@ def saldo_cliente(request: Request, cliente_id: int):
         "saldo_favor": base.saldo_favor_cliente(cliente_id), "deuda": deuda, "limite_credito": limite,
         "credito_disponible": round(max(0.0, limite - deuda), 2), "dias_credito": int(fila[1] or 30),
         "lista_precio": int(fila[2] or 1), "nombre": fila[3], "movimientos": movimientos,
+        "puntos": int(fila[4] or 0),
     }
 
 
@@ -2017,7 +2513,9 @@ def ver_factura(request: Request, factura_id: int):
         SELECT f.id, f.numero, f.fecha, f.total, f.estado, f.ncf, f.usuario,
                COALESCE(c.nombre, 'Consumidor final'), f.subtotal, f.impuesto_total,
                f.cliente_id, f.cierre_id, IFNULL(v.nombre,''), IFNULL(f.observaciones,''), f.fecha_vencimiento,
-               IFNULL((SELECT SUM(p.monto) FROM pagos_factura p WHERE p.factura_id = f.id), 0)
+               IFNULL((SELECT SUM(p.monto) FROM pagos_factura p WHERE p.factura_id = f.id), 0),
+               IFNULL(f.descuento_total,0), IFNULL(f.propina,0), TRIM(IFNULL(c.documento,'')),
+               IFNULL(f.tipo_comprobante,'')
         FROM facturas f
         LEFT JOIN clientes c ON c.id = f.cliente_id
         LEFT JOIN vendedores v ON v.id = f.vendedor_id
@@ -2054,7 +2552,19 @@ def ver_factura(request: Request, factura_id: int):
         {"nombre": n, "cantidad": c, "precio": p, "total": t, "producto_id": pid, "itbis": imp}
         for n, c, p, t, pid, imp in cur.fetchall()
     ]
+    cur.execute(
+        "SELECT tipo_pago, monto, IFNULL(referencia,'') FROM pagos_factura WHERE factura_id=? AND IFNULL(es_abono,0)=0",
+        (factura_id,),
+    )
+    nombres_pago = {codigo: nombre for codigo, nombre, *_resto in db().listar_metodos_pago(False)}
+    nombres_pago.setdefault("saldo_favor", "Saldo a favor")
+    pagos = [
+        {"codigo": codigo, "nombre": nombres_pago.get(codigo, codigo), "monto": round(float(monto or 0), 2), "referencia": ref}
+        for codigo, monto, ref in cur.fetchall()
+    ]
     conn.close()
+    propina = round(float(fac[17] or 0), 2)
+    a_cobrar = round(float(fac[3] or 0) + propina, 2)
     return {
         "id": fac[0], "numero": fac[1], "fecha": fac[2], "total": fac[3],
         "estado": fac[4], "ncf": fac[5], "usuario": fac[6], "cliente": fac[7],
@@ -2062,6 +2572,8 @@ def ver_factura(request: Request, factura_id: int):
         "vendedor": fac[12], "observaciones": fac[13] if fac[13] not in ("Cotización web",) else "", "vence": fac[14],
         "ecf": _ecf_de_factura(factura_id),
         "pagado": round(float(fac[15] or 0), 2), "pendiente": round(max(0.0, float(fac[3] or 0) - float(fac[15] or 0)), 2) if fac[4] == "emitida" else 0,
+        "descuento": round(float(fac[16] or 0), 2), "propina": propina, "a_cobrar": a_cobrar,
+        "documento": fac[18] or "", "comprobante": fac[19] or "", "pagos": pagos,
         "cierre_id": cierre_id, "lineas": lineas,
     }
 
@@ -2550,6 +3062,7 @@ class EmpresaIn(BaseModel):
     nombre: str
     direccion: str = ""
     rnc: str = ""
+    telefono: str = ""
     smtp_host: str = ""
     smtp_port: str = "587"
     smtp_user: str = ""
@@ -2588,6 +3101,14 @@ def inventario(request: Request, q: str = ""):
         }
         for i, n, p, origen, p2, p3, p4, s, cb, b, cat, mn, a in cur.fetchall()
     ]
+    cur.execute("SELECT producto_id, id, nombre, precio FROM modificadores WHERE activo=1 ORDER BY nombre")
+    extras_por_producto: dict[int, list[dict]] = {}
+    for producto_id, extra_id, extra_nombre, extra_precio in cur.fetchall():
+        extras_por_producto.setdefault(producto_id, []).append(
+            {"id": extra_id, "nombre": extra_nombre, "precio": float(extra_precio or 0)}
+        )
+    for fila in rows:
+        fila["extras"] = extras_por_producto.get(fila["id"], [])
     conn.close()
     d2, d3, d4 = _descuentos_mayor(db())
     return {"items": rows, "descuentos": {"p2": d2, "p3": d3, "p4": d4}}
@@ -2986,9 +3507,12 @@ def indicadores(request: Request, rango: str = "semana"):
 def _guardar_permisos(username: str, modulos: list[str], role: str):
     if role == "admin":
         return
-    limpios = [m for m in modulos if m in MODULOS and m not in ("seguimiento", "metodos")]
-    if "mostrador" not in limpios:
-        limpios.insert(0, "mostrador")
+    if role == "mesero":
+        limpios = ["pedidos"]
+    else:
+        limpios = [m for m in modulos if m in MODULOS and m not in ("seguimiento", "metodos", "pedidos")]
+        if "mostrador" not in limpios:
+            limpios.insert(0, "mostrador")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM usuario_permisos WHERE username=?", (username,))
@@ -3007,14 +3531,14 @@ def usuarios(request: Request):
     items = []
     for i, u, r in db().get_users():
         items.append({"id": i, "username": u, "role": r, "modulos": _permisos(u)})
-    return {"items": items, "modulos": [m for m in MODULOS if m not in ("seguimiento", "metodos")]}
+    return {"items": items, "modulos": [m for m in MODULOS if m not in ("seguimiento", "metodos", "pedidos")]}
 
 
 @app.post("/api/usuarios")
 def crear_usuario(request: Request, body: UsuarioIn):
     _exigir(request, "usuarios")
-    if body.role not in ("admin", "user", "empleado"):
-        raise HTTPException(status_code=400, detail="El rol debe ser admin, user o empleado")
+    if body.role not in ("admin", "user", "empleado", "mesero"):
+        raise HTTPException(status_code=400, detail="El rol debe ser admin, user, empleado o mesero")
     if len((body.password or "").strip()) < 1:
         raise HTTPException(status_code=400, detail="Indica una contraseña")
     try:
@@ -3028,8 +3552,8 @@ def crear_usuario(request: Request, body: UsuarioIn):
 @app.post("/api/usuarios/editar")
 def editar_usuario(request: Request, body: UsuarioIn):
     _exigir(request, "usuarios")
-    if body.role not in ("admin", "user", "empleado"):
-        raise HTTPException(status_code=400, detail="El rol debe ser admin, user o empleado")
+    if body.role not in ("admin", "user", "empleado", "mesero"):
+        raise HTTPException(status_code=400, detail="El rol debe ser admin, user, empleado o mesero")
     usuario = body.username.strip()
     conn = db().get_connection()
     cur = conn.cursor()
@@ -3181,6 +3705,7 @@ def guardar_empresa(request: Request, body: EmpresaIn):
     base = db()
     base.set_empresa_info(body.nombre.strip(), body.direccion.strip())
     base.set_config("empresa_rnc", body.rnc.strip())
+    base.set_config("empresa_telefono", body.telefono.strip())
     try:
         puerto = int((body.smtp_port or "587").strip())
     except ValueError:
@@ -3568,6 +4093,662 @@ def editar_vendedor(request: Request, vendedor_id: int, body: VendedorIn):
     return {"ok": True}
 
 
+class ConduceIn(BaseModel):
+    mesa: str
+    items: list[ItemIn]
+    id: int | None = None
+
+
+class PartirIn(BaseModel):
+    quedan: list[ItemIn]
+
+
+class CocinaIn(BaseModel):
+    lista: bool = True
+
+
+class ConduceFacturadoIn(BaseModel):
+    factura_id: int
+
+
+class MesaIn(BaseModel):
+    mesa: str
+
+
+def _normalizar_codigo_conduce(codigo: str) -> str:
+    limpio = "".join(ch for ch in (codigo or "").upper() if ch.isalnum())
+    if limpio.startswith("C") and limpio[1:].isdigit():
+        return "C" + str(int(limpio[1:])).zfill(4)
+    return limpio
+
+
+def _mesa_conduce(mesa: str) -> str:
+    texto = (mesa or "").strip()
+    if not texto:
+        raise HTTPException(status_code=400, detail="Indica la mesa")
+    if texto.isdigit():
+        return f"Mesa {int(texto)}"
+    return texto[:40]
+
+
+def _lineas_conduce(base: Database, items: list[ItemIn]) -> tuple[list[dict], float, float, float]:
+    if not items:
+        raise HTTPException(status_code=400, detail="El pedido está vacío")
+    descuentos = _descuentos_mayor(base)
+    incluido = _itbis_incluido(base)
+    conn = base.get_connection()
+    cur = conn.cursor()
+    lineas = []
+    subtotal = 0.0
+    impuesto = 0.0
+    try:
+        for item in items:
+            if item.cantidad <= 0:
+                raise HTTPException(status_code=400, detail="Cantidad inválida")
+            if item.combo:
+                cur.execute(
+                    "SELECT nombre, IFNULL(precio_combo,0) FROM combos WHERE id=? AND IFNULL(activo,1)=1",
+                    (item.id,),
+                )
+                combo = cur.fetchone()
+                if not combo:
+                    raise HTTPException(status_code=400, detail="Combo no disponible")
+                precio = float(combo[1] or 0)
+                bruto = round(precio * item.cantidad, 2)
+                neto, itbis = _partir_itbis(bruto, True, incluido)
+                nombre = combo[0]
+                combo_flag = True
+                aplica = True
+                pid = item.id
+                extra = 0.0
+                nota = ""
+                filas_extra = []
+            else:
+                cur.execute(SQL_PRODUCTOS + " WHERE id=?", (item.id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=400, detail=f"Producto {item.id} no existe")
+                precio = _precio(row, 1, descuentos)
+                extra, extra_txt, filas_extra = _extras_producto(cur, row[0], item.extras)
+                precio = round(precio + extra, 2)
+                bruto = round(precio * item.cantidad, 2)
+                desc = _descuento_promo(cur, row[0], item.cantidad, precio, bruto)
+                aplica = bool(int(row[8] or 1))
+                neto, itbis = _partir_itbis(bruto - desc, aplica, incluido)
+                nombre = row[1]
+                nota = limpiar_nota(item.nota)
+                detalle = " · ".join(parte for parte in (extra_txt, nota) if parte)
+                if detalle:
+                    nombre = f"{nombre} · {detalle}"
+                combo_flag = False
+                pid = row[0]
+            lineas.append(
+                {
+                    "id": pid,
+                    "nombre": nombre,
+                    "cantidad": item.cantidad,
+                    "precio": round(precio, 2),
+                    "precio_base": round(precio - (extra if not combo_flag else 0), 2),
+                    "total": round(neto + itbis, 2),
+                    "combo": combo_flag,
+                    "itbis": aplica,
+                    "nota": nota if not combo_flag else "",
+                    "extras": filas_extra if not combo_flag else [],
+                }
+            )
+            subtotal += neto
+            impuesto += itbis
+    finally:
+        conn.close()
+    return lineas, round(subtotal, 2), round(impuesto, 2), round(subtotal + impuesto, 2)
+
+
+def _fila_conduce(row, numero_factura: str | None = None) -> dict:
+    items = json.loads(row[4] or "[]")
+    return {
+        "id": row[0],
+        "codigo": row[1],
+        "mesa": row[2],
+        "usuario": row[3] or "",
+        "lineas": items,
+        "subtotal": float(row[5] or 0),
+        "itbis": float(row[6] or 0),
+        "total": float(row[7] or 0),
+        "estado": row[8],
+        "factura_id": row[9],
+        "factura": numero_factura,
+        "fecha": row[10],
+    }
+
+
+def _mesa_libre_de(cur, mesa: str, usuario: str, conduce_id: int | None = None):
+    """Impide que dos meseros tomen la misma mesa."""
+    cur.execute(
+        """
+        SELECT id, codigo, IFNULL(usuario,'')
+        FROM conduces
+        WHERE estado = 'pendiente' AND mesa = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (mesa,),
+    )
+    pedido = cur.fetchone()
+    if pedido and pedido[2] != usuario:
+        raise HTTPException(status_code=409, detail=f"{mesa} la está atendiendo {pedido[2]}")
+    if pedido and conduce_id and pedido[0] != conduce_id:
+        raise HTTPException(status_code=409, detail=f"{mesa} ya tiene el pedido {pedido[1]}")
+    cur.execute("SELECT usuario, IFNULL(conduce_id,0), desde FROM mesa_ocupada WHERE mesa=?", (mesa,))
+    lock = cur.fetchone()
+    if lock and lock[0] != usuario and not (pedido and pedido[2] == usuario):
+        try:
+            desde = datetime.strptime(lock[2], "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            desde = datetime.now()
+        if pedido or datetime.now() - desde < timedelta(hours=3):
+            raise HTTPException(status_code=409, detail=f"{mesa} la está atendiendo {lock[0]}")
+    return pedido
+
+
+def _marcar_mesa(cur, mesa: str, usuario: str, conduce_id: int | None):
+    cur.execute(
+        """
+        INSERT INTO mesa_ocupada (mesa, usuario, conduce_id, desde)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(mesa) DO UPDATE SET
+            usuario=excluded.usuario,
+            conduce_id=excluded.conduce_id,
+            desde=excluded.desde
+        """,
+        (mesa, usuario, conduce_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def conduces_en_cola(items: list[dict]) -> list[dict]:
+    """Pedidos ya guardados, el más antiguo primero. Una mesa tomada sin código no se cobra."""
+    guardados = [x for x in items if str(x.get("codigo") or "").strip()]
+    return sorted(guardados, key=lambda x: (str(x.get("fecha") or ""), int(x.get("id") or 0)))
+
+
+@app.get("/api/conduces")
+def listar_conduces(request: Request, cola: int = 0):
+    usuario = _exigir_alguno(request, ("pedidos", "mostrador"))
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, codigo, mesa, IFNULL(usuario,''), total, fecha
+        FROM conduces
+        WHERE estado = 'pendiente'
+        ORDER BY datetime(fecha) DESC, id DESC
+        LIMIT 80
+        """
+    )
+    items = [
+        {
+            "id": i, "codigo": c, "mesa": m, "usuario": u, "total": float(t or 0),
+            "fecha": f, "mia": u == usuario, "ocupada": u != usuario,
+        }
+        for i, c, m, u, t, f in cur.fetchall()
+    ]
+    tomadas = {x["mesa"] for x in items}
+    cur.execute("SELECT mesa, usuario, desde FROM mesa_ocupada")
+    for mesa, dueno, desde in cur.fetchall():
+        if mesa in tomadas:
+            continue
+        items.append({
+            "id": None, "codigo": "", "mesa": mesa, "usuario": dueno, "total": 0,
+            "fecha": desde, "mia": dueno == usuario, "ocupada": dueno != usuario,
+        })
+    conn.close()
+    if cola:
+        items = conduces_en_cola(items)
+    return {"items": items}
+
+
+@app.get("/api/conduces/codigo/{codigo}")
+def ver_conduce(request: Request, codigo: str):
+    usuario = _exigir_alguno(request, ("pedidos", "mostrador"))
+    clave = _normalizar_codigo_conduce(codigo)
+    if not clave:
+        raise HTTPException(status_code=400, detail="Escribe el código del conduce")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.id, c.codigo, c.mesa, IFNULL(c.usuario,''), c.items_json,
+               c.subtotal, c.itbis, c.total, c.estado, c.factura_id, c.fecha,
+               IFNULL(f.numero,'')
+        FROM conduces c
+        LEFT JOIN facturas f ON f.id = c.factura_id
+        WHERE c.codigo = ?
+        """,
+        (clave,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No hay un conduce con el código {clave}")
+    if "mostrador" not in _permisos(usuario) and (row[3] or "") != usuario:
+        raise HTTPException(status_code=409, detail=f"Esa mesa la está atendiendo {row[3]}")
+    datos = _fila_conduce(row[:11], row[11] or None)
+    return datos
+
+
+@app.post("/api/mesas/tomar")
+def tomar_mesa(request: Request, body: MesaIn):
+    usuario = _exigir(request, "pedidos")
+    mesa = _mesa_conduce(body.mesa)
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    try:
+        pedido = _mesa_libre_de(cur, mesa, usuario)
+        conduce_id = pedido[0] if pedido else None
+        _marcar_mesa(cur, mesa, usuario, conduce_id)
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        conn.close()
+        raise
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    datos = None
+    if pedido:
+        cur.execute(
+            """
+            SELECT c.id, c.codigo, c.mesa, IFNULL(c.usuario,''), c.items_json,
+                   c.subtotal, c.itbis, c.total, c.estado, c.factura_id, c.fecha,
+                   IFNULL(f.numero,'')
+            FROM conduces c
+            LEFT JOIN facturas f ON f.id = c.factura_id
+            WHERE c.id = ?
+            """,
+            (pedido[0],),
+        )
+        fila = cur.fetchone()
+        if fila:
+            datos = _fila_conduce(fila[:11], fila[11] or None)
+    conn.close()
+    return {"ok": True, "mesa": mesa, "conduce": datos}
+
+
+@app.post("/api/mesas/soltar")
+def soltar_mesa(request: Request, body: MesaIn):
+    usuario = _exigir(request, "pedidos")
+    mesa = _mesa_conduce(body.mesa)
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM conduces WHERE estado='pendiente' AND mesa=? AND IFNULL(usuario,'')=?",
+        (mesa, usuario),
+    )
+    if cur.fetchone():
+        conn.close()
+        return {"ok": True, "sigue": True}
+    cur.execute(
+        "DELETE FROM mesa_ocupada WHERE mesa=? AND usuario=? AND IFNULL(conduce_id,0)=0",
+        (mesa, usuario),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "sigue": False}
+
+
+@app.post("/api/conduces")
+def guardar_conduce(request: Request, body: ConduceIn):
+    usuario = _exigir(request, "pedidos")
+    mesa = _mesa_conduce(body.mesa)
+    base = db()
+    lineas, subtotal, itbis, total = _lineas_conduce(base, body.items)
+    conn = base.get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    try:
+        ocupada = _mesa_libre_de(cur, mesa, usuario, body.id)
+    except HTTPException:
+        conn.rollback()
+        conn.close()
+        raise
+    if not body.id and ocupada and ocupada[2] == usuario:
+        body.id = ocupada[0]
+    if body.id:
+        cur.execute("SELECT id, codigo, estado, IFNULL(usuario,'') FROM conduces WHERE id=?", (body.id,))
+        previo = cur.fetchone()
+        if not previo or previo[2] != "pendiente":
+            conn.rollback()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Ese conduce ya se facturó")
+        if previo[3] and previo[3] != usuario:
+            conn.rollback()
+            conn.close()
+            raise HTTPException(status_code=409, detail=f"Ese pedido lo está atendiendo {previo[3]}")
+        cur.execute(
+            """
+            UPDATE conduces
+            SET mesa=?, usuario=?, items_json=?, subtotal=?, itbis=?, total=?
+            WHERE id=?
+            """,
+            (mesa, usuario, json.dumps(lineas), subtotal, itbis, total, previo[0]),
+        )
+        codigo, cid = previo[1], previo[0]
+    else:
+        marca = "T" + secrets.token_hex(4).upper()
+        cur.execute(
+            """
+            INSERT INTO conduces (codigo, mesa, usuario, items_json, subtotal, itbis, total, estado)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pendiente')
+            """,
+            (marca, mesa, usuario, json.dumps(lineas), subtotal, itbis, total),
+        )
+        cid = int(cur.lastrowid)
+        codigo = f"C{cid:04d}"
+        cur.execute("UPDATE conduces SET codigo=? WHERE id=?", (codigo, cid))
+    _marcar_mesa(cur, mesa, usuario, cid)
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "id": cid,
+        "codigo": codigo,
+        "mesa": mesa,
+        "usuario": usuario,
+        "lineas": lineas,
+        "subtotal": subtotal,
+        "itbis": itbis,
+        "total": total,
+        "estado": "pendiente",
+    }
+
+
+@app.post("/api/conduces/{conduce_id}/partir")
+def partir_conduce(request: Request, conduce_id: int, body: PartirIn):
+    _exigir(request, "mostrador")
+    if not body.quedan:
+        raise HTTPException(status_code=400, detail="Deja al menos un producto en la mesa")
+    base = db()
+    lineas, subtotal, itbis, total = _lineas_conduce(base, body.quedan)
+    conn = base.get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT estado FROM conduces WHERE id=?", (conduce_id,))
+    row = cur.fetchone()
+    if not row or row[0] != "pendiente":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Ese pedido ya no está pendiente")
+    cur.execute(
+        "UPDATE conduces SET items_json=?, subtotal=?, itbis=?, total=? WHERE id=?",
+        (json.dumps(lineas), subtotal, itbis, total, conduce_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": conduce_id, "lineas": lineas, "total": total}
+
+
+@app.get("/api/cocina")
+def listar_cocina(request: Request):
+    _exigir_alguno(request, ("mostrador", "pedidos"))
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, codigo, mesa, IFNULL(usuario,''), items_json, total, fecha, IFNULL(cocina,'nueva')
+        FROM conduces
+        WHERE estado = 'pendiente' AND TRIM(IFNULL(codigo,'')) != ''
+        ORDER BY datetime(fecha) ASC, id ASC
+        LIMIT 40
+        """
+    )
+    items = []
+    for i, c, m, u, js, t, f, cocina in cur.fetchall():
+        items.append({
+            "id": i, "codigo": c, "mesa": m, "usuario": u,
+            "lineas": json.loads(js or "[]"), "total": float(t or 0),
+            "fecha": f, "cocina": cocina or "nueva",
+        })
+    conn.close()
+    return {"items": items}
+
+
+@app.post("/api/cocina/{conduce_id}")
+def marcar_cocina(request: Request, conduce_id: int, body: CocinaIn):
+    _exigir_alguno(request, ("mostrador", "pedidos"))
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE conduces SET cocina=? WHERE id=? AND estado='pendiente'",
+        ("lista" if body.lista else "nueva", conduce_id),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Ese pedido no está en cocina")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.get("/api/compras/por-pagar")
+def compras_por_pagar(request: Request):
+    _exigir(request, "compras")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.id, c.fecha, IFNULL(c.nota,''), c.total, IFNULL(p.nombre,'')
+        FROM compras c
+        LEFT JOIN proveedores p ON p.id = c.proveedor_id
+        WHERE IFNULL(c.pagada,0) = 0
+        ORDER BY c.id DESC
+        LIMIT 80
+        """
+    )
+    items = [
+        {"id": i, "fecha": f, "nota": n, "total": float(t or 0), "proveedor": prov or n}
+        for i, f, n, t, prov in cur.fetchall()
+    ]
+    conn.close()
+    return {"items": items, "total": round(sum(x["total"] for x in items), 2)}
+
+
+@app.post("/api/compras/{compra_id}/pagar")
+def pagar_compra(request: Request, compra_id: int):
+    usuario = _exigir(request, "compras")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT total FROM compras WHERE id=? AND IFNULL(pagada,0)=0", (compra_id,))
+    fila = cur.fetchone()
+    if not fila:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Esa compra ya estaba pagada o no existe")
+    cur.execute("UPDATE compras SET pagada=1 WHERE id=?", (compra_id,))
+    _guardar_asiento(
+        cur,
+        f"Pago de la compra {compra_id}",
+        "pago_compra",
+        compra_id,
+        asiento_simple("2.4", "1.1", float(fila[0] or 0)),
+        usuario,
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.get("/api/resultado")
+def resultado_periodo(request: Request, desde: str = "", hasta: str = ""):
+    _exigir_alguno(request, ("reportes", "compras"))
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    inicio = (desde or hoy)[:10]
+    fin = (hasta or hoy)[:10]
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.codigo, c.nombre, c.tipo, IFNULL(SUM(l.debito),0), IFNULL(SUM(l.credito),0)
+        FROM asiento_lineas l
+        JOIN cuentas c ON c.id = l.cuenta_id
+        JOIN asientos a ON a.id = l.asiento_id
+        WHERE date(a.fecha) BETWEEN ? AND ?
+        GROUP BY c.id
+        ORDER BY c.codigo
+        """,
+        (inicio, fin),
+    )
+    cuentas = []
+    ingresos = 0.0
+    gastos = 0.0
+    for codigo, nombre, tipo, debito, credito in cur.fetchall():
+        saldo = round(float(credito or 0) - float(debito or 0), 2) if tipo == "ingreso" else round(float(debito or 0) - float(credito or 0), 2)
+        cuentas.append({"codigo": codigo, "nombre": nombre, "tipo": tipo, "saldo": saldo})
+        if tipo == "ingreso":
+            ingresos += saldo
+        elif tipo == "gasto":
+            gastos += saldo
+    conn.close()
+    return {
+        "desde": inicio,
+        "hasta": fin,
+        "cuentas": cuentas,
+        "ingresos": round(ingresos, 2),
+        "gastos": round(gastos, 2),
+        "resultado": round(ingresos - gastos, 2),
+    }
+
+
+class GastoIn(BaseModel):
+    monto: float
+    nota: str = ""
+
+
+@app.post("/api/gastos")
+def crear_gasto(request: Request, body: GastoIn):
+    usuario = _exigir_alguno(request, ("reportes", "compras"))
+    monto = round(float(body.monto or 0), 2)
+    if monto <= 0:
+        raise HTTPException(status_code=400, detail="El gasto tiene que ser mayor que cero")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO gastos (fecha, monto, nota, usuario) VALUES (?,?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), monto, (body.nota or "").strip()[:120], usuario),
+        )
+        gasto_id = int(cur.lastrowid)
+        _guardar_asiento(
+            cur,
+            (body.nota or "Gasto").strip()[:180] or "Gasto",
+            "gasto",
+            gasto_id,
+            asiento_simple("6.1", "1.1", monto),
+            usuario,
+        )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        conn.close()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    conn.close()
+    return {"ok": True, "id": gasto_id}
+
+
+@app.get("/api/libro")
+def libro_mayor(request: Request, desde: str = "", hasta: str = ""):
+    _exigir_alguno(request, ("reportes", "compras"))
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    inicio = (desde or hoy)[:10]
+    fin = (hasta or hoy)[:10]
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT a.id, a.fecha, a.concepto, c.codigo, c.nombre, l.debito, l.credito
+        FROM asiento_lineas l
+        JOIN asientos a ON a.id = l.asiento_id
+        JOIN cuentas c ON c.id = l.cuenta_id
+        WHERE date(a.fecha) BETWEEN ? AND ?
+        ORDER BY a.id DESC, c.codigo
+        LIMIT 240
+        """,
+        (inicio, fin),
+    )
+    items = [
+        {"asiento": i, "fecha": f, "concepto": concepto, "codigo": codigo, "cuenta": nombre, "debito": float(d or 0), "credito": float(c or 0)}
+        for i, f, concepto, codigo, nombre, d, c in cur.fetchall()
+    ]
+    conn.close()
+    return {"items": items}
+
+
+class ModificadorIn(BaseModel):
+    producto_id: int
+    nombre: str
+    precio: float = 0
+
+
+@app.post("/api/modificadores")
+def crear_modificador(request: Request, body: ModificadorIn):
+    _exigir(request, "inventario")
+    nombre = " ".join((body.nombre or "").split())[:40]
+    if len(nombre) < 2:
+        raise HTTPException(status_code=400, detail="Ponle nombre al extra")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM productos WHERE id=?", (body.producto_id,))
+    if not cur.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    cur.execute(
+        "INSERT INTO modificadores (producto_id, nombre, precio) VALUES (?,?,?)",
+        (body.producto_id, nombre, round(float(body.precio or 0), 2)),
+    )
+    nuevo = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": nuevo}
+
+
+@app.delete("/api/modificadores/{mod_id}")
+def borrar_modificador(request: Request, mod_id: int):
+    _exigir(request, "inventario")
+    conn = db().get_connection()
+    conn.execute("UPDATE modificadores SET activo=0 WHERE id=?", (mod_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/conduces/{conduce_id}/facturado")
+def marcar_conduce_facturado(request: Request, conduce_id: int, body: ConduceFacturadoIn):
+    _exigir(request, "mostrador")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT numero FROM facturas WHERE id=?", (body.factura_id,))
+    factura = cur.fetchone()
+    if not factura:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    cur.execute("SELECT mesa FROM conduces WHERE id=?", (conduce_id,))
+    mesa_row = cur.fetchone()
+    cur.execute(
+        """
+        UPDATE conduces
+        SET estado='facturado', factura_id=?
+        WHERE id=? AND estado='pendiente'
+        """,
+        (body.factura_id, conduce_id),
+    )
+    if mesa_row:
+        cur.execute("DELETE FROM mesa_ocupada WHERE mesa=? OR conduce_id=?", (mesa_row[0], conduce_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "factura": factura[0]}
+
+
 if _STATIC.is_dir():
     app.mount("/estaticos", StaticFiles(directory=str(_STATIC)), name="estaticos")
 
@@ -3700,6 +4881,11 @@ HTML = """<!DOCTYPE html>
   .card.bajo .stock { color:var(--warning); }
   .badge { position:absolute; top:8px; left:8px; background:var(--pill-warning-bg); color:var(--pill-warning-ink); font-size:12px; font-weight:600; height:22px; display:inline-flex; align-items:center; padding:0 9px; border-radius:99px; }
   .vacio { color:var(--muted); padding:24px 0; grid-column:1 / -1; margin:0; }
+  .sin-caja { max-width:480px; background:var(--surface); border:1px solid var(--rule); border-radius:16px; padding:22px; }
+  .sin-caja h2 { margin:0 0 8px; font-size:22px; }
+  .sin-caja p { color:var(--muted); margin:0 0 14px; }
+  #view-venta.bloqueada .toolbar, #view-venta.bloqueada #grid { display:none; }
+  .rail.bloqueada { opacity:.4; pointer-events:none; }
   .bajo { outline:0; }
 
   /* Ticket */
@@ -3715,6 +4901,7 @@ HTML = """<!DOCTYPE html>
   #lines li .nombre { min-width:0; overflow-wrap:anywhere; margin-left:2px; }
   #lines li > span:last-child { white-space:nowrap; font-weight:600; }
   #lines li button.sec { width:26px; height:26px; padding:0; border-radius:8px; flex:none; display:inline-grid; place-items:center; }
+  #lines li .nombre button.sec { width:auto; min-height:28px; height:auto; padding:0 8px; }
   #lines li .num { display:inline-block; min-width:1.4em; text-align:center; }
   .desglose { display:grid; margin-top:4px; }
   .desglose div { display:flex; justify-content:space-between; gap:8px; padding:7px 0; border-top:1px solid var(--rule); font-size:13px; color:var(--muted); }
@@ -3773,6 +4960,20 @@ HTML = """<!DOCTYPE html>
   #esperas { margin-top:14px; display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; }
   #esperas h4 { margin:0 0 2px; font-size:12px; font-weight:500; color:var(--faint); }
   #esperas button.sec { width:100%; text-align:left; border-radius:var(--radius-inner); height:40px; }
+  #colaConduces { display:flex; flex-direction:column; gap:6px; margin:10px 0 4px; max-height:240px; overflow-y:auto; }
+  #colaConduces h4 { margin:0 0 2px; font-size:12px; font-weight:600; color:var(--muted); }
+  #colaConduces .vacio { margin:0; color:var(--muted); font-size:13px; }
+  #colaConduces button.sec {
+    width:100%; height:auto; min-height:44px; text-align:left; border-radius:var(--radius-inner);
+    padding:8px 12px; display:flex; justify-content:space-between; align-items:center; gap:10px;
+  }
+  #colaConduces button.sec span:first-child { min-width:0; overflow:hidden; }
+  #colaConduces button.sec small { display:block; color:var(--muted); font-size:12px; font-weight:500; }
+  #colaConduces button.sec.on { background:var(--r-venta); color:var(--r-venta-ink); }
+  #colaConduces button.sec.on small { color:var(--r-venta-ink); }
+  @media (hover:hover) and (pointer:fine) {
+    #colaConduces button.sec.on:hover { background:var(--r-venta); color:var(--r-venta-ink); }
+  }
   .msg { color:var(--warning); min-height:1.2em; font-size:13px; }
   #msg, #formMsg { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; min-height:0; }
 
@@ -3886,11 +5087,30 @@ HTML = """<!DOCTYPE html>
   .aviso.saliendo { transform: translateY(8px); opacity:0; transition: transform 200ms var(--ease-out), opacity 180ms ease; }
 
   #recibo { display:none; }
+  #recibo .bau { font-family: "Courier New", Courier, monospace; font-size:12px; line-height:1.35; color:#111; }
+  #recibo.angosto .bau { font-size:11px; }
+  #recibo .centro { display:block; text-align:center; }
+  #recibo .local { display:block; font-size:15px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+  #recibo.angosto .local { font-size:13px; }
+  #recibo header span, #recibo .sub, #recibo .pie { display:block; }
+  #recibo .corte { border:0; border-top:1px dashed #111; margin:6px 0; }
+  #recibo .fila { display:flex; justify-content:space-between; gap:8px; }
+  #recibo .nom { flex:1; min-width:0; }
+  #recibo .din { white-space:nowrap; }
+  #recibo .sub { font-size:11px; }
+  #recibo .total { font-size:14px; font-weight:700; }
+  #recibo .cols, #recibo .ley { font-size:11px; }
+  #recibo .titulo { display:block; text-align:center; font-weight:700; letter-spacing:.06em; margin:6px 0 2px; }
+  #recibo .mesa { display:block; text-align:center; font-size:16px; font-weight:700; letter-spacing:.08em; margin:4px 0; }
+  #recibo .cols3 { display:grid; grid-template-columns: 1fr 16mm 20mm; column-gap:4px; }
+  #recibo.angosto .cols3 { grid-template-columns: 1fr 13mm 16mm; }
+  #recibo .d { text-align:right; }
+  #recibo .qr { display:flex; justify-content:center; margin-top:4px; }
+  #recibo .qr svg { width:28mm; height:28mm; }
   @media print {
     body * { visibility: hidden; }
     #recibo, #recibo * { visibility: visible; }
-    #recibo { display:block; position:absolute; left:0; top:0; width:80mm; color:#111; background:#fff; padding:12px; }
-    #recibo .qr svg { width:26mm; height:26mm; display:block; margin:6px 0; }
+    #recibo { display:block; position:absolute; left:0; top:0; margin:0; padding:0; color:#111; background:#fff; }
   }
 
   /* Tablet y teléfono: la barra lateral se pliega en una hoja de menú */
@@ -3998,6 +5218,7 @@ HTML = """<!DOCTYPE html>
   <label>Usuario<input id="user" autocomplete="username" required/></label>
   <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required/></label>
   <button type="submit">Entrar</button>
+  <p class="hint" style="text-align:center;margin:14px 0 0"><a href="/tablet">Entrada del mesero</a></p>
   <div class="msg" id="loginMsg" role="alert"></div>
 </form>
 <main id="app">
@@ -4006,6 +5227,7 @@ HTML = """<!DOCTYPE html>
       <div class="brand"><span class="mono" aria-hidden="true">MD</span><div><b>MD Alliance</b><small>Punto de venta</small></div></div>
       <div class="nav-grupo" data-grupo="venta">Venta</div>
       <button class="nav on" data-view="venta" data-mod="mostrador" onclick="ver('venta')">Mostrador</button>
+      <button class="nav" data-mod="mostrador" type="button" onclick="location.href='/cocina'">Cocina</button>
       <button class="nav" data-view="cotizaciones" data-mod="cotizaciones" onclick="ver('cotizaciones')">Cotizaciones</button>
       <button class="nav" data-view="historial" data-mod="historial" onclick="ver('historial')">Facturas emitidas</button>
       <button class="nav" data-view="cobros" data-mod="cobros" onclick="ver('cobros')">Cuentas por cobrar</button>
@@ -4017,13 +5239,16 @@ HTML = """<!DOCTYPE html>
       <button class="nav" data-view="cerrar" data-mod="caja" onclick="ver('cerrar')">Cuadre y cierre</button>
       <div class="nav-grupo" data-grupo="inventario">Inventario</div>
       <button class="nav" data-view="inventario" data-mod="inventario" onclick="ver('inventario')">Productos</button>
+      <button class="nav" data-view="combos" data-mod="inventario" onclick="ver('combos')">Combos</button>
       <button class="nav" data-view="compra" data-mod="compras" onclick="ver('compra')">Compras</button>
+      <button class="nav" data-view="porpagar" data-mod="compras" onclick="ver('porpagar')">Por pagar</button>
       <button class="nav" data-view="kardex" data-mod="kardex" onclick="ver('kardex')">Kardex</button>
       <button class="nav" data-view="tr" data-mod="transferir" onclick="ver('tr')">Bodegas y traslados</button>
       <button class="nav" data-view="promo" data-mod="promociones" onclick="ver('promo')">Promociones</button>
       <div class="nav-grupo" data-grupo="analisis">Análisis</div>
       <button class="nav" data-view="indicadores" data-mod="indicadores" onclick="ver('indicadores')">Indicadores</button>
       <button class="nav" data-view="reportes" data-mod="reportes" onclick="ver('reportes')">Reportes</button>
+      <button class="nav" data-view="resultado" data-mod="reportes" onclick="ver('resultado')">Resultado</button>
       <button class="nav" data-view="seguimiento" data-mod="seguimiento" onclick="ver('seguimiento')">Seguimiento de cajeros</button>
       <div class="nav-grupo" data-grupo="admin">Administración</div>
       <button class="nav" data-view="clientes" data-mod="clientes" onclick="ver('clientes')">Clientes</button>
@@ -4051,6 +5276,11 @@ HTML = """<!DOCTYPE html>
       <div class="work">
         <section class="catalog">
           <div id="view-venta">
+            <div id="sinCaja" class="sin-caja" hidden>
+              <h2>Abre la caja para vender</h2>
+              <p>No se arma ni se cobra un ticket hasta que el cajero abra el turno. Queda registrado quién abrió, a qué hora y con cuánta caja chica para el vuelto.</p>
+              <div id="sinCajaForm"></div>
+            </div>
             <div class="toolbar">
               <input id="q" type="search" placeholder="Buscar por nombre o escanear código" aria-label="Buscar producto" autocomplete="off"/>
               <select id="cat" aria-label="Categoría"></select>
@@ -4072,7 +5302,15 @@ HTML = """<!DOCTYPE html>
         </section>
         <aside class="rail" aria-label="Ticket">
           <h3>Ticket</h3>
-          <ul id="lines"><li class="vacio">Toca un producto o escanea un código para empezar.</li></ul>
+          <div class="campo ancho">
+            <label for="codConduce">Código del mesero</label>
+            <div style="display:flex;gap:8px">
+              <input id="codConduce" placeholder="C0042" autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter'){event.preventDefault();verConduce()}"/>
+              <button class="sec" type="button" onclick="verConduce()">Traer pedido</button>
+            </div>
+            <div id="colaConduces" aria-live="polite"></div>
+          </div>
+          <ul id="lines"><li class="vacio">Toca un producto, escanea un código o trae el pedido del mesero.</li></ul>
           <div class="desglose" id="desglose"></div>
           <div class="placa-total" id="placaTotal">
             <small>Total a cobrar</small>
@@ -4086,7 +5324,10 @@ HTML = """<!DOCTYPE html>
               <div class="info-cliente" id="infoCliente" hidden></div>
             </div>
             <label>Comprobante<select id="tipoComp"><option value="consumidor_final">Consumidor final</option><option value="credito_fiscal">Crédito fiscal</option></select></label>
-            <label>Descuento (RD$)<input id="desc" type="number" step="0.01" min="0" value="0"/></label>
+            <label>Descuento (RD$)<input id="desc" type="number" step="0.01" min="0" value="0" oninput="pintar()"/></label>
+            <label class="check ancho"><input type="checkbox" id="propina10" onchange="pintar()"/> 10% de ley</label>
+            <label class="check ancho" id="filaPuntos" hidden><input type="checkbox" id="usarPuntos" onchange="pintar()"/> Usar puntos del cliente</label>
+            <label>Autorización de la terminal<input id="authTarjeta" autocomplete="off" spellcheck="false" placeholder="La del voucher, mínimo 4"/></label>
             <div id="pagosDyn"></div>
             <label class="check ancho" id="filaCredito"><input type="checkbox" id="aCredito" onchange="pintar()"/> Venta a crédito (fiado)</label>
             <p id="cambio" class="ancho">Cambio: RD$ 0.00</p>
@@ -4100,8 +5341,12 @@ HTML = """<!DOCTYPE html>
             </details>
           </div>
           <div class="ticket-acciones">
+            <button class="sec" type="button" onclick="imprimirPrecuenta()">Pre-cuenta</button>
             <button class="sec" onclick="popupApartar()">Apartar</button>
             <button class="sec" onclick="guardarCotizacion()">Cotizar</button>
+            <button class="sec" type="button" onclick="dejarEnMesa()">Dejar el resto en la mesa</button>
+            <button class="sec" type="button" onclick="abrirCajon()">Abrir cajón</button>
+            <a class="sec" href="/pantalla" target="_blank" style="display:grid;place-items:center;height:36px;border-radius:999px;text-decoration:none">Pantalla del cliente</a>
           </div>
           <div id="esperas"></div>
           <div class="msg" id="msg" role="status"></div>
@@ -4255,17 +5500,20 @@ async function api(url, opt){
 }
 async function entrar(){
   try {
-    await api("/api/login", {method:"POST", body: JSON.stringify({username:user.value, password:pass.value})});
+    const s = await api("/api/login", {method:"POST", body: JSON.stringify({username:user.value, password:pass.value})});
+    if (s.rol === "mesero") { location.href = "/tablet"; return; }
     login.style.display="none"; app.style.display="block";
     await refrescar(); await cargar();
   } catch(e){ loginMsg.textContent = e.message; }
 }
 async function sesionInicial(){
+  let sesion;
   try {
-    await api("/api/estado");
+    sesion = await api("/api/estado");
   } catch(e) {
     return;
   }
+  if (sesion.rol === "mesero") { location.href = "/tablet"; return; }
   login.style.display = "none";
   app.style.display = "block";
   try {
@@ -4297,19 +5545,36 @@ function actualizarGrupos(){
 async function refrescar(){
   const e = await api("/api/estado");
   const esc = s => String(s || "").replaceAll("&","&amp;").replaceAll("<","&lt;");
-  document.getElementById("top").innerHTML = `<span class="quien">${esc(e.usuario)} · ${esc(e.rol)} · </span><span class="estado${e.caja ? " abierta" : ""}">${e.caja ? esc(e.caja.nombre) + " abierta" : "Caja cerrada"}</span>`;
+  window._usuario = e.usuario || "";
+  window._caja = e.caja || null;
+  const turno = e.caja
+    ? esc(e.caja.nombre) + " · " + esc(e.caja.usuario || e.usuario) + " · " + esc(String(e.caja.apertura || "").slice(0, 16)) + " · caja chica " + money(e.caja.fondo)
+    : "Caja cerrada";
+  document.getElementById("top").innerHTML = `<span class="quien">${esc(e.usuario)} · ${esc(e.rol)} · </span><span class="estado${e.caja ? " abierta" : ""}">${turno}</span>`;
   aplicarPermisos(e.permisos);
   window._empresa = e.empresa || {};
   window._itbisIncluido = !!e.itbis_incluido;
+  aplicarPuertaCaja();
   const btn = document.getElementById("btnCaja");
   if (btn) btn.style.display = e.caja || !permisos.includes("caja") ? "none" : "";
   actualizarGrupos();
-  if (permisos.includes("mostrador")) {
+    if (permisos.includes("mostrador")) {
     await cargarClientesVenta();
     await cargarMetodos();
     await cargarEsperas();
+    await cargarColaConduces();
     await cargarVendedoresVenta();
     await cargarTerminalesVenta();
+    try {
+      const vitrina = await api("/api/promociones/vitrina");
+      window._promosPantalla = vitrina.items || [];
+    } catch (e) { window._promosPantalla = []; }
+    if (!window._colaTimer) {
+      window._colaTimer = setInterval(() => {
+        if (document.hidden || !permisos.includes("mostrador")) return;
+        cargarColaConduces();
+      }, 8000);
+    }
   }
   pintarBarraRed();
 }
@@ -4325,16 +5590,24 @@ function guardarVentaSinConexion(payload){
   if (payload.pagos.some(p => p.codigo === "saldo_favor")) throw new Error("Sin conexión no se puede usar saldo a favor.");
   const t = totalTicket();
   const pagado = payload.pagos.reduce((s, p) => s + p.monto, 0);
-  if (pagado + 0.009 < t.total) throw new Error("Sin conexión la venta tiene que quedar pagada completa.");
+  if (pagado + 0.009 < t.aCobrar) throw new Error("Sin conexión la venta tiene que quedar pagada completa.");
   const ahora = new Date();
   const fecha = ahora.getFullYear() + "-" + String(ahora.getMonth()+1).padStart(2,"0") + "-" + String(ahora.getDate()).padStart(2,"0") + " " + ahora.toTimeString().slice(0,8);
   const cola = colaVentas();
   cola.push({payload: Object.assign({}, payload, {fecha_local: fecha}), total: t.total, creada: fecha, error: ""});
   guardarCola(cola);
+  const nombres = {};
+  (window._metodos || []).forEach(m => { nombres[m.codigo] = m.nombre; });
+  nombres.saldo_favor = "Saldo a favor";
   return {
-    provisional: true, numero: payload.id_local.slice(0, 8).toUpperCase(), ncf: "", total: t.total, itbis: t.itbis,
-    cambio: Math.max(0, Math.round((pagado - t.total) * 100) / 100), cliente: cliVenta.selectedOptions[0]?.textContent || "",
-    lineas: cart.map(l => ({nombre: l.nombre, cantidad: l.cantidad, total: Math.round(l.precio * l.cantidad * 100) / 100})),
+    provisional: true, numero: payload.id_local.slice(0, 8).toUpperCase(), ncf: "",
+    subtotal: t.sub, descuento: t.rebaja, itbis: t.itbis, propina: t.propina,
+    total: t.aCobrar, a_cobrar: t.aCobrar,
+    cambio: Math.max(0, Math.round((pagado - t.aCobrar) * 100) / 100),
+    cliente: cliVenta.selectedOptions[0]?.textContent || "Consumidor final",
+    fecha, usuario: window._usuario || "", observaciones: payload.observaciones || "",
+    pagos: payload.pagos.map(p => ({codigo: p.codigo, nombre: nombres[p.codigo] || p.codigo, monto: p.monto, referencia: p.codigo === "tarjeta" ? (payload.autorizacion || "").replace(/[^a-z0-9]/gi, "") : ""})),
+    lineas: cart.map(l => ({nombre: l.nombre + (l.nota ? " · " + l.nota : ""), cantidad: l.cantidad, precio: l.precio, total: Math.round(l.precio * l.cantidad * 100) / 100})),
   };
 }
 let sincronizando = false;
@@ -4524,13 +5797,16 @@ async function cargar(){
     const precio = p.combo ? p.precio : ([p.precio, p.precio_2, p.precio_3, p.precio_4][nivel-1] || p.precio);
     const nombre = String(p.nombre).replaceAll("<","&lt;");
     const esBajo = !p.combo && Number(p.stock) <= Number(p.minimo || 0);
-    const extra = p.combo ? "Combo" : ("Stock: " + p.stock);
+    const extra = p.combo ? (p.descripcion || "Combo") : ("Stock: " + p.stock);
     const badge = esBajo ? '<span class="badge">Stock bajo</span>' : "";
     return `<button class="card${esBajo ? " bajo" : ""}" onclick='add(${JSON.stringify(p).replaceAll("'","&#39;")}, ${precio})'>${badge}<span class="foto" style="background-image:url('${p.imagen}')"></span><span class="info"><b>${nombre}</b><span class="precio">${money(precio)}</span><span class="stock">${extra}</span></span></button>`;
   }).join("") || `<p class="vacio">${q.value.trim() ? "Ningún producto coincide con «" + q.value.trim().replaceAll("<","&lt;") + "»." : "No hay productos en esta categoría."}</p>`;
   if (!window._catalogoVisto) {
     window._catalogoVisto = true;
     grid.querySelectorAll(".card").forEach((c, i) => animar(c, [{opacity:0, transform:"translateY(10px)"}, {opacity:1, transform:"none"}], {duration:320, delay: Math.min(i * 30, 240)}));
+  } else if (window._animarGrid) {
+    window._animarGrid = false;
+    animar(grid, [{opacity:0}, {opacity:1}], {duration:150});
   }
   if (exacto) {
     const nivel = Number(lista.value);
@@ -4540,11 +5816,152 @@ async function cargar(){
     return cargar();
   }
 }
-cat.onchange = ()=>{ window._cat = cat.value; cargar(); };
+cat.onchange = ()=>{ window._cat = cat.value; window._animarGrid = true; cargar(); };
 lista.onchange = cargar;
+function aplicarPuertaCaja(){
+  const venta = document.getElementById("view-venta");
+  const puerta = document.getElementById("sinCaja");
+  const rail = document.querySelector(".rail");
+  const cerrada = !window._caja;
+  if (venta) venta.classList.toggle("bloqueada", cerrada);
+  if (puerta) puerta.hidden = !cerrada;
+  if (rail) rail.classList.toggle("bloqueada", cerrada);
+  const form = document.getElementById("sinCajaForm");
+  if (!form || !cerrada) return;
+  const escHtml = s => String(s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;");
+  form.innerHTML = permisos.includes("caja")
+    ? `<div class="form"><label>Cajero<input value="${escHtml(window._usuario || "")}" readonly/></label><label>Nombre de la caja<input id="cajaNombreVenta" value="Caja 1"/></label><label>Caja chica<input id="cajaFondoVenta" type="number" min="0" step="0.01" placeholder="Efectivo para el vuelto"/></label><button type="button" onclick="abrirCajaDesdeVenta()">Abrir caja y vender</button></div>`
+    : "<p>La cajera de turno tiene que abrir la caja. Hasta entonces no se puede vender.</p>";
+}
+async function abrirCajaDesdeVenta(){
+  const fondo = document.getElementById("cajaFondoVenta");
+  const nombre = document.getElementById("cajaNombreVenta");
+  if (!fondo || fondo.value.trim() === "" || Number.isNaN(Number(fondo.value)) || Number(fondo.value) < 0) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Indica la caja chica. Si abres sin efectivo, escribe 0.";
+    return;
+  }
+  try {
+    await api("/api/caja/abrir", {method:"POST", body: JSON.stringify({nombre: nombre ? nombre.value : "Caja 1", fondo: Number(fondo.value)})});
+    msg.style.color = "var(--ok)";
+    msg.textContent = "Caja abierta. Ya se puede vender.";
+    await refrescar();
+  } catch(e) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = e.message;
+  }
+}
+function publicarPantalla(t){
+  const data = {
+    lineas: cart.map(l => ({
+      nombre: [l.nombre, ...(l.opciones || []).filter(o => o.on).map(o => o.nombre)].filter(Boolean).join(" · "),
+      nota: l.nota || "",
+      cantidad: l.cantidad,
+      total: Number(l.precio) * Number(l.cantidad)
+    })),
+    total: t ? t.aCobrar : 0,
+    propina: t ? t.propina : 0,
+    promos: window._promosPantalla || []
+  };
+  try { localStorage.setItem("ticket-vivo", JSON.stringify(data)); } catch (e) {}
+  if (!window._canalTicket) {
+    try { window._canalTicket = new BroadcastChannel("ticket-vivo"); } catch (e) { window._canalTicket = null; }
+  }
+  if (window._canalTicket) window._canalTicket.postMessage(data);
+}
+function toggleExtra(i, id){
+  const linea = cart[i];
+  if (!linea) return;
+  const extra = (linea.opciones || []).find(o => o.id === id);
+  if (!extra) return;
+  extra.on = !extra.on;
+  const suma = (linea.opciones || []).filter(o => o.on).reduce((s, o) => s + Number(o.precio || 0), 0);
+  linea.precio = Math.round((Number(linea.base ?? linea.precio) + suma) * 100) / 100;
+  pintar();
+}
+function rotarNotaCaja(i){
+  const notas = ["", "Sin hielo", "Sin azúcar", "Término medio", "Sin cebolla", "Para llevar"];
+  if (!cart[i]) return;
+  const n = notas.indexOf(cart[i].nota || "");
+  cart[i].nota = notas[(n < 0 ? 0 : n + 1) % notas.length];
+  pintar();
+}
+function marcarCobro(i, valor){
+  if (cart[i]) cart[i].cobrar = !!valor;
+}
+async function dejarEnMesa(){
+  if (!window._conduceId) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Trae primero el pedido de la mesa.";
+    return;
+  }
+  const quedan = cart.filter(l => l.cobrar === false);
+  const van = cart.filter(l => l.cobrar !== false);
+  if (!quedan.length || !van.length) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Desmarca lo que se queda en la mesa y deja marcado lo que vas a cobrar.";
+    return;
+  }
+  try {
+    await api("/api/conduces/" + window._conduceId + "/partir", {method:"POST", body: JSON.stringify({
+      quedan: quedan.map(l => ({id:l.id, cantidad:l.cantidad, combo:!!l.combo, nota:l.nota || "", extras: (l.opciones||[]).filter(o => o.on).map(o => o.id)}))
+    })});
+    const id = window._conduceId;
+    cart.length = 0;
+    van.forEach(l => cart.push(l));
+    window._conduceId = null;
+    pintar();
+    cargarColaConduces();
+    msg.style.color = "var(--ok)";
+    msg.textContent = "Lo desmarcado sigue en el pedido " + id + ". Cobra ahora la parte marcada.";
+  } catch (e) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = e.message;
+  }
+}
+async function asegurarPuertoCajon(){
+  if (!navigator.serial) return;
+  if (window._puertoCajon) return;
+  try {
+    const previos = await navigator.serial.getPorts();
+    window._puertoCajon = previos[0] || await navigator.serial.requestPort();
+  } catch (e) {}
+}
+async function pulsarCajon(){
+  const puerto = window._puertoCajon;
+  if (!puerto) return;
+  try {
+    await puerto.open({baudRate: 9600});
+    const writer = puerto.writable.getWriter();
+    await writer.write(new Uint8Array([0x1b, 0x70, 0x00, 0x19, 0xfa]));
+    writer.releaseLock();
+    await puerto.close();
+  } catch (e) {}
+}
+async function abrirCajon(){
+  if (!navigator.serial) {
+    aviso("Chrome puede abrir el cajón si la impresora está conectada por USB.", "error");
+    return;
+  }
+  await asegurarPuertoCajon();
+  if (!window._puertoCajon) return;
+  await pulsarCajon();
+}
 function add(p, precio){
-  const hit = cart.find(x=>x.id===p.id && !!x.combo===!!p.combo && x.precio===precio);
-  if(hit) hit.cantidad += 1; else cart.push({id:p.id, nombre:p.nombre, precio, cantidad:1, itbis:p.itbis!==false, combo:!!p.combo});
+  if (!window._caja) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Abre la caja antes de vender.";
+    return;
+  }
+  const tieneExtras = (p.extras || []).length > 0;
+  const hit = tieneExtras ? null : cart.find(x=>x.id===p.id && !!x.combo===!!p.combo && x.precio===precio && !(x.opciones || []).some(o => o.on));
+  if(hit) hit.cantidad += 1; else cart.push({
+    id:p.id, nombre:p.nombre, precio, base: precio, cantidad:1, itbis:p.itbis!==false, combo:!!p.combo, nota:"",
+    opciones: (p.extras || []).map(e => ({id:e.id, nombre:e.nombre, precio:Number(e.precio || 0), on:false}))
+  });
+  if (!hit && p.stock != null && Number(p.stock) <= Number(p.minimo || 0)) {
+    aviso(p.nombre + " llegó al mínimo: quedan " + p.stock + ".", "error");
+  }
   window._lineaTocada = {indice: cart.indexOf(hit || cart[cart.length - 1]), nueva: !hit};
   pintar();
 }
@@ -4556,8 +5973,14 @@ function pagosActuales(){
     el
   }));
 }
+function rebajaPuntos(){
+  const box = document.getElementById("usarPuntos");
+  if (!box || !box.checked || !window._cliVenta) return 0;
+  return Math.max(0, Number(window._cliVenta.puntos || 0));
+}
 function totalTicket(){
-  const pedido = Math.max(0, Number(document.getElementById("desc").value||0));
+  const pedido = Math.max(0, Number(document.getElementById("desc").value||0)) + rebajaPuntos();
+  let baseTotal;
   if (window._itbisIncluido) {
     let bruto = 0, base = 0;
     cart.forEach(l => {
@@ -4569,59 +5992,69 @@ function totalTicket(){
     const factor = bruto ? (bruto - rebaja) / bruto : 0;
     const itbis = Math.round((bruto - base) * factor * 100) / 100;
     const total = Math.round((bruto - rebaja) * 100) / 100;
-    return {sub: total - itbis, rebaja, itbis, total, incluido: true};
+    baseTotal = {sub: total - itbis, rebaja, itbis, total, incluido: true};
+  } else {
+    const sub = cart.reduce((s,l)=>s+l.precio*l.cantidad,0);
+    const rebaja = Math.min(sub, pedido);
+    const base = Math.max(0, sub-rebaja);
+    const itbis = cart.reduce((s,l)=>s+(l.itbis?l.precio*l.cantidad*0.18:0),0) * (sub ? base/sub : 0);
+    baseTotal = {sub, rebaja, itbis, total: base+itbis, incluido: false};
   }
-  const sub = cart.reduce((s,l)=>s+l.precio*l.cantidad,0);
-  const rebaja = Math.min(sub, pedido);
-  const base = Math.max(0, sub-rebaja);
-  const itbis = cart.reduce((s,l)=>s+(l.itbis?l.precio*l.cantidad*0.18:0),0) * (sub ? base/sub : 0);
-  return {sub, rebaja, itbis, total: base+itbis};
+  const consumo = Math.round((baseTotal.total - baseTotal.itbis) * 100) / 100;
+  baseTotal.consumo = consumo;
+  const propina = document.getElementById("propina10") && document.getElementById("propina10").checked
+    ? Math.round(consumo * 10) / 100 : 0;
+  baseTotal.propina = propina;
+  baseTotal.aCobrar = Math.round((baseTotal.total + propina) * 100) / 100;
+  return baseTotal;
 }
 const ICONO_MENOS = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>';
 const ICONO_MAS = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8h9M8 3.5v9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>';
 function pintar(){
-  lines.innerHTML = cart.map((l,i)=>`<li><span><button class="sec" onclick="cambiarCant(${i},-1)" aria-label="Quitar uno">${ICONO_MENOS}</button> <span class="num">${l.cantidad}</span> <button class="sec" onclick="cambiarCant(${i},1)" aria-label="Agregar uno">${ICONO_MAS}</button><span class="nombre">${String(l.nombre).replaceAll("<","&lt;")}</span></span><span class="num">${money(l.precio*l.cantidad)}</span></li>`).join("")
+  lines.innerHTML = cart.map((l,i)=>`<li><span>${window._conduceId ? `<input type="checkbox" ${l.cobrar === false ? "" : "checked"} onchange="marcarCobro(${i}, this.checked)" aria-label="Cobrar esta línea"/>` : ""}<button class="sec" onclick="cambiarCant(${i},-1)" aria-label="Quitar uno">${ICONO_MENOS}</button> <span class="num">${l.cantidad}</span> <button class="sec" onclick="cambiarCant(${i},1)" aria-label="Agregar uno">${ICONO_MAS}</button><span class="nombre">${String(l.nombre).replaceAll("<","&lt;")}${l.nota ? `<small> · ${String(l.nota).replaceAll("<","&lt;")}</small>` : ""} <button class="sec" type="button" onclick="rotarNotaCaja(${i})">Nota</button> ${(l.opciones||[]).map(o => `<button class="sec" type="button" onclick="toggleExtra(${i},${o.id})">${o.on ? "✓ " : ""}${String(o.nombre).replaceAll("<","&lt;")} ${money(o.precio)}</button>`).join(" ")}</span></span><span class="num">${money(l.precio*l.cantidad)}</span></li>`).join("")
     || '<li class="vacio">Toca un producto o escanea un código para empezar.</li>';
   const btnCobrar = document.getElementById("btnCobrar");
-  if (btnCobrar && !btnCobrar.classList.contains("cobrando")) btnCobrar.disabled = !cart.length;
+  if (btnCobrar && !btnCobrar.classList.contains("cobrando")) btnCobrar.disabled = !cart.length || !window._caja;
   const tocada = window._lineaTocada;
   window._lineaTocada = null;
   if (tocada && lines.children[tocada.indice]) {
     const li = lines.children[tocada.indice];
     if (tocada.nueva) {
-      animar(li, [{opacity:0, transform:"translateY(-6px)"}, {opacity:1, transform:"none"}], {duration:200});
+      animar(li, [{opacity:0, transform:"translateX(-10px)"}, {opacity:1, transform:"none"}], {duration:180});
       lines.scrollTop = lines.scrollHeight;
     } else {
-      animar(li.querySelector(".num"), [{transform:"scale(1.25)"}, {transform:"none"}], {duration:180});
+      animar(li.querySelector(".num"), [{transform:"scale(1.08)"}, {transform:"none"}], {duration:140});
     }
   }
   const t = totalTicket();
   document.getElementById("desglose").innerHTML = cart.length
-    ? (t.incluido
+    ? ((t.incluido
         ? (t.rebaja > 0 ? `<div><span>Descuento aplicado</span><b>−${money(t.rebaja)}</b></div>` : "") + `<div><span>Subtotal sin ITBIS</span><b>${money(t.sub)}</b></div><div><span>ITBIS 18% incluido</span><b>${money(t.itbis)}</b></div>`
         : `<div><span>Subtotal</span><b>${money(t.sub)}</b></div>` + (t.rebaja > 0 ? `<div><span>Descuento</span><b>−${money(t.rebaja)}</b></div>` : "") + `<div><span>ITBIS 18%</span><b>${money(t.itbis)}</b></div>`)
+      + (t.propina > 0 ? `<div><span>10% de ley</span><b>${money(t.propina)}</b></div>` : ""))
     : "";
-  tot.textContent = money(t.total);
+  tot.textContent = money(t.aCobrar);
   tot.classList.toggle("largo", tot.textContent.length > 12);
   const unidades = cart.reduce((s, l) => s + Number(l.cantidad || 0), 0);
-  document.getElementById("barraResumen").textContent = `${unidades} ${unidades === 1 ? "artículo" : "artículos"} · ${money(t.total)}`;
+  document.getElementById("barraResumen").textContent = `${unidades} ${unidades === 1 ? "artículo" : "artículos"} · ${money(t.aCobrar)}`;
   actualizarBarraTicket();
+  publicarPantalla(t);
   const pagos = pagosActuales();
   const cajaPago = pagos.find(p => p.caja);
   const autoCaja = cajaPago && (cajaPago.el.dataset.auto === "1" || !cajaPago.monto);
   if (cajaPago && autoCaja && pagos.every(p => p === cajaPago || !p.monto)) {
-    cajaPago.el.value = t.total ? t.total.toFixed(2) : "0";
+    cajaPago.el.value = t.aCobrar ? t.aCobrar.toFixed(2) : "0";
     cajaPago.el.dataset.auto = "1";
-    cajaPago.monto = t.total;
+    cajaPago.monto = t.aCobrar;
   }
   const fuera = pagos.filter(p => !p.caja).reduce((s,p)=>s+p.monto,0);
   const enCaja = pagos.filter(p => p.caja).reduce((s,p)=>s+p.monto,0);
-  const falta = Math.max(0, t.total - fuera - enCaja);
+  const falta = Math.max(0, t.aCobrar - fuera - enCaja);
   const fiado = document.getElementById("aCredito").checked;
   cambio.classList.toggle("pendiente", fiado && falta > 0.009);
   cambio.textContent = fiado && falta > 0.009
     ? "Queda pendiente: " + money(falta)
-    : "Cambio: " + money(Math.max(0, enCaja - Math.max(0, t.total-fuera)));
+    : "Cambio: " + money(Math.max(0, enCaja - Math.max(0, t.aCobrar-fuera)));
 }
 async function actualizarClienteVenta(){
   const caja = document.getElementById("infoCliente");
@@ -4629,6 +6062,8 @@ async function actualizarClienteVenta(){
   window._cliVenta = null;
   if (!cliVenta.value) {
     caja.hidden = true;
+    const filaPuntos = document.getElementById("filaPuntos");
+    if (filaPuntos) filaPuntos.hidden = true;
     if (saldoLbl) { saldoLbl.hidden = true; saldoLbl.querySelector("input").value = 0; }
     pintar();
     return;
@@ -4640,6 +6075,9 @@ async function actualizarClienteVenta(){
     if (d.deuda > 0) partes.push(`Debe <b>${money(d.deuda)}</b>`);
     partes.push(d.limite_credito > 0 ? `Crédito disponible <b>${money(d.credito_disponible)}</b>` : `<span>Sin crédito aprobado</span>`);
     if (d.saldo_favor > 0) partes.push(`Saldo a favor <b>${money(d.saldo_favor)}</b>`);
+    if (d.puntos > 0) partes.push(`Puntos <b>${d.puntos}</b>`);
+    const filaPuntos = document.getElementById("filaPuntos");
+    if (filaPuntos) filaPuntos.hidden = !(d.puntos > 0);
     caja.innerHTML = partes.map(x => `<span>${x}</span>`).join("");
     caja.hidden = false;
     if (saldoLbl) {
@@ -4741,12 +6179,52 @@ function pintarRotulo(boton){
   r.dataset.grupo = grupo;
   animar(r, [{clipPath:"inset(0 100% 0 0 round 10px)"}, {clipPath:"inset(0 0 0 0 round 10px)"}], {duration:260, easing:"cubic-bezier(0.77, 0, 0.175, 1)"});
 }
+async function pintarPorPagar(){
+  const root = document.getElementById("pagarTabla");
+  if (!root) return;
+  try {
+    const d = await api("/api/compras/por-pagar");
+    root.innerHTML = `<p class="hint">Pendiente con suplidores: ${money(d.total)}</p>` + (d.items.length
+      ? tabla(["Fecha","Suplidor","Total",""], d.items.map(c => [
+          String(c.fecha||"").slice(0,16), escDash(c.proveedor || c.nota), money(c.total),
+          `<button class="sec" type="button" onclick="pagarCompra(${c.id})">Marcar pagada</button>`
+        ]))
+      : "<p class='hint'>No hay compras pendientes.</p>");
+  } catch (e) { root.innerHTML = `<p class="hint">${escDash(e.message)}</p>`; }
+}
+async function pagarCompra(id){
+  await api("/api/compras/" + id + "/pagar", {method:"POST"});
+  await pintarPorPagar();
+}
+async function pintarResultado(){
+  const root = document.getElementById("resTabla");
+  if (!root) return;
+  const desde = (document.getElementById("resDesde") || {}).value || "";
+  const hasta = (document.getElementById("resHasta") || {}).value || "";
+  const q = "?desde=" + encodeURIComponent(desde) + "&hasta=" + encodeURIComponent(hasta);
+  try {
+    const d = await api("/api/resultado" + q);
+    const cuentas = (d.cuentas || []).filter(c => c.tipo === "ingreso" || c.tipo === "gasto");
+    const libro = await api("/api/libro" + q);
+    root.innerHTML = tabla(["Cuenta", "RD$"], cuentas.map(c => [c.codigo + " " + c.nombre, money(c.saldo)]))
+      + `<p><b>Resultado ${money(d.resultado)}</b> · ingresos ${money(d.ingresos)} · gastos y compras ${money(d.gastos)}</p>`
+      + tabla(["Asiento","Concepto","Cuenta","Debe","Haber"], (libro.items || []).map(x => [String(x.asiento), escDash(x.concepto), x.codigo + " " + escDash(x.cuenta), money(x.debito), money(x.credito)]));
+  } catch (e) { root.innerHTML = `<p class="hint">${escDash(e.message)}</p>`; }
+}
+async function guardarGasto(){
+  const monto = Number((document.getElementById("gastoMonto") || {}).value || 0);
+  const nota = (document.getElementById("gastoNota") || {}).value || "";
+  await api("/api/gastos", {method:"POST", body: JSON.stringify({monto, nota})});
+  document.getElementById("gastoMonto").value = "";
+  document.getElementById("gastoNota").value = "";
+  await pintarResultado();
+}
 async function pintarForm(nombre){
   const lista = await productos();
   const opts = opcionesProductos(lista);
   window._optsProd = opts;
   const forms = {
-    caja: ["Abrir caja", "Pulsa Abrir turno para indicar el nombre y el fondo. Si ya hay uno abierto, edítalo desde la lista.",
+    caja: ["Abrir caja", "Para vender, el cajero abre el turno con la caja chica. Queda su usuario, la hora y el monto. Si ya hay uno abierto, se ve en la barra y se puede editar desde la lista.",
       `<div class="form"><button onclick="abrirTurno()">Abrir turno</button></div><div id="cajaInfo"></div>`],
     ingreso: ["Ingreso de efectivo", "El monto entra al efectivo esperado del turno. Abajo están los ingresos de este turno.",
       `<div class="form"><button onclick="nuevoMov('ingreso')">Registrar ingreso</button></div><div id="movLista"></div>`],
@@ -4769,6 +6247,8 @@ async function pintarForm(nombre){
     ncf: ["Comprobantes NCF", "Secuencias que se imprimen en cada venta.", ""],
     inventario: ["Productos", "Primero va el precio original. El mínimo de venta es el precio de público. Los porcentajes se aplican a ese mínimo, y el dueño puede cambiarlos.",
       `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button><button onclick="nuevoProducto()">Crear producto</button></div><div class="form" style="margin-top:14px"><label>1er por mayor %<input id="descP2" type="number" step="0.01" value="2"/></label><label>2do por mayor %<input id="descP3" type="number" step="0.01" value="5"/></label><label>3er por mayor %<input id="descP4" type="number" step="0.01" value="10"/></label><button class="sec" onclick="guardarDescuentos()">Guardar porcentajes</button></div><div id="invTabla"></div>`],
+    combos: ["Combos", "Junta productos distintos y ponle un solo precio: un ron o whisky con la gaseosa o el jugo. El 2x1 y el 3x2 se cobran solos en la caja.",
+      `<div class="form"><button onclick="armarCombo()">Armar combo</button></div><div id="comboTabla"></div><h3 style="margin:22px 0 8px">Especiales</h3><div class="form"><label>Producto<select id="espProd">${opts}</select></label><label>Tipo<select id="espTipo"><option value="2x1">2x1</option><option value="3x2">3x2</option></select></label><button class="sec" onclick="crearEspecial()">Crear especial</button></div><div id="espTabla"></div>`],
     kardex: ["Kardex", "Movimientos de un producto: ventas, compras, transferencias y devoluciones.",
       `<div class="form"><label>Producto<select id="kxProd" onchange="cargarKardex()">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
     historial: ["Facturas emitidas", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
@@ -4785,11 +6265,15 @@ async function pintarForm(nombre){
       `<div class="form"><label class="wide">Buscar<input id="cobQ" placeholder="Cliente, documento o número de factura" onkeydown="if(event.key==='Enter')cargarCobros()"/></label><button class="sec" onclick="cargarCobros()">Buscar</button></div><div id="cobResumen"></div><div id="cobTabla"></div>`],
     clientes: ["Clientes", "Pulsa Crear cliente. El correo recibe el comprobante. Cada fila se puede editar.",
       `<div class="form"><button onclick="nuevoCliente()">Crear cliente</button></div><div id="cliTabla"></div>`],
-    usuarios: ["Usuarios y permisos", "El administrador ve todo. Un cajero solo entra a los módulos que marques. La contraseña vacía, al editar, no la cambia.",
+    usuarios: ["Usuarios y permisos", "El administrador ve todo. El cajero entra a los módulos que marques y es quien cuadra la caja. El mesero queda por debajo: solo usa la tablet y sus pedidos se cobran en la caja abierta. La contraseña vacía, al editar, no la cambia.",
       `<div class="form"><button onclick="nuevoUsuario()">Crear usuario</button></div><div id="usuTabla"></div>`],
     seguimiento: ["Seguimiento de cajeros", "Cuánto vendió cada cajero y qué turnos descuadraron. Deja una nota de seguimiento.", ""],
     empresa: ["Empresa y correo", "Datos del ticket y el servidor que envía el comprobante por correo.",
-      `<div class="form"><label>Nombre<input id="empNom"/></label><label class="wide">Dirección<input id="empDir"/></label><label>RNC<input id="empRnc"/></label><label>Servidor SMTP<input id="smtpHost" placeholder="smtp.hostinger.com"/></label><label>Puerto<input id="smtpPort" value="587"/></label><label>Usuario<input id="smtpUser"/></label><label>Contraseña<input id="smtpPass" type="password" placeholder="Vacía para no cambiarla"/></label><label>Remitente<input id="smtpFrom" placeholder="facturas@tudominio.com"/></label><label class="check wide"><input type="checkbox" id="empItbisIncl"/> Los precios del catálogo ya incluyen el ITBIS (lo normal en colmado y tienda)</label><button onclick="guardarEmpresa()">Guardar</button></div>`]
+      `<div class="form"><label>Nombre<input id="empNom"/></label><label class="wide">Dirección<input id="empDir"/></label><label>Teléfono<input id="empTel" placeholder="809-000-0000"/></label><label>RNC<input id="empRnc"/></label><label>Servidor SMTP<input id="smtpHost" placeholder="smtp.hostinger.com"/></label><label>Puerto<input id="smtpPort" value="587"/></label><label>Usuario<input id="smtpUser"/></label><label>Contraseña<input id="smtpPass" type="password" placeholder="Vacía para no cambiarla"/></label><label>Remitente<input id="smtpFrom" placeholder="facturas@tudominio.com"/></label><label class="check wide"><input type="checkbox" id="empItbisIncl"/> Los precios del catálogo ya incluyen el ITBIS (lo normal en colmado y tienda)</label><button onclick="guardarEmpresa()">Guardar</button></div>`],
+    porpagar: ["Por pagar", "Compras que todavía no se marcaron como pagadas al suplidor.",
+      `<div id="pagarTabla"></div>`],
+    resultado: ["Resultado", "Estado de resultados del libro: las ventas son ingreso, las compras y los gastos restan. El ITBIS y la propina quedan como deudas, no como ingreso.",
+      `<div class="form"><label>Desde<input id="resDesde" type="date"/></label><label>Hasta<input id="resHasta" type="date"/></label><button class="sec" onclick="pintarResultado()">Ver</button><label>Gasto<input id="gastoMonto" type="number" min="0" step="0.01" placeholder="Monto"/></label><label>Nota<input id="gastoNota" placeholder="Luz, gas, nómina"/></label><button class="sec" onclick="guardarGasto()">Registrar gasto</button></div><div id="resTabla"></div>`]
   };
   const item = forms[nombre];
   if(!item) return;
@@ -4809,6 +6293,7 @@ async function pintarForm(nombre){
   if(nombre==="ncf") await pintarNcf();
   if(nombre==="promo") await pintarPromos();
   if(nombre==="inventario") await cargarInventario();
+  if(nombre==="combos") await cargarCombos();
   if(nombre==="historial") await cargarHistorial();
   if(nombre==="kardex") await cargarKardex();
   if(nombre==="cotizaciones") await cargarCotizaciones();
@@ -4820,6 +6305,8 @@ async function pintarForm(nombre){
   if(nombre==="terminales") await cargarTerminales();
   if(nombre==="usuarios") await cargarUsuarios();
   if(nombre==="empresa") await cargarEmpresa();
+  if(nombre==="porpagar") await pintarPorPagar();
+  if(nombre==="resultado") await pintarResultado();
   if(nombre==="seguimiento") await cargarSeguimiento();
   if(nombre==="compra"){ lineasCompra = []; await cargarCompras(); }
   if(nombre==="tr") await cargarBodegas();
@@ -4969,7 +6456,7 @@ async function imprimirCierre(id){
 }
 function abrirTurno(){
   window._turnoId = null;
-  abrirModal("Abrir turno", `<div class="form"><label>Nombre<input id="cajaNombre" value="Caja 1"/></label><label>Fondo<input id="cajaFondo" type="number" step="0.01" value="0"/></label><button id="btnCajaAbrir" onclick="guardarCaja()">Abrir turno</button></div>`);
+  abrirModal("Abrir turno", `<div class="form"><label>Cajero<input value="${String(window._usuario || "").replaceAll("&","&amp;").replaceAll("<","&lt;")}" readonly/></label><label>Nombre de la caja<input id="cajaNombre" value="Caja 1"/></label><label>Caja chica<input id="cajaFondo" type="number" min="0" step="0.01" placeholder="Efectivo para el vuelto"/></label><button id="btnCajaAbrir" onclick="guardarCaja()">Abrir turno</button></div>`);
 }
 function editarTurno(){
   const a = window._cajaPanel && window._cajaPanel.abierta;
@@ -4996,12 +6483,17 @@ function editarCierre(id){
   btnCerrar.textContent = "Guardar cambios";
 }
 async function guardarCaja(){
+  if (cajaFondo.value.trim() === "" || Number.isNaN(Number(cajaFondo.value)) || Number(cajaFondo.value) < 0) {
+    errorModal({message:"Indica la caja chica. Si abres sin efectivo, escribe 0."});
+    return;
+  }
   try {
     const editando = window._turnoId;
+    const body = {nombre: cajaNombre.value, fondo: Number(cajaFondo.value)};
     if (editando) {
-      await api("/api/caja/turno/" + window._turnoId, {method:"POST", body: JSON.stringify({nombre: cajaNombre.value, fondo: Number(cajaFondo.value||0)})});
+      await api("/api/caja/turno/" + window._turnoId, {method:"POST", body: JSON.stringify(body)});
     } else {
-      await api("/api/caja/abrir", {method:"POST", body: JSON.stringify({nombre: cajaNombre.value, fondo: Number(cajaFondo.value||0)})});
+      await api("/api/caja/abrir", {method:"POST", body: JSON.stringify(body)});
     }
     window._turnoId = null;
     okModal(editando ? "Turno actualizado." : "Turno abierto.");
@@ -5094,6 +6586,78 @@ async function guardarCompra(){
     productosCache = [];
     await cargarCompras();
   } catch(e){ errorModal(e); }
+}
+function armarCombo(combo){
+  window._comboId = combo ? combo.id : null;
+  window._lineasCombo = combo ? combo.lineas.map(l => ({producto_id: l.producto_id, nombre: l.nombre, cantidad: l.cantidad})) : [];
+  abrirModal(combo ? "Editar combo" : "Armar combo", `<div class="form"><label class="wide">Nombre<input id="comboNom" placeholder="Cuba libre, cubetazo, mescla"/></label><label>Precio del combo<input id="comboPrecio" type="number" min="0" step="0.01" value="${combo ? combo.precio : ""}"/></label></div><div class="form"><label>Producto<select id="comboProd">${window._optsProd || ""}</select></label><label>Cantidad<input id="comboCant" type="number" min="1" step="1" value="1"/></label><button class="sec" type="button" onclick="agregarLineaCombo()">Agregar al combo</button></div><div id="comboLineas"></div><div class="form" style="margin-top:12px"><button type="button" onclick="guardarCombo()">Guardar combo</button></div>`);
+  if (combo) document.getElementById("comboNom").value = combo.nombre;
+  pintarLineasCombo();
+}
+function agregarLineaCombo(){
+  const sel = document.getElementById("comboProd");
+  const cant = Number((document.getElementById("comboCant") || {}).value || 0);
+  if (!sel || !sel.value || cant <= 0) return;
+  const previa = window._lineasCombo.find(l => l.producto_id === Number(sel.value));
+  if (previa) previa.cantidad += cant;
+  else window._lineasCombo.push({producto_id: Number(sel.value), nombre: sel.selectedOptions[0].textContent, cantidad: cant});
+  pintarLineasCombo();
+}
+function quitarLineaCombo(i){
+  window._lineasCombo.splice(i, 1);
+  pintarLineasCombo();
+}
+function pintarLineasCombo(){
+  const root = document.getElementById("comboLineas");
+  if (!root) return;
+  root.innerHTML = tabla(["Producto","Cantidad",""], (window._lineasCombo || []).map((l, i) => [
+    escDash(l.nombre), String(l.cantidad), `<button class="sec" type="button" onclick="quitarLineaCombo(${i})">Quitar</button>`
+  ]), "Agrega el ron y la gaseosa, o los productos que lleve.");
+}
+async function guardarCombo(){
+  try {
+    const body = {
+      nombre: (document.getElementById("comboNom") || {}).value || "",
+      precio: Number((document.getElementById("comboPrecio") || {}).value || 0),
+      lineas: (window._lineasCombo || []).map(l => ({producto_id: l.producto_id, cantidad: l.cantidad}))
+    };
+    const url = window._comboId ? "/api/combos/" + window._comboId : "/api/combos";
+    await api(url, {method:"POST", body: JSON.stringify(body)});
+    cerrarModal();
+    okModal(window._comboId ? "Combo actualizado." : "Combo creado. Ya sale en el mostrador y en la tablet.");
+    await cargarCombos();
+  } catch(e) { errorModal(e); }
+}
+async function cargarCombos(){
+  const data = await api("/api/combos");
+  window._combosAdmin = data.combos || [];
+  const root = document.getElementById("comboTabla");
+  const esp = document.getElementById("espTabla");
+  if (root) root.innerHTML = tabla(["Combo","Lleva","Precio",""], window._combosAdmin.filter(c => c.activo).map(c => [
+    escDash(c.nombre), escDash(c.descripcion), money(c.precio),
+    `<button class="sec" onclick="editarCombo(${c.id})">Editar</button> <button class="sec" onclick="quitarCombo(${c.id})">Quitar</button>`
+  ]), "Todavía no hay combos.");
+  if (esp) esp.innerHTML = tabla(["Especial","Producto","Tipo"], (data.especiales || []).map(e => [
+    escDash(e.nombre), escDash(e.producto), e.tipo
+  ]), "Sin 2x1 ni 3x2.");
+}
+function editarCombo(id){
+  const combo = (window._combosAdmin || []).find(c => c.id === id);
+  if (combo) armarCombo(combo);
+}
+async function quitarCombo(id){
+  await api("/api/combos/" + id + "/quitar", {method:"POST"});
+  await cargarCombos();
+}
+async function crearEspecial(){
+  try {
+    await api("/api/especiales", {method:"POST", body: JSON.stringify({
+      producto_id: Number((document.getElementById("espProd") || {}).value || 0),
+      tipo: (document.getElementById("espTipo") || {}).value || "2x1"
+    })});
+    okModal("El especial ya se aplica al cobrar ese producto.");
+    await cargarCombos();
+  } catch(e) { errorModal(e); }
 }
 function formPromo(){
   return `<div class="form"><label>Nombre<input id="promoNom"/></label><label>Tipo<select id="promoTipo"><option>porcentaje</option><option>fijo</option><option>2x1</option><option>3x2</option></select></label><label>Valor<input id="promoVal" type="number" step="0.01" value="10"/></label><label>Producto<select id="promoProd">${window._optsProd || ""}</select></label><label>Estado<select id="promoActiva"><option value="1">Activa</option><option value="0">Inactiva</option></select></label><button id="btnPromo" onclick="guardarPromo()">Crear promoción</button></div>`;
@@ -5288,12 +6852,32 @@ async function cargarInventario(){
   const x = window._descuentos || {p2:2, p3:5, p4:10};
   invTabla.innerHTML = tabla(["","Producto","","Original","Mínimo", x.p2+"%", x.p3+"%", x.p4+"%", "Stock","Código","Bodega","Categoría"], window._prods.map(p => [
     `<input class="etiq" type="checkbox" value="${p.id}"/>`, escDash(p.nombre),
-    `<button class="sec" onclick="editarProducto(${p.id})">Editar</button>`,
+    `<button class="sec" onclick="editarProducto(${p.id})">Editar</button> <button class="sec" onclick="extrasProducto(${p.id})">Extras</button>`,
     money(p.precio_original), money(p.precio), money(precioNivel(p.precio_2, p.precio, x.p2)), money(precioNivel(p.precio_3, p.precio, x.p3)), money(precioNivel(p.precio_4, p.precio, x.p4)),
     p.stock, escDash(p.codigo || "—"), escDash(p.bodega), escDash(p.categoria || "—")
   ]));
   if (document.getElementById("invPrecio")) invPrecio.oninput = recalcularPreciosMayor;
   [descP2, descP3, descP4].forEach(el => { if (el) el.oninput = recalcularPreciosMayor; });
+}
+function extrasProducto(id){
+  const p = (window._prods || []).find(x => x.id === id);
+  if (!p) return;
+  const lista = (p.extras || []).map(e => `<li>${escDash(e.nombre)} · ${money(e.precio)} <button class="sec" type="button" onclick="quitarExtra(${e.id}, ${id})">Quitar</button></li>`).join("");
+  abrirModal("Extras de " + p.nombre, `<ul>${lista || "<li>Sin extras</li>"}</ul><div class="form"><label>Nombre<input id="extraNombre"/></label><label>Precio<input id="extraPrecio" type="number" min="0" step="0.01" value="0"/></label><button type="button" onclick="agregarExtra(${id})">Agregar</button></div>`);
+}
+async function agregarExtra(id){
+  await api("/api/modificadores", {method:"POST", body: JSON.stringify({
+    producto_id: id,
+    nombre: (document.getElementById("extraNombre") || {}).value || "",
+    precio: Number((document.getElementById("extraPrecio") || {}).value || 0)
+  })});
+  await cargarInventario();
+  extrasProducto(id);
+}
+async function quitarExtra(extraId, productoId){
+  await api("/api/modificadores/" + extraId, {method:"DELETE"});
+  await cargarInventario();
+  extrasProducto(productoId);
 }
 function editarProducto(id){
   const p = (window._prods || []).find(x => x.id === id);
@@ -5802,9 +7386,84 @@ async function registrarAbono(id){
     await cargarCobros();
   } catch(e){ errorModal(e); }
 }
+function papelTicket(){
+  const ancho = (document.getElementById("anchoTicket") || {}).value === "58" ? "58" : "80";
+  let tag = document.getElementById("papelTicket");
+  if (!tag) {
+    tag = document.createElement("style");
+    tag.id = "papelTicket";
+    document.head.appendChild(tag);
+  }
+  tag.textContent = `@page{size:${ancho}mm auto;margin:2mm}`;
+  recibo.style.width = ancho + "mm";
+  recibo.className = ancho === "58" ? "angosto" : "";
+  return ancho;
+}
+function fechaTicket(valor){
+  const m = String(valor || "").match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})/);
+  if (m) return m[3] + "/" + m[2] + "/" + m[1] + " " + m[4] + ":" + m[5];
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return p(d.getDate()) + "/" + p(d.getMonth() + 1) + "/" + d.getFullYear() + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function notaTicket(data){
+  let nota = String(data.observaciones || "").trim();
+  (data.pagos || []).forEach(p => {
+    const marca = p.referencia ? "Tarjeta " + p.referencia : "";
+    if (marca && nota.endsWith(marca)) nota = nota.slice(0, -marca.length).trim();
+  });
+  return nota;
+}
+function numTicket(n){
+  return Number(n || 0).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function cabezaTicket(emp){
+  return `<header class="centro"><strong class="local">${escDash(emp.nombre || "Ticket")}</strong>`
+    + (emp.direccion ? `<span>${escDash(emp.direccion)}</span>` : "")
+    + (emp.telefono ? `<span>Tel. ${escDash(emp.telefono)}</span>` : "")
+    + (emp.rnc ? `<span>RNC ${escDash(emp.rnc)}</span>` : "")
+    + `</header>`;
+}
+function pieTicket(){
+  return `<hr class="corte"><p class="centro pie">GRACIAS POR SU VISITA</p>`;
+}
+function filaTicket(izq, der, clase){
+  return `<div class="fila${clase ? " " + clase : ""}"><span class="nom">${izq}</span><span class="din">${der}</span></div>`;
+}
+function datosMesa(nota){
+  const partes = String(nota || "").split("·").map(s => s.trim()).filter(Boolean);
+  const mesaParte = partes.find(p => /^mesa\\b/i.test(p));
+  if (!mesaParte) return {mesa: "", codigo: "", camarero: "", nota: String(nota || "").trim()};
+  const mesa = mesaParte.replace(/^mesa\\s*/i, "");
+  const codigo = partes.find(p => /^C\\d+/i.test(p)) || "";
+  const camarero = partes.find(p => p !== mesaParte && p !== codigo) || "";
+  return {mesa, codigo, camarero, nota: ""};
+}
+function esCreditoFiscal(data){
+  if (data.comprobante) return data.comprobante === "credito_fiscal";
+  const ncf = String(data.ncf || (data.ecf && data.ecf.encf) || "");
+  return ncf.startsWith("B01") || ncf.startsWith("E31");
+}
+function lineasTicket(data){
+  return (data.lineas || []).map(l => {
+    const cant = Number(l.cantidad);
+    const cantTxt = Number.isInteger(cant) ? String(cant) : cant.toFixed(2);
+    const precio = l.precio != null ? numTicket(l.precio) : "";
+    return `<div class="cols3"><span>${cantTxt} ${escDash(l.nombre)}</span><span class="d">${precio}</span><span class="d">${numTicket(l.total)}</span></div>`;
+  }).join("");
+}
 function imprimirReciboAbono(r){
   const emp = window._empresa || {};
-  recibo.innerHTML = `<h2>${escDash(emp.nombre || "Recibo")}</h2><p>Recibo de abono<br>${new Date().toLocaleString("es-DO")}</p><p>${escDash(r.numero)}<br>${escDash(r.cliente || "")}</p><p>Abono <b>${money(r.abonado)}</b><br>Queda ${money(Math.max(0, r.pendiente))}${r.cambio > 0 ? "<br>Cambio " + money(r.cambio) : ""}</p>`;
+  papelTicket();
+  recibo.innerHTML = `<div class="bau">${cabezaTicket(emp)}<p class="centro"><b>RECIBO DE ABONO</b></p><hr class="corte">`
+    + filaTicket("Fecha", fechaTicket(""))
+    + filaTicket("Factura", escDash(r.numero || ""))
+    + filaTicket("Cliente", escDash(r.cliente || ""))
+    + `<hr class="corte">`
+    + filaTicket("Abono", money(r.abonado), "total")
+    + filaTicket("Queda", money(Math.max(0, r.pendiente || 0)))
+    + (Number(r.cambio || 0) > 0 ? filaTicket("Cambio", money(r.cambio)) : "")
+    + pieTicket() + `</div>`;
   window.print();
 }
 async function cargarClientes(){
@@ -5864,9 +7523,14 @@ async function guardarCliente(){
     cargarClientesVenta();
   } catch(e){ errorModal(e); }
 }
+function usarRolMesero(){
+  const es = usuRol.value === "mesero";
+  usuMods.style.display = es ? "none" : "";
+  usuNotaMesero.hidden = !es;
+}
 function formUsuario(marcar){
   const mods = (window._modulosLista || []).map(m => `<label><input type="checkbox" class="mod" value="${m}" ${marcar ? (marcar.includes(m) ? "checked" : "") : (m==="mostrador" ? "checked" : "")}/> ${m}</label>`).join("");
-  return `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Obligatoria al crear"/></label><label>Rol<select id="usuRol"><option>empleado</option><option>user</option><option>admin</option></select></label><div class="wide" id="usuMods">${mods}</div><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div>`;
+  return `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Obligatoria al crear"/></label><label>Rol<select id="usuRol" onchange="usarRolMesero()"><option>empleado</option><option>mesero</option><option>user</option><option>admin</option></select></label><p class="hint" id="usuNotaMesero" hidden>El mesero solo toma pedidos en la tablet. No abre caja ni hace cuadre. Lo que pide lo factura la cajera con el código, en la caja que esté abierta.</p><div class="wide" id="usuMods">${mods}</div><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div>`;
 }
 function nuevoUsuario(){
   window._usuEdit = false;
@@ -5891,6 +7555,7 @@ function editarUsuario(i){
   usuPass.value = "";
   usuPass.placeholder = "Vacía para no cambiarla";
   usuRol.value = u.role;
+  usarRolMesero();
   btnUsu.textContent = "Guardar cambios";
 }
 async function guardarUsuario(){
@@ -6034,6 +7699,7 @@ async function cargarEmpresa(){
   const d = await api("/api/empresa");
   empNom.value = d.nombre || "";
   empDir.value = d.direccion || "";
+  empTel.value = d.telefono || "";
   empRnc.value = d.rnc || "";
   smtpHost.value = d.smtp_host || "";
   smtpPort.value = d.smtp_port || "587";
@@ -6045,7 +7711,7 @@ async function cargarEmpresa(){
 async function guardarEmpresa(){
   try {
     await api("/api/empresa", {method:"POST", body: JSON.stringify({
-      nombre: empNom.value, direccion: empDir.value, rnc: empRnc.value,
+      nombre: empNom.value, direccion: empDir.value, telefono: empTel.value, rnc: empRnc.value,
       smtp_host: smtpHost.value, smtp_port: smtpPort.value, smtp_user: smtpUser.value,
       smtp_password: smtpPass.value, smtp_from: smtpFrom.value,
       precios_incluyen_itbis: empItbisIncl.checked
@@ -6080,7 +7746,22 @@ function repintarPlaca(data){
   ], {duration:2600, easing:"cubic-bezier(0.77, 0, 0.175, 1)"});
 }
 async function cobrar(){
+  if (!window._caja) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Abre la caja antes de vender.";
+    return;
+  }
   msg.textContent = "";
+  const pagos = pagosActuales();
+  const tarjeta = pagos.find(p => p.codigo === "tarjeta" && p.monto > 0);
+  const auth = ((document.getElementById("authTarjeta") || {}).value || "").replace(/[^a-z0-9]/gi, "");
+  if (tarjeta && auth.length < 4) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Cobra " + money(tarjeta.monto) + " en la terminal del banco y escribe la autorización del voucher.";
+    return;
+  }
+  const hayEfectivo = pagos.some(p => p.caja && p.monto > 0);
+  if (hayEfectivo) await asegurarPuertoCajon();
   const boton = document.getElementById("btnCobrar");
   boton.classList.add("cobrando");
   boton.disabled = true;
@@ -6088,7 +7769,7 @@ async function cobrar(){
     const nivel = Number(lista.value);
     const nombres = nombresLista();
     const payload = {
-      items: cart.map(l=>({id:l.id, cantidad:l.cantidad, nivel, combo:!!l.combo})),
+      items: cart.map(l=>({id:l.id, cantidad:l.cantidad, nivel, combo:!!l.combo, nota: l.nota || "", extras: (l.opciones||[]).filter(o => o.on).map(o => o.id)})),
       pagos: pagosActuales().filter(p => p.monto>0).map(p => ({codigo:p.codigo, monto:p.monto})),
       lista: nombres[nivel], descuento: Number(desc.value||0),
       cliente_id: cliVenta.value ? Number(cliVenta.value) : null,
@@ -6097,7 +7778,10 @@ async function cobrar(){
       vendedor_id: vendVenta.value ? Number(vendVenta.value) : null,
       observaciones: obsVenta.value,
       terminal_id: termVenta.value ? Number(termVenta.value) : null,
-      id_local: idLocal()
+      id_local: idLocal(),
+      propina: !!(document.getElementById("propina10") && document.getElementById("propina10").checked),
+      autorizacion: (document.getElementById("authTarjeta") || {}).value || "",
+      usar_puntos: (document.getElementById("usarPuntos") && document.getElementById("usarPuntos").checked && window._cliVenta) ? Number(window._cliVenta.puntos || 0) : 0
     };
     let data;
     try {
@@ -6120,6 +7804,14 @@ async function cobrar(){
       ? `${data.numero} fiado a ${data.cliente}: queda ${money(data.pendiente)}, vence ${data.vencimiento}.`
       : data.numero + (data.ncf? " · "+data.ncf : "") + " · " + money(data.total) + " · cambio " + money(data.cambio);
     if (data.provisional) return;
+    if (hayEfectivo) await pulsarCajon();
+    if (window._conduceId && data.id) {
+      try { await api("/api/conduces/" + window._conduceId + "/facturado", {method:"POST", body: JSON.stringify({factura_id: data.id})}); } catch (err) {}
+      window._conduceId = null;
+      const cajaCodigo = document.getElementById("codConduce");
+      if (cajaCodigo) cajaCodigo.value = "";
+      await cargarColaConduces();
+    }
     await cargar();
     if (cliVenta.value) actualizarClienteVenta();
   } catch(e){
@@ -6130,21 +7822,88 @@ async function cobrar(){
 }
 q.addEventListener("keydown", ev=>{ if(ev.key==="Enter") { clearTimeout(window._qT); cargar(); } });
 q.addEventListener("input", ()=>{ clearTimeout(window._qT); window._qT = setTimeout(cargar, 250); });
+function imprimirPrecuenta(){
+  const van = cart.filter(l => l.cobrar !== false);
+  if (!van.length) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "El ticket está vacío.";
+    return;
+  }
+  const t = totalTicket();
+  const cli = (document.getElementById("cliVenta") || {}).selectedOptions;
+  const vend = (document.getElementById("vendVenta") || {}).selectedOptions;
+  imprimirRecibo({
+    precuenta: true,
+    fecha: "",
+    observaciones: (document.getElementById("obsVenta") || {}).value || "",
+    cliente: cli && cli[0] ? cli[0].textContent : "Consumidor final",
+    usuario: window._usuario || "",
+    vendedor: vend && vend[0] && vend[0].value ? vend[0].textContent : "",
+    subtotal: t.consumo, itbis: t.itbis, propina: t.propina, descuento: t.rebaja,
+    a_cobrar: t.aCobrar, total: t.aCobrar,
+    lineas: van.map(l => ({
+      nombre: l.nombre + (l.nota ? " · " + l.nota : ""),
+      cantidad: l.cantidad, precio: l.precio,
+      total: Math.round(l.precio * l.cantidad * 100) / 100
+    }))
+  });
+}
 async function imprimirRecibo(data){
   const emp = window._empresa || {};
+  papelTicket();
+  const lugar = datosMesa(notaTicket(data));
+  const propina = Number(data.propina || 0);
+  const aCobrar = data.a_cobrar != null ? Number(data.a_cobrar) : Number(data.total || 0);
+  const credito = !data.precuenta && esCreditoFiscal(data);
+  const titulo = data.precuenta ? "PRE-CUENTA" : (credito ? "FACTURA PARA CREDITO FISCAL" : "FACTURA");
+  const atendio = data.vendedor || lugar.camarero || data.usuario || window._usuario || "";
   let bloqueEcf = "";
   if (data.ecf && data.ecf.encf) {
     let qr = "";
     if (data.ecf.codigo_seguridad && data.id) {
       try { qr = await (await fetch("/api/ecf/qr/" + data.id)).text(); } catch(e) { qr = ""; }
     }
-    bloqueEcf = `<p><b>e-NCF ${escDash(data.ecf.encf)}</b>${data.ecf.codigo_seguridad ? `<br>Código de seguridad: ${escDash(data.ecf.codigo_seguridad)}<br>Fecha de firma: ${escDash(data.ecf.fecha_firma)}` : "<br>Comprobante electrónico pendiente de firma"}</p>${qr ? `<div class="qr">${qr}</div>` : ""}`;
+    bloqueEcf = `<p class="centro"><b>e-NCF ${escDash(data.ecf.encf)}</b>${data.ecf.codigo_seguridad ? `<br>Cód. seguridad ${escDash(data.ecf.codigo_seguridad)}<br>${escDash(data.ecf.fecha_firma || "")}` : "<br>Pendiente de firma"}</p>${qr ? `<div class="qr">${qr}</div>` : ""}`;
   }
-  const ancho = (document.getElementById("anchoTicket") || {}).value || "80";
-  recibo.style.width = ancho === "58" ? "58mm" : "80mm";
-  const lineas = (data.lineas||[]).map(l => `<tr><td>${l.cantidad} ${l.nombre}</td><td>${money(l.total)}</td></tr>`).join("");
-  if (data.provisional) bloqueEcf = `<p><b>Venta sin conexión</b><br>Ref. ${escDash(data.numero)}<br>El comprobante fiscal se emite al sincronizar.</p>` + bloqueEcf;
-  recibo.innerHTML = `<h2>${emp.nombre || "Factura"}</h2><p>${emp.direccion || ""}<br>RNC ${emp.rnc || "—"}</p><p>${data.numero}<br>${data.ncf || ""}<br>${data.cliente || ""}</p><table>${lineas}</table><p>ITBIS ${money(data.itbis)}<br><b>Total ${money(data.total)}</b><br>Cambio ${money(data.cambio||0)}${Number(data.pendiente||0) > 0 ? `<br><b>Pendiente ${money(data.pendiente)}</b><br>Vence ${data.vencimiento || ""}` : ""}</p>${bloqueEcf}`;
+  if (data.provisional) bloqueEcf = `<p class="centro"><b>VENTA SIN CONEXIÓN</b><br>El comprobante fiscal se emite al sincronizar.</p>` + bloqueEcf;
+  const meta = [
+    lugar.mesa ? `<span class="mesa">MESA ${escDash(lugar.mesa)}</span>` : "",
+    filaTicket("Fecha", fechaTicket(data.fecha)),
+    data.precuenta ? "" : filaTicket(credito ? "Factura" : "Ticket", escDash(data.numero || "")),
+    lugar.codigo ? filaTicket("Pedido", escDash(lugar.codigo)) : "",
+    data.ncf ? filaTicket("NCF", escDash(data.ncf)) : "",
+    filaTicket("Cliente", escDash(data.cliente || "Consumidor final")),
+    credito && data.documento ? filaTicket("RNC", escDash(data.documento)) : "",
+    lugar.nota ? `<div class="sub">${escDash(lugar.nota)}</div>` : ""
+  ].join("");
+  const cuentas = [
+    Number(data.descuento || 0) > 0 ? filaTicket("Descuento", numTicket(data.descuento)) : "",
+    filaTicket("Sub Total", numTicket(data.subtotal)),
+    filaTicket("ITBIS 18%", numTicket(data.itbis)),
+    propina > 0 ? filaTicket("10% de ley", numTicket(propina)) : "",
+    Number(data.puntos || 0) > 0 ? filaTicket("Puntos usados", String(data.puntos)) : "",
+    filaTicket("TOTAL", "RD$ " + numTicket(aCobrar), "total")
+  ].join("");
+  let impuestos = "";
+  if (credito) {
+    const gravada = Number(data.subtotal || 0);
+    impuestos = `<hr class="corte"><div class="cols3 ley"><span>Impuesto</span><span class="d">B.IMP.</span><span class="d">IMPORTE</span></div>`
+      + `<div class="cols3"><span>0.00%</span><span class="d">${numTicket(0)}</span><span class="d">${numTicket(0)}</span></div>`
+      + `<div class="cols3"><span>18.00%</span><span class="d">${numTicket(gravada)}</span><span class="d">${numTicket(data.itbis)}</span></div>`;
+  }
+  const pagos = data.precuenta ? "" : (data.pagos || []).map(p => {
+    const aut = p.referencia ? `<div class="sub">Aut. ${escDash(p.referencia)}</div>` : "";
+    return `<div class="item">${filaTicket(escDash(p.nombre || p.codigo || "Pago"), numTicket(p.monto))}${aut}</div>`;
+  }).join("");
+  const vuelto = !data.precuenta && data.cambio != null
+    ? filaTicket(credito ? "Devuelta" : "Cambio", numTicket(data.cambio)) : "";
+  const debe = Number(data.pendiente || 0) > 0.009
+    ? filaTicket("Pendiente", numTicket(data.pendiente)) + (data.vencimiento ? `<div class="sub">Vence ${escDash(data.vencimiento)}</div>` : "")
+    : "";
+  const firma = data.precuenta
+    ? (lugar.camarero ? filaTicket("Camarero", escDash(lugar.camarero)) : "")
+    : (atendio ? `<p class="centro">Le atendió: ${escDash(String(atendio).toUpperCase())}</p>` : "");
+  recibo.innerHTML = `<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte"><div class="cols3 ley"><span>UDS DESCRIPCION</span><span class="d">PRECIO</span><span class="d">IMPORTE</span></div>${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`;
   window.print();
 }
 async function cargarMetodos(){
@@ -6189,6 +7948,67 @@ async function apartar(){
     await cargarEsperas();
   } catch(e){ errorModal(e); }
 }
+async function verConduce(codigo){
+  if (!window._caja) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Abre la caja antes de traer el pedido del mesero.";
+    return;
+  }
+  const caja = document.getElementById("codConduce");
+  const clave = (codigo || (caja && caja.value) || "").trim();
+  if (!clave) return;
+  try {
+    const d = await api("/api/conduces/codigo/" + encodeURIComponent(clave));
+    if (d.estado !== "pendiente") throw new Error("Ese código ya se facturó" + (d.factura ? ": " + d.factura : "") + ".");
+    if (cart.length && window._conduceId !== d.id) {
+      msg.style.color = "var(--danger)";
+      msg.textContent = "Este ticket ya tiene productos. Déjalo en cero antes de traer " + d.codigo + " · " + d.mesa + ".";
+      return;
+    }
+    cart.length = 0;
+    (d.lineas || []).forEach(l => cart.push({
+      id: l.id, nombre: (l.extras && l.extras.length) ? String(l.nombre).split(" · ")[0] : l.nombre, precio: Number(l.precio), base: Number(l.precio_base ?? l.precio), cantidad: Number(l.cantidad),
+      itbis: l.itbis !== false, combo: !!l.combo, nota: l.nota || "", cobrar: true,
+      opciones: (l.extras || []).map(e => ({id:e.id, nombre:e.nombre, precio:Number(e.precio || 0), on:true}))
+    }));
+    window._conduceId = d.id;
+    if (document.getElementById("lista")) lista.value = "1";
+    obsVenta.value = d.codigo + " · " + d.mesa + (d.usuario ? " · " + d.usuario : "");
+    if (caja) caja.value = d.codigo;
+    pintar();
+    msg.style.color = "var(--ok)";
+    msg.textContent = d.codigo + " de " + (d.usuario || "el mesero") + " · " + d.mesa + ". Cobra en esta caja para facturar.";
+    cargarColaConduces();
+  } catch(e) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = e.message;
+  }
+}
+function nombreCortoCaja(usuario){
+  const t = String(usuario || "");
+  const i = t.indexOf("@");
+  return i > 0 ? t.slice(0, i) : t;
+}
+async function cargarColaConduces(){
+  const root = document.getElementById("colaConduces");
+  if (!root || !permisos.includes("mostrador")) return;
+  try {
+    const d = await api("/api/conduces?cola=1");
+    const items = d.items || [];
+    if (!items.length) {
+      root.innerHTML = `<h4>Pedidos de mesero</h4><p class="vacio">Ningún pedido por cobrar.</p>`;
+      return;
+    }
+    root.innerHTML = `<h4>Pedidos de mesero</h4>` + items.map(x => {
+      const activo = window._conduceId && x.id === window._conduceId ? " on" : "";
+      const quien = escDash(nombreCortoCaja(x.usuario) || "Mesero");
+      const codigo = encodeURIComponent(x.codigo || "");
+      return `<button type="button" class="sec${activo}" onclick="verConduce(decodeURIComponent('${codigo}'))"><span><b>${escDash(x.mesa)}</b> · ${escDash(x.codigo)}<small>${quien}</small></span><span class="num">${money(x.total)}</span></button>`;
+    }).join("");
+  } catch (e) {
+    root.innerHTML = "";
+  }
+}
 async function cargarEsperas(){
   try {
     const d = await api("/api/espera");
@@ -6209,7 +8029,7 @@ async function guardarCotizacion(){
     const nivel = Number(lista.value);
     const nombres = nombresLista();
     const data = await api("/api/cotizaciones", {method:"POST", body: JSON.stringify({
-      items: cart.map(l=>({id:l.id, cantidad:l.cantidad, nivel, combo:!!l.combo})),
+      items: cart.map(l=>({id:l.id, cantidad:l.cantidad, nivel, combo:!!l.combo, nota: l.nota || ""})),
       lista: nombres[nivel], cliente_id: cliVenta.value ? Number(cliVenta.value) : null
     })});
     cart.length = 0; pintar();
@@ -6217,6 +8037,806 @@ async function guardarCotizacion(){
     msg.textContent = "Cotización " + data.numero;
   } catch(e){ msg.style.color="var(--danger)"; msg.textContent = e.message; }
 }
+</script>
+</body>
+</html>
+"""
+
+
+TABLET_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<title>Pedidos · tablet</title>
+<script>document.documentElement.dataset.tema = localStorage.getItem("tema") || (matchMedia("(prefers-color-scheme: light)").matches ? "dia" : "noche");</script>
+<style>
+  @font-face {
+    font-family: "Archivo";
+    src: url("/estaticos/fonts/archivo-wdth.woff2") format("woff2");
+    font-weight: 100 900; font-stretch: 62% 125%; font-style: normal; font-display: swap;
+  }
+  :root {
+    color-scheme: dark;
+    --bg:#0e0d0c;
+    --card:#181716;
+    --raised:#242220;
+    --ink:#f3f2f0;
+    --muted:#b4b0a8;
+    --faint:#97938b;
+    --line:#262422;
+    --accent:#ffd23f;
+    --on-accent:#1f1803;
+    --accent-ink:#ffd23f;
+    --tint:#2b2414;
+    --tint-ink:#ffd23f;
+    --mal:#ff6b6b;
+    --header:rgba(14,13,12,.94);
+    --velo:rgba(5,5,4,.72);
+    --chair:#d9d3c8;
+    --chair-mia:#e6c35c;
+    --back:#f4efe8;
+    --seat:#9c968c;
+    --back-mia:#ffe7a8;
+    --seat-mia:#c49a3a;
+    --shadow:none;
+  }
+  :root[data-tema="dia"] {
+    color-scheme: light;
+    --bg:#f1f0ed;
+    --card:#ffffff;
+    --raised:#f4f3f0;
+    --ink:#151412;
+    --muted:#5c5953;
+    --faint:#6b6862;
+    --line:#e4e2de;
+    --accent:#ffd23f;
+    --on-accent:#1f1803;
+    --accent-ink:#b7791f;
+    --tint:#fff6d6;
+    --tint-ink:#1f1803;
+    --mal:#c4242a;
+    --header:rgba(241,240,237,.94);
+    --velo:rgba(21,20,18,.38);
+    --chair:#4a453c;
+    --chair-mia:#7a5c12;
+    --back:#3c362e;
+    --seat:#c2b8ac;
+    --back-mia:#5c4810;
+    --seat-mia:#f0d48a;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:"Archivo", "Segoe UI", sans-serif; }
+  button, input { font: inherit; }
+  button { border:0; cursor:pointer; }
+  a { color: var(--accent-ink); }
+  #login {
+    max-width:420px; margin:8vh auto; padding:28px; display:grid; gap:14px;
+    background:var(--card); border:1px solid var(--line); border-radius:28px; box-shadow:var(--shadow);
+  }
+  #login h1 { margin:0; font-size:28px; }
+  #login p, .nota { color:var(--muted); margin:0; }
+  #login label { display:grid; gap:6px; font-size:13px; color:var(--muted); font-weight:700; }
+  #login input, .buscar input {
+    background:var(--raised); border:1px solid var(--line); border-radius:14px;
+    min-height:52px; padding:0 14px; color:var(--ink);
+  }
+  #login button, .principal {
+    background:var(--accent); color:var(--on-accent); border-radius:14px; min-height:52px;
+    font-weight:800; width:100%;
+  }
+  #login button:hover, .principal:hover { filter:brightness(1.06); }
+  .principal:disabled { opacity:.45; }
+  .ghost {
+    background:var(--raised); color:var(--ink); border:1px solid var(--line); border-radius:14px;
+    min-height:44px; padding:0 14px; font-weight:700;
+  }
+  #app { display:none; }
+  #app.on { display:block; min-height:100vh; }
+  header {
+    position:sticky; top:0; z-index:3; background:var(--header);
+    backdrop-filter:blur(10px); padding:14px 16px 8px; display:grid; gap:10px;
+  }
+  .fila { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .buscar { flex:1 1 220px; }
+  .marca { display:flex; align-items:center; gap:10px; min-width:0; }
+  .logo {
+    width:42px; height:42px; border-radius:14px; background:var(--accent); color:var(--on-accent);
+    display:grid; place-items:center; font-weight:800; flex:none;
+  }
+  .marca b { display:block; font-size:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .marca small, .pedido-head small { color:var(--muted); font-weight:700; }
+  .mesa-box {
+    display:flex; align-items:center; gap:8px; background:var(--card); border:1px solid var(--line); border-radius:16px;
+    padding:6px 12px; box-shadow:var(--shadow); min-width:148px;
+  }
+  .mesa-box span { font-size:12px; font-weight:800; color:var(--muted); letter-spacing:.04em; }
+  #mesa {
+    border:0; background:transparent; font-size:26px; font-weight:800; width:88px;
+    min-height:40px; color:var(--ink); padding:0;
+  }
+  #mesa::placeholder { color:var(--faint); }
+  .chip-fijo {
+    background:var(--accent); color:var(--on-accent); border-radius:999px;
+    padding:6px 10px; font-size:12px; font-weight:800;
+  }
+  .buscar { display:flex; }
+  .buscar input { flex:1; background:var(--card); box-shadow:var(--shadow); }
+  #mesas, #cats { display:flex; gap:8px; overflow:auto; padding-bottom:2px; scrollbar-width:none; }
+  #mesas { scroll-snap-type:x mandatory; padding:2px 2px 6px; }
+  #mesas::-webkit-scrollbar, #cats::-webkit-scrollbar { display:none; }
+  #mesas:empty { display:none; }
+  #mesas button, .cat {
+    flex:none; background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:16px; min-height:58px;
+    padding:8px 14px; box-shadow:var(--shadow); font-weight:800; text-align:left;
+  }
+  #mesas button { display:flex; flex-direction:column; justify-content:center; min-width:84px; line-height:1.15; scroll-snap-align:start; }
+  #mesas b { font-size:20px; line-height:1; }
+  #mesas small { font-size:11px; font-weight:700; color:var(--muted); }
+  #mesas button.on, .cat.on { background:var(--accent); color:var(--on-accent); border-color:transparent; }
+  #mesas button.on small, .cat.on small { color:rgba(31,24,3,.72); }
+  #mesas button.mas { min-width:72px; align-items:center; color:var(--muted); }
+  .cat { padding:8px 12px; }
+  .cat small { display:block; font-size:11px; font-weight:700; color:var(--muted); }
+  .agregar, .step button, #mesas button, .cat { transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1); }
+  .agregar:active, .step button:active, #mesas button:active, .cat:active { transform: scale(0.97); }
+  @media (prefers-reduced-motion: reduce) {
+    .agregar:active, .step button:active, #mesas button:active, .cat:active { transform: none; }
+  }
+  .carta { display:grid; gap:10px; align-content:start; padding:0 16px 110px; min-width:0; }
+  #grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:12px; }
+  .card {
+    background:var(--card); border-radius:20px; padding:10px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; gap:8px; border:1px solid var(--line); min-width:0;
+  }
+  .card.en { border-color:var(--accent); }
+  .foto { height:112px; border-radius:14px; background:var(--raised) center/cover no-repeat; }
+  .card b { font-size:15px; line-height:1.25; min-height:2.5em; }
+  .precio { color:var(--accent-ink); font-weight:800; }
+  .agregar, .step {
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    background:var(--accent); color:var(--on-accent); border-radius:12px; min-height:42px; font-weight:800;
+  }
+  .step { justify-content:space-between; padding:0 6px; }
+  .step button { background:transparent; color:var(--on-accent); min-width:36px; min-height:36px; font-size:20px; font-weight:800; }
+  .cuerpo { display:block; }
+  #pedido {
+    display:none; background:var(--card); z-index:6;
+  }
+  #pedido.on {
+    display:flex; flex-direction:column; position:fixed; left:0; right:0; bottom:0;
+    max-height:88vh; overflow:auto; border-radius:24px 24px 0 0; box-shadow:0 -12px 40px rgba(27,36,48,.16); padding:16px 16px 22px;
+  }
+  .pedido-head { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+  .pedido-head h2 { margin:0; font-size:22px; }
+  #lineas { overflow:auto; margin:8px 0; }
+  .linea { display:grid; grid-template-columns:46px minmax(0,1fr) auto; gap:8px; align-items:center; padding:10px 0; border-bottom:1px solid var(--line); }
+  .mini { width:46px; height:46px; border-radius:12px; background:var(--raised) center/cover no-repeat; }
+  .linea b { display:block; font-size:14px; }
+  .linea small { color:var(--muted); }
+  .cant { display:flex; align-items:center; gap:6px; }
+  .cant button { width:32px; height:32px; border-radius:10px; background:var(--tint); color:var(--tint-ink); font-weight:800; }
+  .vacio { color:var(--muted); padding:18px 0; }
+  .totales { display:grid; gap:6px; font-size:14px; margin:8px 0 12px; }
+  .totales div { display:flex; justify-content:space-between; color:var(--muted); }
+  .totales .grande { color:var(--ink); font-size:18px; font-weight:800; }
+  .listo { background:var(--tint); color:var(--tint-ink); border-radius:18px; padding:12px 14px; margin-bottom:8px; }
+  .codigo { font-size:40px; font-weight:800; letter-spacing:1px; color:var(--accent-ink); line-height:1; }
+  .msg { min-height:1.2em; color:var(--mal); margin:6px 0; font-size:14px; }
+  .acciones { display:grid; grid-template-columns:1fr 1fr; gap:8px; position:sticky; bottom:0; background:var(--card); padding-top:8px; }
+  .acciones .principal { grid-column:1 / -1; }
+  .barra {
+    position:fixed; left:12px; right:12px; bottom:12px; z-index:4; display:flex;
+    justify-content:space-between; align-items:center; background:var(--accent); color:var(--on-accent);
+    border-radius:16px; padding:14px 16px; font-weight:800;
+  }
+  .velo { position:fixed; inset:0; background:var(--velo); display:none; z-index:5; }
+  .velo.on { display:block; }
+  #slip { display:none; }
+  .pedir-mesa { position:fixed; inset:0; z-index:30; background:var(--bg); display:none; overflow:auto; padding:18px 16px 32px; }
+  .pedir-mesa.on { display:block; }
+  .salon { width:min(980px, 100%); margin:0 auto; display:grid; gap:16px; }
+  .salon-top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+  .salon-top h2 { margin:0; font-size:28px; line-height:1.1; }
+  .salon-top p { margin:6px 0 0; color:var(--muted); max-width:460px; }
+  .leyenda { display:flex; gap:12px; flex-wrap:wrap; font-size:13px; font-weight:700; color:var(--muted); }
+  .leyenda span { display:inline-flex; align-items:center; gap:6px; }
+  .dot { width:12px; height:12px; border-radius:4px; display:inline-block; background:var(--card); border:1px solid var(--line); }
+  .dot.mia { background:var(--accent); border-color:transparent; }
+  .dot.ocupada { background:var(--raised); border-color:transparent; }
+  .piso { display:grid; gap:14px; }
+  .grupo { background:transparent; border:0; border-radius:0; padding:2px 0 8px; }
+  .grupo h3 { margin:0 0 12px; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:700; }
+  .fila-mesas { display:flex; flex-wrap:wrap; gap:18px 14px; align-items:flex-end; }
+  button.mesa-dibujo {
+    background:transparent; color:var(--ink); padding:2px; min-height:0; border-radius:16px;
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+  }
+  button.mesa-dibujo:disabled { opacity:1; cursor:not-allowed; }
+  .cuerpo-mesa { display:flex; align-items:center; gap:2px; }
+  .lado { display:flex; justify-content:center; gap:6px; align-items:center; }
+  .lado.izq, .lado.der { flex-direction:column; }
+  .lado:empty { display:none; }
+  .silla { width:34px; height:40px; display:block; object-fit:contain; border:0; pointer-events:none; }
+  .lado.bot .silla { transform:rotate(180deg); }
+  .lado.izq .silla { transform:rotate(-90deg); }
+  .lado.der .silla { transform:rotate(90deg); }
+  .tablero {
+    background:var(--card); color:var(--ink); border:1px solid var(--line);
+    border-radius:18px; box-shadow:0 10px 22px rgba(21,20,18,.07);
+    display:grid; place-items:center; align-content:center; gap:2px; min-width:74px; min-height:64px; padding:8px 10px;
+  }
+  .tablero b { font-size:22px; line-height:1; }
+  .tablero small { font-size:11px; font-weight:700; color:var(--muted); max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .c2 .tablero { width:84px; height:72px; border-radius:22px; }
+  .c4 .tablero { width:112px; height:86px; border-radius:22px; }
+  .c8 .tablero { width:196px; height:92px; border-radius:26px; }
+  .c8 .lado.top, .c8 .lado.bot { width:196px; justify-content:space-between; }
+  .c12 .tablero { width:min(320px, 78vw); height:104px; border-radius:28px; }
+  .c12 .lado.top, .c12 .lado.bot { width:min(320px, 78vw); justify-content:space-between; }
+  .mesa-dibujo.ocupada { cursor:not-allowed; }
+  .c12 .tablero b { font-size:28px; }
+  .mesa-dibujo.mia .tablero { background:var(--accent); color:var(--on-accent); border-color:transparent; box-shadow:0 10px 22px rgba(180,140,20,.18); }
+  .mesa-dibujo.mia .tablero small { color:rgba(31,24,3,.72); }
+  .mesa-dibujo.ocupada .tablero { background:var(--raised); color:var(--faint); border-color:transparent; box-shadow:none; }
+  .mesa-dibujo.ocupada .tablero small { color:var(--faint); }
+  .mesa-dibujo.libre:active .tablero, .mesa-dibujo.mia:active .tablero { transform:scale(.98); }
+  @media (min-width:900px) {
+    .piso { grid-template-columns:1fr 1fr; align-items:start; }
+    .g2 { grid-column:1; grid-row:1; }
+    .g4 { grid-column:1; grid-row:2; }
+    .g8 { grid-column:2; grid-row:1; }
+    .g12 { grid-column:2; grid-row:2; }
+  }
+  @media (min-width:780px) {
+    header { padding:16px 16px 0; }
+    .cuerpo { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; padding:12px 16px 16px; align-items:start; }
+    .carta { padding:0; }
+    #grid { grid-template-columns:repeat(2, minmax(0,1fr)); }
+    #pedido, #pedido.on {
+      display:flex; flex-direction:column; position:sticky; top:16px; max-height:calc(100vh - 150px); overflow:auto;
+      border:1px solid var(--line); border-radius:24px; box-shadow:var(--shadow); padding:18px;
+    }
+    .barra, .velo, .cerrar-hoja { display:none !important; }
+  }
+  @media (min-width:1180px) {
+    .cuerpo { grid-template-columns:minmax(0,1fr) 360px; }
+    #grid { grid-template-columns:repeat(3, minmax(0,1fr)); }
+  }
+  @media print {
+    body * { visibility:hidden; }
+    #slip, #slip * { visibility:visible; }
+    #slip { display:block; position:absolute; left:0; top:0; width:80mm; color:#111; background:#fff; padding:12px; }
+  }
+</style>
+</head>
+<body>
+<form id="login" onsubmit="event.preventDefault(); entrar();">
+  <div class="marca"><span class="logo">M</span><div><b>Pedidos</b><small>Tablet de mesas</small></div></div>
+  <p>Solo el mesero. El pedido queda con un código y lo factura la cajera en la caja abierta. El mesero no cuadra.</p>
+  <label>Usuario<input id="user" autocomplete="username" required/></label>
+  <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required/></label>
+  <button type="submit">Entrar</button>
+  <p class="msg" id="loginMsg"></p>
+  <p class="nota"><a href="/">Volver a la caja</a></p>
+</form>
+<div id="app">
+  <header>
+    <div class="fila">
+      <div class="marca"><span class="logo">M</span><div><b id="marca">Pedidos</b><small id="quien">Mesas</small></div></div>
+      <button class="ghost" type="button" onclick="salir()">Salir</button>
+    </div>
+    <div class="fila">
+      <label class="mesa-box" onclick="preguntarMesa()"><span>MESA</span><input id="mesa" inputmode="numeric" placeholder="Elige" readonly autocomplete="off" aria-label="Número de mesa"/></label>
+      <span class="chip-fijo">En mesa</span>
+      <div class="buscar" style="flex:1"><input id="q" type="search" placeholder="Buscar producto" aria-label="Buscar producto"/></div>
+    </div>
+  </header>
+  <div class="cuerpo">
+    <div class="carta">
+      <div id="mesas"></div>
+      <div id="cats"></div>
+      <div id="grid"></div>
+    </div>
+    <aside id="pedido">
+      <div class="pedido-head">
+        <div><small>Pedido de la mesa</small><h2 id="tituloMesa">Mesa</h2></div>
+        <button class="ghost cerrar-hoja" type="button" onclick="cerrarHoja()">Cerrar</button>
+      </div>
+      <div id="pedidoAviso"></div>
+      <div id="lineas"></div>
+      <div class="totales" id="totales"></div>
+      <p class="msg" id="msg"></p>
+      <div class="acciones">
+        <button class="principal" id="btnGenerar" type="button" onclick="generar()">Generar conduce</button>
+        <button class="ghost" id="btnPrint" type="button" onclick="imprimirConduce()" hidden>Imprimir</button>
+        <button class="ghost" type="button" onclick="nuevo()">Otra mesa</button>
+      </div>
+    </aside>
+  </div>
+  <button class="barra" id="barra" type="button" onclick="abrirPedido()"><span id="resumen">0 productos · RD$ 0.00</span><span>Ver pedido</span></button>
+</div>
+<div class="velo" id="velo" onclick="cerrarHoja()"></div>
+<div class="pedir-mesa" id="pedirMesa">
+  <div class="salon">
+    <div class="salon-top">
+      <div>
+        <h2>Elige la mesa</h2>
+        <p>Toca la mesa que vas a atender. Las apagadas ya las tiene otro mesero.</p>
+      </div>
+      <div class="leyenda">
+        <span><i class="dot"></i> Libre</span>
+        <span><i class="dot mia"></i> Tuya</span>
+        <span><i class="dot ocupada"></i> Ocupada</span>
+      </div>
+      <button class="ghost" id="cerrarSalon" type="button" onclick="cerrarSalon()" hidden>Volver</button>
+    </div>
+    <p class="msg" id="mesaMsg"></p>
+    <div class="piso" id="piso"></div>
+  </div>
+</div>
+<div id="slip"></div>
+<script>
+const cart = [];
+const borradores = {};
+let catalogo = [];
+let categorias = [];
+let combos = [];
+let buscarTimer = 0;
+function money(n){ return "RD$ " + Number(n||0).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;"); }
+function mesaCorta(m){
+  const t = String(m || "");
+  return t.indexOf("Mesa ") === 0 ? t.slice(5) : t;
+}
+function fotoDe(l){
+  if (l.imagen) return l.imagen;
+  const p = catalogo.find(x => x.id === l.id && !!x.combo === !!l.combo) || combos.find(x => x.id === l.id && !!l.combo);
+  return p && p.imagen ? p.imagen : "";
+}
+function lineaTotal(l){
+  const bruto = Number(l.precio) * Number(l.cantidad);
+  if (window._itbisIncluido || l.itbis === false) return bruto;
+  return bruto * 1.18;
+}
+function total(){ return cart.reduce((s,l) => s + lineaTotal(l), 0); }
+function piezas(){ return cart.reduce((s,l) => s + Number(l.cantidad), 0); }
+async function api(url, opt){
+  const r = await fetch(url, Object.assign({credentials:"same-origin", headers:{"Content-Type":"application/json"}}, opt||{}));
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok){
+    const d = data.detail;
+    throw new Error(typeof d === "string" ? d : "No se pudo completar");
+  }
+  return data;
+}
+async function entrar(){
+  const aviso = document.getElementById("loginMsg");
+  aviso.textContent = "";
+  try {
+    const s = await api("/api/login", {method:"POST", body: JSON.stringify({username: user.value, password: pass.value})});
+    if (s.rol !== "mesero" && s.rol !== "admin") {
+      await fetch("/api/logout", {method:"POST", credentials:"same-origin"}).catch(()=>{});
+      throw new Error("La tablet es solo para el mesero. La cajera cobra el código en la caja.");
+    }
+    let estado = {};
+    try { estado = await api("/api/estado"); } catch (err) {}
+    window._itbisIncluido = !!estado.itbis_incluido;
+    document.getElementById("login").style.display = "none";
+    document.getElementById("app").classList.add("on");
+    quien.textContent = (s.usuario || user.value) + (estado.caja ? " · caja de " + (estado.caja.usuario || "la cajera") : " · sin caja abierta");
+    if (estado.empresa && estado.empresa.nombre) marca.textContent = estado.empresa.nombre;
+    await cargar();
+    await pendientes();
+    pintar();
+    preguntarMesa();
+  } catch(e){ aviso.textContent = e.message; }
+}
+function preguntarMesa(){
+  mesaMsg.textContent = "";
+  document.getElementById("pedirMesa").classList.add("on");
+  const volver = document.getElementById("cerrarSalon");
+  if (volver) volver.hidden = !mesa.value.trim();
+  pendientes().catch(() => {});
+}
+function cerrarSalon(){
+  if (!mesa.value.trim()) return;
+  document.getElementById("pedirMesa").classList.remove("on");
+}
+async function confirmarMesa(numero){
+  numero = String(numero || "").trim();
+  if (!numero) return;
+  mesaMsg.textContent = "";
+  try {
+    const d = await api("/api/mesas/tomar", {method:"POST", body: JSON.stringify({mesa: numero})});
+    if (d.conduce) aplicarConduce(d.conduce);
+    else {
+      const misma = mesaCorta(d.mesa) === mesa.value.trim();
+      if (!misma) {
+        const destino = mesaCorta(d.mesa);
+        if (!restaurarBorrador(destino)) {
+          cart.length = 0;
+          window._id = null;
+          window._codigo = "";
+          window._oficial = null;
+          window._tocado = false;
+          pedidoAviso.innerHTML = "";
+          btnPrint.hidden = true;
+        }
+      }
+      mesa.value = mesaCorta(d.mesa);
+      document.getElementById("pedirMesa").classList.remove("on");
+      pintar();
+      q.focus();
+    }
+    await pendientes();
+  } catch(e) { mesaMsg.textContent = e.message; }
+}
+async function salir(){
+  await fetch("/api/logout", {method:"POST", credentials:"same-origin"}).catch(()=>{});
+  location.href = "/tablet";
+}
+function elegirCat(id){
+  window._cat = id;
+  cargar();
+}
+async function cargar(){
+  const cat = window._cat && window._cat !== "combos" ? "&categoria=" + encodeURIComponent(window._cat) : "";
+  const data = await api("/api/catalogo?q=" + encodeURIComponent(q.value || "") + cat);
+  categorias = data.categorias || [];
+  if (!window._cat) combos = data.combos || [];
+  if (window._cat === "combos") {
+    const texto = (q.value || "").toLowerCase();
+    catalogo = combos.filter(c => !texto || String(c.nombre || "").toLowerCase().indexOf(texto) >= 0);
+  } else catalogo = data.productos || [];
+  if (!window._cat) catalogo = catalogo.concat(combos);
+  pintarCats();
+  pintarGrid();
+}
+function pintarCats(){
+  const actual = window._cat || "";
+  const base = [{id:"", nombre:"Todas", extra:""}];
+  if (combos.length) base.push({id:"combos", nombre:"Combos", extra: String(combos.length)});
+  const lista = base.concat(categorias.map(c => ({id:String(c.id), nombre:c.nombre, extra:""})));
+  cats.innerHTML = lista.map(c => `<button type="button" class="cat${actual===c.id ? " on" : ""}" onclick='elegirCat(${JSON.stringify(c.id)})'>${esc(c.nombre)}${c.extra ? `<small>${esc(c.extra)}</small>` : ""}</button>`).join("");
+}
+function qtyDe(p){
+  const hit = cart.find(x => x.id === p.id && !!x.combo === !!p.combo);
+  return hit ? hit.cantidad : 0;
+}
+function pintarGrid(){
+  grid.innerHTML = catalogo.map(p => {
+    const n = qtyDe(p);
+    const foto = p.imagen ? ` style="background-image:url('${esc(p.imagen)}')"` : "";
+    const accion = n
+      ? `<div class="step"><button type="button" onclick="sumar(${p.id},${p.combo?1:0},-1)">−</button><span>${n}</span><button type="button" onclick="sumar(${p.id},${p.combo?1:0},1)">+</button></div>`
+      : `<button class="agregar" type="button" onclick="sumar(${p.id},${p.combo?1:0},1)">Agregar</button>`;
+    return `<article class="card${n ? " en" : ""}"><div class="foto"${foto}></div><b>${esc(p.nombre)}</b>${p.descripcion ? `<small>${esc(p.descripcion)}</small>` : ""}<span class="precio">${money(p.precio)}</span>${accion}</article>`;
+  }).join("") || "<p class='nota'>No hay productos en esta categoría.</p>";
+}
+function animarLinea(el, frames, ms){
+  if (!el || !el.animate) return;
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  el.animate(frames, {duration: ms, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "backwards"});
+}
+function sumar(id, combo, delta){
+  if (!mesa.value.trim()) { preguntarMesa(); return; }
+  const p = catalogo.find(x => x.id === id && !!x.combo === !!combo) || combos.find(x => x.id === id && !!combo);
+  if(!p) return;
+  const tieneExtras = (p.extras || []).length > 0;
+  const hit = tieneExtras ? null : cart.find(x => x.id === p.id && !!x.combo === !!p.combo && !(x.opciones || []).some(o => o.on));
+  if(hit){
+    hit.cantidad += delta;
+    if(hit.cantidad <= 0) cart.splice(cart.indexOf(hit), 1);
+  } else if(delta > 0){
+    cart.push({
+      id:p.id, nombre:p.nombre, precio:p.precio, base:p.precio, cantidad:delta, combo:!!p.combo, itbis:p.itbis!==false, imagen:p.imagen || "", nota:"",
+      opciones: (p.extras || []).map(e => ({id:e.id, nombre:e.nombre, precio:Number(e.precio || 0), on:false}))
+    });
+  }
+  const indice = hit && hit.cantidad > 0 ? cart.indexOf(hit) : (!hit && delta > 0 ? cart.length - 1 : -1);
+  window._lineaAnim = indice >= 0 ? {indice, nueva: !hit} : null;
+  window._tocado = true;
+  pintar();
+}
+function toggleExtra(i, id){
+  const linea = cart[i];
+  if (!linea) return;
+  const extra = (linea.opciones || []).find(o => o.id === id);
+  if (!extra) return;
+  extra.on = !extra.on;
+  const suma = (linea.opciones || []).filter(o => o.on).reduce((s, o) => s + Number(o.precio || 0), 0);
+  linea.precio = Math.round((Number(linea.base ?? linea.precio) + suma) * 100) / 100;
+  window._tocado = true;
+  pintar();
+}
+function rotarNota(i){
+  const notas = ["", "Sin hielo", "Sin azúcar", "Término medio", "Sin cebolla", "Para llevar"];
+  if (!cart[i]) return;
+  const n = notas.indexOf(cart[i].nota || "");
+  cart[i].nota = notas[(n < 0 ? 0 : n + 1) % notas.length];
+  window._tocado = true;
+  pintar();
+}
+function cambiar(i, delta){
+  if(!cart[i]) return;
+  cart[i].cantidad += delta;
+  if(cart[i].cantidad <= 0) {
+    cart.splice(i, 1);
+    window._lineaAnim = null;
+  } else window._lineaAnim = {indice: i, nueva: false};
+  window._tocado = true;
+  pintar();
+}
+function pintar(){
+  const n = piezas();
+  resumen.textContent = n + (n === 1 ? " producto · " : " productos · ") + money(total());
+  const numero = mesa.value.trim();
+  tituloMesa.textContent = numero ? "Mesa " + numero : "Sin mesa";
+  btnGenerar.textContent = window._id ? "Actualizar conduce" : "Generar conduce";
+  btnGenerar.disabled = cart.length === 0 || !mesa.value.trim();
+  const filas = cart.map((l,i) => {
+    const foto = fotoDe(l);
+    const mini = foto ? ` style="background-image:url('${esc(foto)}')"` : "";
+    return `<div class="linea"><span class="mini"${mini}></span><div><b>${esc(l.nombre)}</b><small>${l.cantidad} × ${money(l.precio)}${l.nota ? " · " + esc(l.nota) : ""}</small><button class="ghost" type="button" onclick="rotarNota(${i})">Nota</button> ${(l.opciones||[]).map(o => `<button class="ghost" type="button" onclick="toggleExtra(${i},${o.id})">${o.on ? "✓ " : ""}${esc(o.nombre)} ${money(o.precio)}</button>`).join(" ")}</div><div class="cant"><button type="button" onclick="cambiar(${i},-1)">−</button><b>${l.cantidad}</b><button type="button" onclick="cambiar(${i},1)">+</button></div></div>`;
+  }).join("");
+  lineas.innerHTML = filas || (mesa.value.trim() ? "<p class='vacio'>Toca un producto para armar la mesa.</p>" : "<p class='vacio'>Primero elige la mesa.</p>");
+  const marca = window._lineaAnim;
+  window._lineaAnim = null;
+  if (marca && lineas.children[marca.indice] && lineas.children[marca.indice].classList.contains("linea")) {
+    const el = lineas.children[marca.indice];
+    if (marca.nueva) animarLinea(el, [{opacity:0, transform:"translateX(-10px)"}, {opacity:1, transform:"none"}], 180);
+    else animarLinea(el.querySelector(".cant b"), [{transform:"scale(1.08)"}, {transform:"none"}], 140);
+  }
+  const bruto = cart.reduce((s,l) => s + Number(l.precio) * Number(l.cantidad), 0);
+  const impuesto = Math.max(0, total() - bruto);
+  totales.innerHTML = window._itbisIncluido
+    ? `<div class="grande"><span>Total</span><span>${money(total())}</span></div><div><span>ITBIS incluido</span><span></span></div>`
+    : `<div><span>Subtotal</span><span>${money(bruto)}</span></div><div><span>ITBIS</span><span>${money(impuesto)}</span></div><div class="grande"><span>Total</span><span>${money(total())}</span></div>`;
+  if (window._codigo && window._oficial){
+    const nota = window._tocado ? "Hay productos nuevos. Actualiza el conduce antes de pasarlo a la caja." : "Se cobra en la caja";
+    pedidoAviso.innerHTML = `<div class="listo"><small>${esc(window._oficial.mesa || "")} · ${nota}</small><div class="codigo">${esc(window._codigo)}</div><div>Total ${money(window._tocado ? total() : window._oficial.total)}</div></div>`;
+    btnPrint.hidden = !!window._tocado;
+  } else {
+    pedidoAviso.innerHTML = "";
+    btnPrint.hidden = true;
+  }
+  pintarGrid();
+  pintarCarrusel();
+}
+function cerrarHoja(){
+  pedido.classList.remove("on");
+  velo.classList.remove("on");
+}
+function abrirPedido(){
+  pedido.classList.add("on");
+  velo.classList.add("on");
+}
+async function generar(){
+  if (!mesa.value.trim()) { preguntarMesa(); return; }
+  msg.textContent = "";
+  try {
+    const body = {mesa: mesa.value, items: cart.map(l => ({id:l.id, cantidad:l.cantidad, combo:!!l.combo, nivel:1, nota:l.nota || "", extras: (l.opciones||[]).filter(o => o.on).map(o => o.id)}))};
+    if (window._id) body.id = window._id;
+    const d = await api("/api/conduces", {method:"POST", body: JSON.stringify(body)});
+    window._id = d.id;
+    window._codigo = d.codigo;
+    window._oficial = d;
+    window._tocado = false;
+    mesa.value = mesaCorta(d.mesa);
+    slip.innerHTML = `<h2>CONDUCE ${esc(d.codigo)}</h2><p>${esc(d.mesa)}<br>${esc(d.usuario || "")}</p><table>${(d.lineas||[]).map(l => `<tr><td>${l.cantidad} ${esc(l.nombre)}</td><td>${money(l.total)}</td></tr>`).join("")}</table><p><b>Total ${money(d.total)}</b></p><p>Presenta este código en la caja.</p>`;
+    pintar();
+    abrirPedido();
+    await pendientes();
+  } catch(e){ msg.textContent = e.message; abrirPedido(); }
+}
+function imprimirConduce(){ window.print(); }
+function aplicarConduce(d){
+  window._id = d.id;
+  window._codigo = d.codigo;
+  window._oficial = d;
+  window._tocado = false;
+  mesa.value = mesaCorta(d.mesa);
+  cart.length = 0;
+  (d.lineas || []).forEach(l => cart.push({
+    id:l.id, nombre: (l.extras && l.extras.length) ? String(l.nombre).split(" · ")[0] : l.nombre, precio:l.precio, base: Number(l.precio_base ?? l.precio), cantidad:l.cantidad, combo:!!l.combo, itbis:l.itbis!==false, nota:l.nota || "",
+    opciones: (l.extras || []).map(e => ({id:e.id, nombre:e.nombre, precio:Number(e.precio || 0), on:true}))
+  }));
+  slip.innerHTML = `<h2>CONDUCE ${esc(d.codigo)}</h2><p>${esc(d.mesa)}<br>${esc(d.usuario || "")}</p><table>${(d.lineas||[]).map(l => `<tr><td>${l.cantidad} ${esc(l.nombre)}</td><td>${money(l.total)}</td></tr>`).join("")}</table><p><b>Total ${money(d.total)}</b></p><p>Presenta este código en la caja.</p>`;
+  msg.textContent = "";
+  document.getElementById("pedirMesa").classList.remove("on");
+  pintar();
+  abrirPedido();
+}
+async function nuevo(){
+  const anterior = mesa.value.trim();
+  const guardado = !!window._id;
+  cart.length = 0;
+  window._id = null;
+  window._codigo = "";
+  window._oficial = null;
+  window._tocado = false;
+  mesa.value = "";
+  pedidoAviso.innerHTML = "";
+  btnPrint.hidden = true;
+  msg.textContent = "";
+  delete borradores[anterior];
+  if (anterior && !guardado) {
+    await api("/api/mesas/soltar", {method:"POST", body: JSON.stringify({mesa: anterior})}).catch(() => {});
+  }
+  pintar();
+  cerrarHoja();
+  preguntarMesa();
+}
+const PLANO = [
+  {n:"1", c:2}, {n:"2", c:2}, {n:"3", c:2}, {n:"4", c:2},
+  {n:"5", c:4}, {n:"6", c:4}, {n:"7", c:4}, {n:"8", c:4},
+  {n:"9", c:8}, {n:"10", c:8},
+  {n:"11", c:12}
+];
+function nombreCorto(u){
+  const t = String(u || "");
+  const i = t.indexOf("@");
+  return i > 0 ? t.slice(0, i) : t;
+}
+function ladosMesa(cap){
+  if (cap === 2) return {top:0, bot:0, izq:1, der:1};
+  if (cap === 4) return {top:1, bot:1, izq:1, der:1};
+  if (cap === 8) return {top:3, bot:3, izq:1, der:1};
+  return {top:5, bot:5, izq:1, der:1};
+}
+function sillas(n, estado){
+  const archivo = estado === "mia" ? "mia" : estado === "ocupada" ? "ocupada" : "libre";
+  const icono = `<img class="silla" alt="" src="/estaticos/sillas/${archivo}.png"/>`;
+  return icono.repeat(n);
+}
+function estadoMesa(numero, items){
+  const hit = (items || []).find(x => mesaCorta(x.mesa) === String(numero));
+  if (!hit) return {cls:"libre", nota:"libre", codigo:""};
+  if (hit.ocupada) return {cls:"ocupada", nota:nombreCorto(hit.usuario) || "ocupada", codigo:""};
+  return {cls:"mia", nota:hit.codigo || "tuya", codigo:hit.codigo || ""};
+}
+function htmlMesaVisual(m, items){
+  const e = estadoMesa(m.n, items);
+  const l = ladosMesa(m.c);
+  return `<button type="button" class="mesa-dibujo c${m.c} ${e.cls}" onclick='elegirMesaPlano(${JSON.stringify(m.n)})'><span class="lado top">${sillas(l.top, e.cls)}</span><span class="cuerpo-mesa"><span class="lado izq">${sillas(l.izq, e.cls)}</span><span class="tablero"><b>${esc(m.n)}</b><small>${esc(e.nota)}</small></span><span class="lado der">${sillas(l.der, e.cls)}</span></span><span class="lado bot">${sillas(l.bot, e.cls)}</span></button>`;
+}
+function pintarPiso(items){
+  const root = document.getElementById("piso");
+  if (!root) return;
+  const grupos = [{t:"2 personas", cap:2}, {t:"4 personas", cap:4}, {t:"8 personas", cap:8}, {t:"12 personas", cap:12}];
+  root.innerHTML = grupos.map(g => {
+    const dibujos = PLANO.filter(m => m.c === g.cap).map(m => htmlMesaVisual(m, items)).join("");
+    return `<section class="grupo g${g.cap}"><h3>${g.t}</h3><div class="fila-mesas">${dibujos}</div></section>`;
+  }).join("");
+}
+function guardarBorrador(){
+  const n = mesa.value.trim();
+  if (!n) return;
+  borradores[n] = {
+    cart: cart.map(l => Object.assign({}, l)),
+    id: window._id || null,
+    codigo: window._codigo || "",
+    oficial: window._oficial || null,
+    tocado: !!window._tocado
+  };
+}
+function restaurarBorrador(numero){
+  const b = borradores[String(numero)];
+  if (!b) return false;
+  cart.length = 0;
+  b.cart.forEach(l => cart.push(Object.assign({}, l)));
+  window._id = b.id;
+  window._codigo = b.codigo;
+  window._oficial = b.oficial;
+  window._tocado = b.tocado;
+  return true;
+}
+async function irAMesa(numero){
+  numero = String(numero || "").trim();
+  if (!numero || numero === mesa.value.trim()) return;
+  guardarBorrador();
+  const e = estadoMesa(numero, window._mesasEstado || []);
+  const local = borradores[numero];
+  if (local && local.tocado) {
+    try {
+      const d = await api("/api/mesas/tomar", {method:"POST", body: JSON.stringify({mesa: numero})});
+      restaurarBorrador(numero);
+      mesa.value = mesaCorta(d.mesa);
+      document.getElementById("pedirMesa").classList.remove("on");
+      msg.textContent = "";
+      pintar();
+      q.focus();
+    } catch (err) { mesaMsg.textContent = err.message; }
+    return;
+  }
+  if (e.codigo) {
+    await abrirMesa(e.codigo);
+    return;
+  }
+  await confirmarMesa(numero);
+}
+async function elegirMesaPlano(numero){
+  const e = estadoMesa(numero, window._mesasEstado || []);
+  if (e.cls === "ocupada") {
+    mesaMsg.textContent = "Esa mesa ya la está atendiendo " + e.nota + ".";
+    return;
+  }
+  await irAMesa(numero);
+}
+function pintarCarrusel(){
+  const caja = document.getElementById("mesas");
+  if (!caja) return;
+  const items = (window._mesasEstado || []).filter(x => x.mia);
+  const actual = mesa.value.trim();
+  const numeros = items.map(x => mesaCorta(x.mesa));
+  if (actual && numeros.indexOf(actual) < 0) numeros.push(actual);
+  numeros.sort((a, b) => (Number(a) || 0) - (Number(b) || 0));
+  if (!numeros.length) {
+    caja.innerHTML = "";
+    window._firmaCarrusel = "";
+    return;
+  }
+  const firma = numeros.map(n => {
+    const hit = items.find(x => mesaCorta(x.mesa) === n);
+    const sucio = n === actual ? !!window._tocado : !!(borradores[n] && borradores[n].tocado);
+    return n + (n === actual ? "*" : "") + (sucio ? "!" : "") + ((hit && hit.codigo) || "");
+  }).join("|");
+  if (firma === window._firmaCarrusel) return;
+  window._firmaCarrusel = firma;
+  caja.innerHTML = numeros.map(n => {
+    const hit = items.find(x => mesaCorta(x.mesa) === n);
+    const plano = PLANO.find(x => x.n === n);
+    const sucio = n === actual ? !!window._tocado : !!(borradores[n] && borradores[n].tocado);
+    const nota = sucio ? "sin guardar" : ((hit && hit.codigo) || (plano ? plano.c + " pers." : "en curso"));
+    return `<button type="button" class="carrusel${n === actual ? " on" : ""}" onclick='irAMesa(${JSON.stringify(n)})'><b>${esc(n)}</b><small>${esc(nota)}</small></button>`;
+  }).join("") + `<button type="button" class="carrusel mas" onclick="preguntarMesa()">Otra</button>`;
+  if (window._carruselMesa !== actual) {
+    window._carruselMesa = actual;
+    const activo = caja.querySelector(".on");
+    if (activo && activo.scrollIntoView) activo.scrollIntoView({inline:"center", block:"nearest"});
+  }
+}
+async function pendientes(){
+  const d = await api("/api/conduces");
+  window._mesasEstado = d.items || [];
+  pintarPiso(window._mesasEstado);
+  pintarCarrusel();
+}
+async function abrirMesa(codigo){
+  if (!codigo) return;
+  try {
+    const d = await api("/api/conduces/codigo/" + encodeURIComponent(codigo));
+    if (d.estado !== "pendiente") return;
+    await api("/api/mesas/tomar", {method:"POST", body: JSON.stringify({mesa: d.mesa})});
+    aplicarConduce(d);
+    await pendientes();
+  } catch(e) {
+    mesaMsg.textContent = e.message;
+    document.getElementById("pedirMesa").classList.add("on");
+  }
+}
+mesa.addEventListener("input", () => {
+  tituloMesa.textContent = mesa.value.trim() ? "Mesa " + mesa.value.trim() : "Sin mesa";
+});
+q.addEventListener("input", () => { clearTimeout(buscarTimer); buscarTimer = setTimeout(cargar, 280); });
+api("/api/estado").then(async estado => {
+  if (estado.rol !== "mesero" && estado.rol !== "admin") return;
+  window._itbisIncluido = !!estado.itbis_incluido;
+  document.getElementById("login").style.display = "none";
+  document.getElementById("app").classList.add("on");
+  quien.textContent = (estado.usuario || "") + (estado.caja ? " · caja de " + (estado.caja.usuario || "la cajera") : " · sin caja abierta");
+  if (estado.empresa && estado.empresa.nombre) marca.textContent = estado.empresa.nombre;
+  await cargar();
+  await pendientes();
+  pintar();
+  preguntarMesa();
+}).catch(() => {});
+setInterval(() => {
+  const capa = document.getElementById("pedirMesa");
+  if (capa && capa.classList.contains("on")) pendientes().catch(() => {});
+}, 8000);
 </script>
 </body>
 </html>
