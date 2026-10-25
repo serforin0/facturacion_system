@@ -1217,22 +1217,23 @@ def _panel_caja(base: Database, desde: str = "", hasta: str = "") -> dict:
         }
     conn = base.get_connection()
     cur = conn.cursor()
-    donde = "WHERE fecha_cierre IS NOT NULL"
+    donde = "WHERE c.fecha_cierre IS NOT NULL"
     params: list = []
-    if (desde or "").strip() and (hasta or "").strip():
-        donde += " AND date(fecha_cierre) >= date(?) AND date(fecha_cierre) <= date(?)"
-        params = [desde.strip(), hasta.strip()]
-    else:
-        donde += " AND datetime(fecha_cierre) >= datetime('now', '-30 days')"
+    if (desde or "").strip():
+        donde += " AND date(c.fecha_cierre) >= date(?)"
+        params.append(desde.strip())
+    if (hasta or "").strip():
+        donde += " AND date(c.fecha_cierre) <= date(?)"
+        params.append(hasta.strip())
     cur.execute(
         f"""
-        SELECT id, IFNULL(nombre_caja,'Caja'), fecha_apertura, fecha_cierre,
-               IFNULL(usuario_apertura,''), IFNULL(usuario_cierre, usuario_apertura),
-               IFNULL(monto_inicial,0), IFNULL(efectivo_contado,0),
-               IFNULL(diferencia_efectivo,0), IFNULL(observaciones,''), estado
-        FROM cierres_caja
+        SELECT c.id, IFNULL(c.nombre_caja,'Caja'), c.fecha_apertura, c.fecha_cierre,
+               IFNULL(c.usuario_apertura,''), IFNULL(c.usuario_cierre, c.usuario_apertura),
+               IFNULL(c.monto_inicial,0), IFNULL(c.efectivo_contado,0),
+               IFNULL(c.diferencia_efectivo,0), IFNULL(c.observaciones,''), c.estado
+        FROM cierres_caja c
         {donde}
-        ORDER BY datetime(fecha_cierre) DESC
+        ORDER BY datetime(c.fecha_cierre) DESC
         LIMIT 200
         """,
         params,
@@ -1274,10 +1275,42 @@ def panel_caja(request: Request, desde: str = "", hasta: str = ""):
     return _panel_caja(db(), desde, hasta)
 
 
+def _pagos_del_cuadre(base: Database, cierre_id: int, apertura: str, cerrado: bool) -> list[dict]:
+    conn = base.get_connection()
+    cur = conn.cursor()
+    if cerrado:
+        donde = "COALESCE(p.cierre_id, f.cierre_id) = ?"
+        params: tuple = (cierre_id,)
+    else:
+        donde = """
+            (COALESCE(p.cierre_id, f.cierre_id) = ?
+             OR (COALESCE(p.cierre_id, f.cierre_id) IS NULL
+                 AND datetime(COALESCE(p.fecha, f.fecha)) >= datetime(?)))
+        """
+        params = (cierre_id, apertura or "1970-01-01")
+    cur.execute(
+        f"""
+        SELECT IFNULL(p.tipo_pago, 'otro'), SUM(p.monto)
+        FROM pagos_factura p
+        JOIN facturas f ON f.id = p.factura_id
+        WHERE f.estado = 'emitida' AND {donde}
+        GROUP BY IFNULL(p.tipo_pago, 'otro')
+        ORDER BY SUM(p.monto) DESC
+        """,
+        params,
+    )
+    filas = [{"tipo": t or "otro", "monto": round(float(m or 0), 2)} for t, m in cur.fetchall()]
+    conn.close()
+    return filas
+
+
 @app.get("/api/caja/cierre/{cierre_id}")
 def ver_cuadre(request: Request, cierre_id: int):
     _exigir_alguno(request, ("caja", "historial"))
-    base = db()
+    return _datos_cuadre(db(), cierre_id)
+
+
+def _datos_cuadre(base: Database, cierre_id: int) -> dict:
     conn = base.get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1335,11 +1368,17 @@ def ver_cuadre(request: Request, cierre_id: int):
         for fid, num, fec, tot, est, ncf, cli, sub, itbis in fac_rows
     ]
     ingresos, retiros = base.totales_movimientos_efectivo(i)
-    ventas = _efectivo_ventas(base, a or "", i) if (estado or "") != "cerrado" else _efectivo_del_turno(base, i)
+    cerrado = (estado or "") == "cerrado"
+    if cerrado:
+        esperado_cierre = round(float(cont or 0) - float(diff or 0), 2)
+        ventas = round(esperado_cierre - float(fondo or 0) - ingresos + retiros, 2)
+    else:
+        ventas = _efectivo_ventas(base, a or "", i)
     movimientos = [
         {"id": mid, "tipo": t, "monto": m, "motivo": mot, "usuario": u, "fecha": f}
         for mid, t, m, mot, u, f in base.listar_movimientos_efectivo(i)
     ]
+    emitidas = [f for f in facturas if (f.get("estado") or "") == "emitida"]
     return {
         "id": i,
         "nombre": n,
@@ -1349,16 +1388,40 @@ def ver_cuadre(request: Request, cierre_id: int):
         "usuario_cierre": uc,
         "fondo": float(fondo or 0),
         "ventas_efectivo": ventas,
+        "ventas_total": round(sum(float(f.get("total") or 0) for f in emitidas), 2),
+        "n_facturas": len(emitidas),
+        "n_anuladas": sum(1 for f in facturas if (f.get("estado") or "") == "anulada"),
         "ingresos": ingresos,
         "retiros": retiros,
-        "esperado": round(float(cont or 0) - float(diff or 0), 2) if (estado or "") == "cerrado" else round(float(fondo or 0) + ventas + ingresos - retiros, 2),
+        "esperado": round(float(cont or 0) - float(diff or 0), 2) if cerrado else round(float(fondo or 0) + ventas + ingresos - retiros, 2),
         "contado": float(cont or 0),
         "diferencia": float(diff or 0),
         "observaciones": obs,
         "estado": estado,
+        "pagos": _pagos_del_cuadre(base, i, a or "", cerrado),
         "movimientos": movimientos,
         "facturas": facturas,
     }
+
+
+@app.get("/api/caja/cierre/{cierre_id}/pdf")
+def pdf_cuadre(request: Request, cierre_id: int, descarga: int = 0):
+    _exigir_alguno(request, ("caja", "historial"))
+    from report_pdf_builder import build_cuadre_caja_pdf
+
+    base = db()
+    try:
+        datos = _datos_cuadre(base, cierre_id)
+        pdf = build_cuadre_caja_pdf(datos, base.get_empresa_info())
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="Falta reportlab en el servidor") from exc
+    nombre = f"cuadre-{cierre_id}.pdf"
+    modo = "attachment" if int(descarga or 0) else "inline"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"{modo}; filename={nombre}"},
+    )
 
 
 class TurnoEditIn(BaseModel):
@@ -4063,6 +4126,11 @@ HTML = """<!DOCTYPE html>
 <script>
 const cart = [];
 function money(n){ return "RD$ " + Number(n||0).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function textoDif(n){
+  const v = Number(n||0);
+  if (Math.abs(v) < 0.05) return "Cuadrado";
+  return (v > 0 ? "Sobrante " : "Faltante ") + money(Math.abs(v));
+}
 function abrirModal(titulo, html){
   modalTitulo.textContent = titulo;
   modalCuerpo.innerHTML = html;
@@ -4684,8 +4752,8 @@ async function pintarForm(nombre){
       `<div class="form"><button onclick="nuevoMov('ingreso')">Registrar ingreso</button></div><div id="movLista"></div>`],
     retiro: ["Retiro de efectivo", "No puede superar el efectivo esperado del turno. Abajo están los retiros de este turno.",
       `<div class="form"><button onclick="nuevoMov('retiro')">Registrar retiro</button></div><div id="movLista"></div>`],
-    cerrar: ["Cuadre y cierre", "Cierra el turno cuando cuentes el efectivo. El historial se filtra por fechas; si las dejas vacías, muestra los últimos 30 días.",
-      `<div class="form"><button onclick="nuevoCierre()">Cerrar turno</button><label>Desde<input id="cuadreDesde" type="date"/></label><label>Hasta<input id="cuadreHasta" type="date"/></label><button class="sec" onclick="cargarPanelCaja('cerrar')">Ver historial</button></div><div id="cajaInfo"></div>`],
+    cerrar: ["Cuadre y cierre", "El historial muestra todos los cuadres para compararlos. Filtra por fechas si quieres un período. Cada cuadre se abre en PDF para verlo o imprimirlo.",
+      `<div class="form"><button onclick="nuevoCierre()">Cerrar turno</button><label>Desde<input id="cuadreDesde" type="date"/></label><label>Hasta<input id="cuadreHasta" type="date"/></label><button class="sec" onclick="cargarPanelCaja('cerrar')">Filtrar</button></div><div id="cajaInfo"></div>`],
     compra: ["Compras", "Pulsa Registrar compra. Varias líneas entran en la misma compra y suman existencia.",
       `<div class="form"><button onclick="nuevaCompra()">Registrar compra</button></div><div id="compLista"></div>`],
     promo: ["Promociones", "Se aplican en el mostrador cuando el producto está en la promoción.",
@@ -4772,14 +4840,11 @@ async function cargarPanelCaja(nombre){
   if (nombre === "cerrar") {
     const desde = document.getElementById("cuadreDesde");
     const hasta = document.getElementById("cuadreHasta");
-    if ((desde && desde.value) || (hasta && hasta.value)) {
-      if (!desde.value || !hasta.value) {
-        formMsg.style.color = "var(--danger)";
-        formMsg.textContent = "Indica la fecha desde y la fecha hasta.";
-        return;
-      }
-      q = "?desde=" + desde.value + "&hasta=" + hasta.value;
-    }
+    const p = new URLSearchParams();
+    if (desde && desde.value) p.set("desde", desde.value);
+    if (hasta && hasta.value) p.set("hasta", hasta.value);
+    const s = p.toString();
+    if (s) q = "?" + s;
   }
   const d = await api("/api/caja/panel" + q);
   window._cajaPanel = d;
@@ -4794,18 +4859,18 @@ async function cargarPanelCaja(nombre){
   }
   const a = d.abierta;
   const resumen = a
-    ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p></div>`
+    ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p><div class="acciones"><button class="sec" onclick="verPdfCuadre(${a.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${a.id})">Imprimir</button></div></div>`
     : "<p class='hint'>No hay turno abierto.</p>";
   const filas = (d.cierres || []).filter(c => c.estado === "cerrado");
-  const rango = q ? "en esas fechas" : "en los últimos 30 días";
+  const vacio = q ? "No hay cuadres en ese período." : "Todavía no hay cuadres cerrados.";
   box.innerHTML = resumen + `<div id="cuadreVista"></div><h3>Historial de cuadres</h3><div id="cuadreTabla">` + tabla(
     ["Cierre","Turno","Cajero","Fondo","Esperado","Contado","Diferencia",""],
     filas.map(c => [
       String(c.cierre||"").slice(0,16), escDash(c.nombre), escDash(c.usuario || "—"),
-      money(c.fondo), money(c.esperado), money(c.contado), money(c.diferencia),
-      `<div class="acciones"><button class="sec" onclick="verCuadre(${c.id})">Ver</button><button class="sec" onclick="imprimirCierre(${c.id})">Imprimir</button><button class="sec" onclick="editarCierre(${c.id})">Editar</button></div>`
+      money(c.fondo), money(c.esperado), money(c.contado), textoDif(c.diferencia),
+      `<div class="acciones"><button class="sec" onclick="verPdfCuadre(${c.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${c.id})">Imprimir</button><button class="sec" onclick="bajarCuadre(${c.id})">Descargar</button><button class="sec" onclick="editarCierre(${c.id})">Editar</button></div>`
     ]),
-    "No hay cuadres " + rango + "."
+    vacio
   ) + `</div>`;
 }
 function htmlCuadre(d){
@@ -4829,13 +4894,53 @@ function htmlCuadre(d){
   );
   return `<div class="doc"><h3>Cuadre · ${escDash(d.nombre)}</h3><p>Abrió ${escDash(d.usuario_apertura || "—")} el ${escDash(String(d.apertura||"").slice(0,16))}<br>Cerró ${escDash(d.usuario_cierre || "—")} el ${escDash(String(d.cierre||"").slice(0,16))}</p>${montos}<p>${escDash(d.observaciones || "Sin observación")}</p><button onclick="imprimirCierre(${d.id})">Imprimir cierre</button></div><h3>Facturas del turno</h3>${facturas}<h3>Movimientos del turno</h3>${movs}`;
 }
+async function pdfCuadreBlob(id){
+  const r = await fetch("/api/caja/cierre/" + id + "/pdf", {credentials:"same-origin"});
+  if(!r.ok){
+    const data = await r.json().catch(()=>({}));
+    const d = data.detail;
+    throw new Error(typeof d === "string" ? d : "No se pudo generar el PDF");
+  }
+  return await r.blob();
+}
+async function verPdfCuadre(id){
+  try {
+    const blob = await pdfCuadreBlob(id);
+    const url = URL.createObjectURL(blob);
+    if (window._pdfCuadreUrl) URL.revokeObjectURL(window._pdfCuadreUrl);
+    window._pdfCuadreUrl = url;
+    const vista = document.getElementById("cuadreVista");
+    if (!vista) return;
+    vista.innerHTML = `<div class="doc"><div class="acciones"><button type="button" onclick="imprimirVisorPdf()">Imprimir</button><button type="button" class="sec" onclick="bajarCuadre(${id})">Descargar PDF</button></div><iframe id="pdfCuadre" title="Cuadre de caja" src="${url}" style="width:100%;height:72vh;border:1px solid var(--line);border-radius:12px;background:#fff"></iframe></div>`;
+    vista.scrollIntoView({block:"nearest"});
+  } catch(e) {
+    formMsg.style.color = "var(--danger)";
+    formMsg.textContent = e.message;
+  }
+}
+function imprimirVisorPdf(){
+  const frame = document.getElementById("pdfCuadre");
+  if (!frame || !frame.contentWindow) return;
+  frame.contentWindow.focus();
+  frame.contentWindow.print();
+}
+async function bajarCuadre(id){
+  try {
+    await bajarPdf("/api/caja/cierre/" + id + "/pdf?descarga=1", "cuadre-" + id + ".pdf");
+    formMsg.style.color = "var(--ok)";
+    formMsg.textContent = "PDF del cuadre descargado.";
+  } catch(e) {
+    formMsg.style.color = "var(--danger)";
+    formMsg.textContent = e.message;
+  }
+}
 async function verCuadre(id){
-  const d = await api("/api/caja/cierre/" + id);
-  window._cuadreDoc = d;
-  const vista = document.getElementById("cuadreVista");
-  if (!vista) return;
-  vista.innerHTML = htmlCuadre(d);
-  vista.scrollIntoView({block:"nearest"});
+  try {
+    await verPdfCuadre(id);
+  } catch(e) {
+    formMsg.style.color = "var(--danger)";
+    formMsg.textContent = e.message;
+  }
 }
 function verFacturaDelCuadre(id){
   const f = ((window._cuadreDoc && window._cuadreDoc.facturas) || []).find(x => x.id === id);
@@ -4849,14 +4954,18 @@ async function verCuadreDesdeFactura(id){
   await verCuadre(id);
 }
 async function imprimirCierre(id){
-  const d = await api("/api/caja/cierre/" + id);
-  const emp = window._empresa || {};
-  const ancho = (document.getElementById("anchoTicket") || {}).value || "80";
-  recibo.style.width = ancho === "58" ? "58mm" : "80mm";
-  const movs = (d.movimientos || []).map(m => `<tr><td>${escDash(m.tipo)} ${escDash(m.motivo)}</td><td>${money(m.monto)}</td></tr>`).join("");
-  const nums = (d.facturas || []).map(f => escDash(f.numero)).join(", ");
-  recibo.innerHTML = `<h2>${escDash(emp.nombre || "Cierre de caja")}</h2><p>${escDash(emp.direccion || "")}<br>RNC ${escDash(emp.rnc || "—")}</p><p><b>CIERRE DE CAJA</b><br>${escDash(d.nombre)}<br>Abrió ${escDash(d.usuario_apertura || "—")}<br>${escDash(String(d.apertura||"").slice(0,16))}<br>Cerró ${escDash(d.usuario_cierre || "—")}<br>${escDash(String(d.cierre||"").slice(0,16))}</p><p>Fondo ${money(d.fondo)}<br>Ventas en efectivo ${money(d.ventas_efectivo)}<br>Ingresos ${money(d.ingresos)}<br>Retiros ${money(d.retiros)}</p><p>Esperado ${money(d.esperado)}<br>Contado ${money(d.contado)}<br><b>Diferencia ${money(d.diferencia)}</b></p><p>${escDash(d.observaciones || "")}</p>${nums ? `<p>Facturas<br>${nums}</p>` : ""}${movs ? `<table>${movs}</table>` : ""}`;
-  window.print();
+  try {
+    await verPdfCuadre(id);
+    const frame = document.getElementById("pdfCuadre");
+    if (!frame) return;
+    const lanzar = () => {
+      try { frame.contentWindow.focus(); frame.contentWindow.print(); } catch (err) {}
+    };
+    frame.addEventListener("load", lanzar, {once:true});
+  } catch(e) {
+    formMsg.style.color = "var(--danger)";
+    formMsg.textContent = e.message;
+  }
 }
 function abrirTurno(){
   window._turnoId = null;

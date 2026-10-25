@@ -459,3 +459,204 @@ def build_factura_comprobante_pdf(db: Database, factura_id: int) -> bytes | None
     )
     doc.build(elems)
     return bio.getvalue()
+
+
+def _rd(valor) -> str:
+    return f"RD$ {float(valor or 0):,.2f}"
+
+
+def _xml(texto) -> str:
+    from xml.sax.saxutils import escape
+
+    return escape(str(texto or ""))
+
+
+def _tabla_reporte(data: list[list], anchos: list[float]) -> Table:
+    tabla = Table(data, repeatRows=1, colWidths=anchos)
+    tabla.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e3a5f")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 1), (-1, -1), 8),
+                ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    return tabla
+
+
+def build_cuadre_caja_pdf(datos: dict, empresa: dict) -> bytes:
+    """Cuadre de caja en carta, para archivar, comparar e imprimir."""
+    bio = BytesIO()
+    doc = SimpleDocTemplate(
+        bio,
+        pagesize=letter,
+        leftMargin=40,
+        rightMargin=40,
+        topMargin=36,
+        bottomMargin=36,
+    )
+    styles = getSampleStyleSheet()
+    normal = styles["Normal"]
+    elems = []
+    cerrado = (datos.get("estado") or "") == "cerrado"
+    diferencia = float(datos.get("diferencia") or 0)
+    if not cerrado:
+        resultado = "Pendiente de conteo"
+        contado = "Pendiente"
+        diferencia_txt = "-"
+    elif abs(diferencia) < 0.05:
+        resultado = "Cuadrado"
+        contado = _rd(datos.get("contado"))
+        diferencia_txt = _rd(0)
+    elif diferencia > 0:
+        resultado = f"Sobrante {_rd(diferencia)}"
+        contado = _rd(datos.get("contado"))
+        diferencia_txt = _rd(diferencia)
+    else:
+        resultado = f"Faltante {_rd(abs(diferencia))}"
+        contado = _rd(datos.get("contado"))
+        diferencia_txt = _rd(diferencia)
+
+    nombre = _xml(empresa.get("nombre") or "Empresa")
+    direccion = _xml(empresa.get("direccion") or "").replace("\n", "<br/>")
+    rnc = _xml(empresa.get("rnc") or "—")
+    titulo = "CUADRE DE CAJA" if cerrado else "PRE-CUADRE DE CAJA"
+    hdr = f"<b><font size=14>{nombre}</font></b><br/><font size=9>{direccion}</font><br/><font size=9>RNC {rnc}</font>"
+    meta = (
+        f"<b>{titulo}</b><br/>"
+        f"Cuadre nº {datos.get('id')}<br/>"
+        f"Turno: {_xml(datos.get('nombre') or 'Caja')}<br/>"
+        f"<b>{_xml(resultado)}</b>"
+    )
+    elems.append(
+        Table(
+            [[Paragraph(hdr, normal), Paragraph(meta, normal)]],
+            colWidths=[340, 192],
+        )
+    )
+    elems.append(Spacer(1, 10))
+    elems.append(
+        Paragraph(
+            f"Abrió {_xml(datos.get('usuario_apertura') or '—')} el {_xml(str(datos.get('apertura') or '')[:16])}<br/>"
+            f"Cerró {_xml(datos.get('usuario_cierre') or '—')} el {_xml(str(datos.get('cierre') or 'turno abierto')[:16])}<br/>"
+            f"Facturas emitidas: {int(datos.get('n_facturas') or 0)} · "
+            f"anuladas: {int(datos.get('n_anuladas') or 0)} · "
+            f"venta total {_rd(datos.get('ventas_total'))}",
+            normal,
+        )
+    )
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph("<b>Efectivo</b>", normal))
+    elems.append(Spacer(1, 4))
+    elems.append(
+        _tabla_reporte(
+            [
+                ["Concepto", "Monto"],
+                ["Fondo inicial", _rd(datos.get("fondo"))],
+                ["Ventas en efectivo", _rd(datos.get("ventas_efectivo"))],
+                ["Ingresos de efectivo", _rd(datos.get("ingresos"))],
+                ["Retiros de efectivo", _rd(datos.get("retiros"))],
+                ["Efectivo esperado", _rd(datos.get("esperado"))],
+                ["Efectivo contado", contado],
+                ["Diferencia", diferencia_txt],
+            ],
+            [340, 192],
+        )
+    )
+
+    pagos = datos.get("pagos") or []
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph("<b>Ventas por forma de pago</b>", normal))
+    elems.append(Spacer(1, 4))
+    if pagos:
+        filas_pago = [["Forma de pago", "Monto"]]
+        filas_pago.extend(
+            [
+                [_xml((p.get("tipo") or "otro").replace("_", " ")).capitalize(), _rd(p.get("monto"))]
+                for p in pagos
+            ]
+        )
+        filas_pago.append(["Total cobrado", _rd(sum(float(p.get("monto") or 0) for p in pagos))])
+        elems.append(_tabla_reporte(filas_pago, [340, 192]))
+    else:
+        elems.append(Paragraph("Este turno no tiene cobros registrados.", normal))
+
+    movimientos = datos.get("movimientos") or []
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph("<b>Movimientos de efectivo</b>", normal))
+    elems.append(Spacer(1, 4))
+    if movimientos:
+        filas_mov = [["Fecha", "Tipo", "Monto", "Motivo", "Usuario"]]
+        for m in movimientos:
+            filas_mov.append(
+                [
+                    str(m.get("fecha") or "")[:16],
+                    _xml(m.get("tipo") or ""),
+                    _rd(m.get("monto")),
+                    _xml(m.get("motivo") or "")[:42],
+                    _xml(m.get("usuario") or "—")[:18],
+                ]
+            )
+        elems.append(_tabla_reporte(filas_mov, [100, 70, 90, 172, 100]))
+    else:
+        elems.append(Paragraph("Este turno no tiene ingresos ni retiros.", normal))
+
+    facturas = datos.get("facturas") or []
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph("<b>Facturas del turno</b>", normal))
+    elems.append(Spacer(1, 4))
+    if facturas:
+        filas_fac = [["Número", "Fecha", "Cliente", "Estado", "Total"]]
+        for f in facturas:
+            filas_fac.append(
+                [
+                    _xml(f.get("numero") or "")[:18],
+                    str(f.get("fecha") or "")[:16],
+                    _xml(f.get("cliente") or "")[:28],
+                    _xml(f.get("estado") or ""),
+                    _rd(f.get("total")),
+                ]
+            )
+        elems.append(_tabla_reporte(filas_fac, [90, 100, 170, 80, 92]))
+        if len(facturas) >= 300:
+            elems.append(Spacer(1, 4))
+            elems.append(Paragraph("Se listan las primeras 300 facturas del turno.", normal))
+    else:
+        elems.append(Paragraph("Este turno no tiene facturas.", normal))
+
+    obs = str(datos.get("observaciones") or "").strip()
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph(f"<b>Observación:</b> {_xml(obs) if obs else 'Sin observación.'}", normal))
+    elems.append(Spacer(1, 22))
+    elems.append(
+        Table(
+            [
+                [
+                    Paragraph("Cajero<br/>______________________________", normal),
+                    Paragraph("Revisado por<br/>______________________________", normal),
+                ]
+            ],
+            colWidths=[266, 266],
+        )
+    )
+    elems.append(Spacer(1, 14))
+    elems.append(
+        Paragraph(
+            f"<font size=8 color='#64748b'>Generado el {datetime.now().strftime('%d/%m/%Y %H:%M')} "
+            "para archivar y comparar cuadres. Documento interno de caja.</font>",
+            normal,
+        )
+    )
+    doc.build(elems)
+    return bio.getvalue()
