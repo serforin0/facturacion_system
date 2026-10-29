@@ -48,12 +48,17 @@ _FONDOS = (
 )
 
 
-def _imagen_de(nombre: str) -> str:
+def _imagen_de(nombre: str, imagen_path: str | None = None) -> str:
+    ruta = (imagen_path or "").replace("\\", "/").strip()
+    if ruta.startswith("web_static/"):
+        ruta = ruta[len("web_static/"):]
+    if ruta and (_STATIC / ruta).is_file():
+        return "/estaticos/" + ruta
     texto = (nombre or "").lower()
     for clave, archivo in _FONDOS:
         if clave in texto:
             return f"/estaticos/productos/{archivo}"
-    return "/estaticos/productos/cerveza.jpg"
+    return ""
 
 
 def db() -> Database:
@@ -691,7 +696,7 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
     if q.strip():
         sql += " AND (nombre LIKE ? OR IFNULL(codigo_barras,'') LIKE ?)"
         params.extend([f"%{q.strip()}%", f"%{q.strip()}%"])
-    sql += " ORDER BY nombre COLLATE NOCASE LIMIT 80"
+    sql += " ORDER BY nombre COLLATE NOCASE LIMIT 400"
     cur.execute(sql, params)
     filas_producto = cur.fetchall()
 
@@ -721,7 +726,7 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
                 "stock": row[5],
                 "codigo": row[6] or "",
                 "itbis": bool(int(row[8] or 1)),
-                "imagen": _imagen_de(row[1]),
+                "imagen": _imagen_de(row[1], row[7]),
                 "minimo": float(row[17] or 0),
                 "combo": False,
                 "extras": extras_por_producto.get(row[0], []),
@@ -3204,6 +3209,62 @@ def editar_producto(request: Request, producto_id: int, body: ProductoIn):
     return {"ok": True}
 
 
+class SyncLineaIn(BaseModel):
+    codigo: str = ""
+    nombre: str = ""
+    cantidad: float = 0
+    precio: float = 0
+    total: float = 0
+
+
+class SyncVentaIn(BaseModel):
+    numero: str
+    fecha: str = ""
+    subtotal: float = 0
+    itbis: float = 0
+    total: float = 0
+    usuario: str = ""
+    lineas: list[SyncLineaIn] = []
+
+
+class SyncProductoIn(BaseModel):
+    codigo: str
+    nombre: str = ""
+    precio: float = 0
+    precio_base: float = 0
+    stock: float = 0
+    unidad: str = ""
+    bodega: str = "Principal"
+    categoria: str = ""
+    imagen: str = ""
+
+
+class SyncStockIn(BaseModel):
+    codigo: str
+    stock: float
+
+
+class SyncIn(BaseModel):
+    productos: list[SyncProductoIn] = []
+    ventas: list[SyncVentaIn] = []
+    codigos: list[str] = []
+    numeros: list[str] = []
+    stocks: list[SyncStockIn] = []
+
+
+@app.post("/api/sync/inventario")
+def sync_inventario(request: Request, body: SyncIn):
+    usuario = _exigir(request, "inventario")
+    from sincronizar_inventario import responder
+
+    base = db()
+    conn = base.get_connection()
+    try:
+        return responder(conn, str(Path(__file__).resolve().parent), body.model_dump(), usuario)
+    finally:
+        conn.close()
+
+
 @app.get("/api/precios-mayor")
 def ver_precios_mayor(request: Request):
     _exigir(request, "inventario")
@@ -4873,7 +4934,7 @@ HTML = """<!DOCTYPE html>
   .card { position:relative; height:auto; border-radius:var(--radius-card); padding:0; background:var(--surface); color:var(--text); display:flex; flex-direction:column; align-items:stretch; overflow:hidden; text-align:left; font-weight:400; transition: transform 160ms var(--ease-out), background-color 160ms ease; }
   .card:active { transform: scale(0.98); }
   @media (hover:hover) and (pointer:fine) { .card:hover { background:var(--raised); } }
-  .card .foto { display:block; height:128px; background:var(--raised) center/cover no-repeat; }
+  .card .foto { display:block; height:180px; background:var(--raised) center / contain no-repeat; }
   .card .info { padding:10px 14px 14px; display:grid; gap:2px; }
   .card .info b { font-weight:600; line-height:1.3; }
   .card .precio { font-weight:600; font-size:15px; }
@@ -5148,7 +5209,7 @@ HTML = """<!DOCTYPE html>
     .toolbar input { grid-column:1 / -1; min-width:0; }
     .work { padding:12px 16px 18px; }
     .grid { grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; }
-    .card .foto { height:104px; }
+    .card .foto { height:148px; }
     .kpis, .kpis.tres { grid-template-columns:1fr; }
     .kpis.tres .kpi:nth-child(n) { border-left:0; }
     .kpis.tres .kpi + .kpi { border-top:1px solid var(--rule); }
@@ -8191,7 +8252,7 @@ TABLET_HTML = """<!DOCTYPE html>
     display:flex; flex-direction:column; gap:8px; border:1px solid var(--line); min-width:0;
   }
   .card.en { border-color:var(--accent); }
-  .foto { height:112px; border-radius:14px; background:var(--raised) center/cover no-repeat; }
+  .foto { height:220px; border-radius:14px; background:var(--raised) center / contain no-repeat; }
   .card b { font-size:15px; line-height:1.25; min-height:2.5em; }
   .precio { color:var(--accent-ink); font-weight:800; }
   .agregar, .step {

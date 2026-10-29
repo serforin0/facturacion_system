@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 
 import customtkinter as ctk
 from tkinter import messagebox, ttk
@@ -152,6 +153,24 @@ class ComprasFrame(ctk.CTkFrame):
         )
         self.lbl = ctk.CTkLabel(self, text="", font=("Arial", 12))
         self.lbl.pack(anchor="w", padx=12)
+        ctk.CTkLabel(self, text="Por pagar", font=("Arial", 13, "bold")).pack(
+            anchor="w", padx=12, pady=(8, 2)
+        )
+        self.tree_pagar = ttk.Treeview(
+            self, columns=("fecha", "proveedor", "total"), show="headings", height=8
+        )
+        for col, titulo, ancho in (
+            ("fecha", "Fecha", 160),
+            ("proveedor", "Proveedor", 220),
+            ("total", "Total", 100),
+        ):
+            self.tree_pagar.heading(col, text=titulo)
+            self.tree_pagar.column(col, width=ancho)
+        self.tree_pagar.pack(fill="both", expand=True, padx=10, pady=4)
+        ctk.CTkButton(
+            self, text="Pagar con caja", fg_color="#15803d", command=self._pagar
+        ).pack(anchor="w", padx=10, pady=8)
+        self._cargar_por_pagar()
 
     def _alta_prov(self):
         nom = (self.ent_nuevo_prov.get() or "").strip()
@@ -184,8 +203,31 @@ class ComprasFrame(ctk.CTkFrame):
         except Exception as e:
             messagebox.showerror("Compra", str(e), parent=self)
             return
-        self.lbl.configure(text=f"Compra {cid} registrada. Entraron {cant:g} unidades.")
+        self.lbl.configure(text=f"Compra {cid} registrada. Entraron {cant:g} unidades. Quedó por pagar.")
         self.ent_cant.delete(0, "end")
+        self._cargar_por_pagar()
+
+    def _cargar_por_pagar(self):
+        for iid in self.tree_pagar.get_children():
+            self.tree_pagar.delete(iid)
+        for cid, fecha, nota, total, proveedor in self.db.listar_compras_por_pagar():
+            self.tree_pagar.insert(
+                "", "end", iid=str(cid),
+                values=(fecha or "", proveedor or nota or "", f"{float(total or 0):.2f}"),
+            )
+
+    def _pagar(self):
+        sel = self.tree_pagar.selection()
+        if not sel:
+            messagebox.showwarning("Compra", "Elige la compra que vas a pagar.", parent=self)
+            return
+        try:
+            self.db.pagar_compra(int(sel[0]), self.current_user)
+        except Exception as exc:
+            messagebox.showerror("Compra", str(exc), parent=self)
+            return
+        self._cargar_por_pagar()
+        self.lbl.configure(text=f"Compra {sel[0]} pagada desde caja.")
 
 
 class MetodosPagoFrame(ctk.CTkFrame):
@@ -501,3 +543,182 @@ def enviar_pdf_factura(parent, db: Database, factura_id: int, email: str, numero
         f"No se pudo adjuntar solo. El PDF está en:\n{path}",
         parent=parent,
     )
+
+
+class CombosFrame(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent, fg_color="#1e293b")
+        self.db = Database()
+        self._lineas: list[tuple[int, float]] = []
+        ctk.CTkLabel(self, text="Combos", font=("Arial", 16, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 4)
+        )
+        ctk.CTkLabel(
+            self,
+            text="Un combo junta productos y se vende a un solo precio.",
+            font=("Arial", 11),
+            text_color="#94a3b8",
+        ).pack(anchor="w", padx=12)
+        form = ctk.CTkFrame(self, fg_color="#0f172a")
+        form.pack(fill="x", padx=10, pady=8)
+        self.ent_nombre = ctk.CTkEntry(form, width=180, placeholder_text="Nombre")
+        self.ent_nombre.grid(row=0, column=0, padx=6, pady=8)
+        self.ent_precio = ctk.CTkEntry(form, width=90, placeholder_text="Precio")
+        self.ent_precio.grid(row=0, column=1, padx=6)
+        self.ent_prod = ctk.CTkEntry(form, width=90, placeholder_text="Id producto")
+        self.ent_prod.grid(row=1, column=0, padx=6, pady=6, sticky="w")
+        self.ent_cant = ctk.CTkEntry(form, width=80, placeholder_text="Cantidad")
+        self.ent_cant.grid(row=1, column=1, padx=6, sticky="w")
+        ctk.CTkButton(form, text="Agregar producto", width=130, command=self._agregar).grid(
+            row=1, column=2, padx=6
+        )
+        ctk.CTkButton(form, text="Guardar combo", fg_color="#15803d", command=self._guardar).grid(
+            row=0, column=2, padx=6
+        )
+        self.lbl_lineas = ctk.CTkLabel(self, text="Sin productos.", anchor="w")
+        self.lbl_lineas.pack(fill="x", padx=12)
+        self.tree = ttk.Treeview(
+            self, columns=("nombre", "precio", "incluye", "estado"), show="headings", height=10
+        )
+        for col, titulo, ancho in (
+            ("nombre", "Combo", 180),
+            ("precio", "Precio", 90),
+            ("incluye", "Incluye", 280),
+            ("estado", "Estado", 80),
+        ):
+            self.tree.heading(col, text=titulo)
+            self.tree.column(col, width=ancho)
+        self.tree.pack(fill="both", expand=True, padx=10, pady=6)
+        ctk.CTkButton(self, text="Quitar", fg_color="#b45309", command=self._quitar).pack(
+            anchor="w", padx=10, pady=8
+        )
+        self._cargar()
+
+    def _agregar(self):
+        raw = (self.ent_prod.get() or "").strip()
+        if not raw.isdigit():
+            messagebox.showwarning("Combo", "Indica el id del producto.", parent=self)
+            return
+        try:
+            cant = float((self.ent_cant.get() or "1").replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Combo", "La cantidad tiene que ser un número.", parent=self)
+            return
+        if cant <= 0:
+            messagebox.showwarning("Combo", "La cantidad tiene que ser mayor que cero.", parent=self)
+            return
+        self._lineas.append((int(raw), cant))
+        self.lbl_lineas.configure(
+            text="Incluye: " + ", ".join(f"{cant:g} del producto {pid}" for pid, cant in self._lineas)
+        )
+        self.ent_prod.delete(0, "end")
+        self.ent_cant.delete(0, "end")
+
+    def _guardar(self):
+        try:
+            precio = float((self.ent_precio.get() or "0").replace(",", "."))
+            self.db.guardar_combo(self.ent_nombre.get(), precio, list(self._lineas))
+        except Exception as exc:
+            messagebox.showerror("Combo", str(exc), parent=self)
+            return
+        self._lineas.clear()
+        self.lbl_lineas.configure(text="Sin productos.")
+        self.ent_nombre.delete(0, "end")
+        self.ent_precio.delete(0, "end")
+        self._cargar()
+
+    def _cargar(self):
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for cid, nombre, precio, incluye, activo in self.db.listar_combos():
+            self.tree.insert(
+                "", "end", iid=str(cid),
+                values=(nombre, f"{float(precio or 0):.2f}", incluye, "Activo" if activo else "Inactivo"),
+            )
+
+    def _quitar(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        self.db.desactivar_combo(int(sel[0]))
+        self._cargar()
+
+
+class LibroFrame(ctk.CTkFrame):
+    def __init__(self, parent, current_user=None):
+        super().__init__(parent, fg_color="#1e293b")
+        self.db = Database()
+        self.current_user = current_user
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        ctk.CTkLabel(self, text="Estado de resultados", font=("Arial", 16, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 4)
+        )
+        ctk.CTkLabel(
+            self,
+            text="Las ventas son ingreso. Las compras y los gastos restan. El ITBIS y la propina quedan como deuda.",
+            font=("Arial", 11),
+            text_color="#94a3b8",
+        ).pack(anchor="w", padx=12)
+        fechas = ctk.CTkFrame(self, fg_color="transparent")
+        fechas.pack(fill="x", padx=10, pady=8)
+        self.ent_desde = ctk.CTkEntry(fechas, width=120)
+        self.ent_desde.insert(0, hoy)
+        self.ent_desde.pack(side="left", padx=4)
+        self.ent_hasta = ctk.CTkEntry(fechas, width=120)
+        self.ent_hasta.insert(0, hoy)
+        self.ent_hasta.pack(side="left", padx=4)
+        ctk.CTkButton(fechas, text="Ver", width=70, command=self._ver).pack(side="left", padx=4)
+        self.lbl = ctk.CTkLabel(self, text="", font=("Arial", 13, "bold"), anchor="w")
+        self.lbl.pack(fill="x", padx=12)
+        self.tree = ttk.Treeview(
+            self, columns=("codigo", "cuenta", "tipo", "saldo"), show="headings", height=8
+        )
+        for col, titulo, ancho in (
+            ("codigo", "Código", 80),
+            ("cuenta", "Cuenta", 220),
+            ("tipo", "Tipo", 90),
+            ("saldo", "Saldo", 100),
+        ):
+            self.tree.heading(col, text=titulo)
+            self.tree.column(col, width=ancho)
+        self.tree.pack(fill="x", padx=10, pady=6)
+        gasto = ctk.CTkFrame(self, fg_color="#0f172a")
+        gasto.pack(fill="x", padx=10, pady=8)
+        ctk.CTkLabel(gasto, text="Gasto de caja", font=("Arial", 13, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 2)
+        )
+        self.ent_monto = ctk.CTkEntry(gasto, width=100, placeholder_text="Monto")
+        self.ent_monto.grid(row=1, column=0, padx=8, pady=8)
+        self.ent_nota = ctk.CTkEntry(gasto, width=240, placeholder_text="Nota")
+        self.ent_nota.grid(row=1, column=1, padx=6)
+        ctk.CTkButton(gasto, text="Registrar", fg_color="#b45309", command=self._gastar).grid(
+            row=1, column=2, padx=8
+        )
+        self._ver()
+
+    def _ver(self):
+        data = self.db.resultado_periodo(self.ent_desde.get().strip(), self.ent_hasta.get().strip())
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for cuenta in data["cuentas"]:
+            self.tree.insert(
+                "", "end",
+                values=(cuenta["codigo"], cuenta["nombre"], cuenta["tipo"], f"{cuenta['saldo']:.2f}"),
+            )
+        self.lbl.configure(
+            text=(
+                f"Resultado RD$ {data['resultado']:.2f} · "
+                f"ingresos {data['ingresos']:.2f} · gastos y compras {data['gastos']:.2f}"
+            )
+        )
+
+    def _gastar(self):
+        try:
+            monto = float((self.ent_monto.get() or "0").replace(",", "."))
+            self.db.registrar_gasto(monto, self.ent_nota.get(), self.current_user)
+        except Exception as exc:
+            messagebox.showerror("Gasto", str(exc), parent=self)
+            return
+        self.ent_monto.delete(0, "end")
+        self.ent_nota.delete(0, "end")
+        self._ver()

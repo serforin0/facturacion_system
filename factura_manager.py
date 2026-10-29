@@ -12,10 +12,115 @@ from tkinter import BooleanVar, messagebox, ttk
 from caja_manager import abrir_dialogo_movimiento_efectivo
 from config_impresion_dialog import open_config_impresion
 from database import Database
+from operacion_local import (
+    asiento_venta,
+    autorizacion_ok,
+    limpiar_nota,
+    partir_lineas,
+    precio_con_extras,
+    propina_legal,
+    puntos_ganados,
+    rebaja_puntos,
+)
 from pos_catalogo_dialog import PosCatalogoDialog
 
 # ITBIS ventas RD (precio en catálogo = base sin ITBIS; el impuesto se suma en factura si aplica)
 TASA_ITBIS = 0.18
+
+
+def normalizar_codigo_conduce(codigo: str) -> str:
+    """C42 y c0042 son el mismo pedido: C0042."""
+    limpio = "".join(ch for ch in (codigo or "").upper() if ch.isalnum())
+    if limpio.startswith("C") and limpio[1:].isdigit():
+        return "C" + str(int(limpio[1:])).zfill(4)
+    return limpio
+
+
+def linea_ticket_desde_conduce(linea: dict, componentes: list | None = None) -> dict | None:
+    """Pasa una línea guardada por el mesero al formato del ticket de escritorio.
+
+    El nombre y el precio ya incluyen extras. El total guardado es lo que se cobra,
+    con el ITBIS dentro, así que no se vuelve a calcular la promoción.
+    """
+    cantidad = float(linea.get("cantidad") or 0)
+    if cantidad <= 0:
+        return None
+    precio = round(float(linea.get("precio") or 0), 2)
+    aplica = linea.get("itbis") is not False
+    nombre = str(linea.get("nombre") or "Producto").strip() or "Producto"
+    subtotal_bruto = round(precio * cantidad, 2)
+    total_guardado = linea.get("total")
+    if total_guardado is None:
+        subtotal_neto = subtotal_bruto
+        impuesto = round(subtotal_neto * TASA_ITBIS, 2) if aplica else 0.0
+        total_linea = round(subtotal_neto + impuesto, 2)
+        descuento = 0.0
+    else:
+        total_linea = round(float(total_guardado), 2)
+        if aplica and total_linea > 0:
+            subtotal_neto = round(total_linea / (1 + TASA_ITBIS), 2)
+            impuesto = round(total_linea - subtotal_neto, 2)
+        else:
+            subtotal_neto = total_linea
+            impuesto = 0.0
+        if subtotal_bruto + 0.009 < subtotal_neto:
+            subtotal_bruto = subtotal_neto
+            precio = round(subtotal_neto / cantidad, 2) if cantidad else precio
+            descuento = 0.0
+        else:
+            descuento = round(subtotal_bruto - subtotal_neto, 2)
+            if descuento < 0.009:
+                descuento = 0.0
+                subtotal_neto = subtotal_bruto
+                impuesto = round(subtotal_neto * TASA_ITBIS, 2) if aplica else 0.0
+                total_linea = round(subtotal_neto + impuesto, 2)
+    item = {
+        "id": None if linea.get("combo") else linea.get("id"),
+        "nombre": nombre,
+        "cantidad": cantidad,
+        "precio": precio,
+        "descuento": descuento,
+        "subtotal_bruto": subtotal_bruto,
+        "subtotal_neto": subtotal_neto,
+        "aplica_itbis": aplica,
+        "impuesto_item": impuesto,
+        "total_linea": total_linea,
+    }
+    if linea.get("combo"):
+        item["id"] = None
+        item["combo_id"] = linea.get("id")
+        item["componentes"] = [
+            {"id": int(c["id"]), "cantidad": float(c["cantidad"])}
+            for c in (componentes or [])
+        ]
+    return item
+
+
+def marcar_conduce_facturado(cursor, conduce_id: int, factura_id: int) -> None:
+    """Cierra el pedido y suelta la mesa. Va dentro de la misma transacción de la venta."""
+    cursor.execute(
+        "SELECT estado, mesa FROM conduces WHERE id=?",
+        (int(conduce_id),),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("Ese pedido del mesero ya no está.")
+    if row[0] != "pendiente":
+        raise ValueError("Ese pedido del mesero ya se facturó.")
+    cursor.execute(
+        """
+        UPDATE conduces
+        SET estado='facturado', factura_id=?
+        WHERE id=? AND estado='pendiente'
+        """,
+        (int(factura_id), int(conduce_id)),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("Ese pedido del mesero ya se facturó.")
+    cursor.execute(
+        "DELETE FROM mesa_ocupada WHERE mesa=? OR conduce_id=?",
+        (row[1], int(conduce_id)),
+    )
 
 
 def _parse_monto_pago(txt: str) -> float:
@@ -71,6 +176,16 @@ class FacturaManager:
         self.subtotal_total = 0.0          # subtotal neto (bruto - todos los descuentos)
         self.impuestos_total = 0.0         # suma ITBIS líneas
         self.total_factura = 0.0           # gravable + ITBIS − desc. global
+        self.propina_monto = 0.0           # 10% de ley, fuera del ITBIS
+        self.var_propina = BooleanVar(value=False)
+        self.var_puntos = BooleanVar(value=False)
+        self.puntos_usados = 0
+        self.puntos_rebaja = 0.0
+        self._cambio_ticket = 0.0
+        self._conduce_id = None
+        self._conduce_codigo = ""
+        self._conduce_mesa = ""
+        self._conduce_usuario = ""
 
         # Producto actual seleccionado después de una búsqueda
         # Tuple: (..., aplica_itbis)
@@ -359,6 +474,46 @@ class FacturaManager:
         self.product_info_label.pack(fill="x", padx=10, pady=(2, 8))
         self.product_image_label = None
 
+        pedido = ctk.CTkFrame(right_frame, fg_color="transparent")
+        pedido.pack(fill="x", padx=8, pady=(8, 2))
+        ctk.CTkLabel(
+            pedido,
+            text="Código del mesero",
+            font=("Arial", 12, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        fila_conduce = ctk.CTkFrame(pedido, fg_color="transparent")
+        fila_conduce.pack(fill="x", pady=(2, 0))
+        self.entry_conduce = ctk.CTkEntry(
+            fila_conduce,
+            height=28,
+            placeholder_text="C0042",
+        )
+        self.entry_conduce.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.entry_conduce.bind("<Return>", lambda _e: self._traer_conduce())
+        self.entry_conduce.bind("<FocusIn>", lambda _e: self._refrescar_cola_conduces())
+        ctk.CTkButton(
+            fila_conduce,
+            text="Traer pedido",
+            width=110,
+            height=28,
+            fg_color="#2563eb",
+            command=self._traer_conduce,
+        ).pack(side="left")
+        self.lbl_conduce = ctk.CTkLabel(
+            pedido,
+            text="",
+            font=("Arial", 11),
+            anchor="w",
+            text_color="#86efac",
+        )
+        self.lbl_conduce.pack(fill="x")
+        self.cola_conduces = ctk.CTkScrollableFrame(
+            pedido, height=78, fg_color="transparent"
+        )
+        self.cola_conduces.pack(fill="x", pady=(2, 0))
+        self._programar_cola_conduces()
+
         ctk.CTkLabel(
             right_frame,
             text="Ticket",
@@ -440,6 +595,23 @@ class FacturaManager:
             width=100,
             fg_color="#6d28d9",
             command=self._abrir_descuento_global_dialog,
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            item_btn_frame, text="Nota", width=64, command=self._nota_linea
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            item_btn_frame,
+            text="Se queda",
+            width=80,
+            fg_color="#334155",
+            command=self._marcar_queda,
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            item_btn_frame,
+            text="Dejar el resto",
+            width=110,
+            fg_color="#334155",
+            command=self._dejar_resto_en_mesa,
         ).pack(side="left", padx=2)
 
         totales_frame = ctk.CTkFrame(right_frame, fg_color="#111827", corner_radius=6)
@@ -526,8 +698,38 @@ class FacturaManager:
         self.entry_pago_otro = ctk.CTkEntry(pago, height=28, width=80)
         self.entry_pago_otro.grid(row=5, column=2, sticky="ew", padx=(2, 8), pady=2)
         self.entry_pago_otro.bind("<KeyRelease>", self._on_pago_manual)
+        ctk.CTkCheckBox(
+            pago,
+            text="10% de ley",
+            variable=self.var_propina,
+            command=self._recalcular_totales_y_refrescar,
+            font=("Arial", 11),
+        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=2)
+        ctk.CTkLabel(pago, text="Autorización", font=("Arial", 11)).grid(
+            row=7, column=0, sticky="w", padx=8, pady=2
+        )
+        self.entry_auth = ctk.CTkEntry(pago, height=28, placeholder_text="La del voucher")
+        self.entry_auth.grid(row=7, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
+        ctk.CTkLabel(pago, text="Saldo a favor", font=("Arial", 11)).grid(
+            row=8, column=0, sticky="w", padx=8, pady=2
+        )
+        self.entry_pago_saldo = ctk.CTkEntry(pago, height=28)
+        self.entry_pago_saldo.grid(row=8, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
+        self.entry_pago_saldo.insert(0, "0.00")
+        self.entry_pago_saldo.bind("<KeyRelease>", self._on_pago_manual)
+        ctk.CTkCheckBox(
+            pago,
+            text="Usar puntos",
+            variable=self.var_puntos,
+            command=self._recalcular_totales_y_refrescar,
+            font=("Arial", 11),
+        ).grid(row=9, column=0, sticky="w", padx=8, pady=2)
+        self.lbl_cliente_saldo = ctk.CTkLabel(
+            pago, text="", font=("Arial", 11), anchor="w", text_color="#94a3b8"
+        )
+        self.lbl_cliente_saldo.grid(row=9, column=1, columnspan=2, sticky="w", padx=4, pady=2)
         self.lbl_cambio_panel.grid(
-            row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6)
+            row=10, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6)
         )
 
         espera_row = ctk.CTkFrame(right_frame, fg_color="transparent")
@@ -576,6 +778,14 @@ class FacturaManager:
 
         acciones = ctk.CTkFrame(right_frame, fg_color="transparent")
         acciones.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkButton(
+            acciones,
+            text="Pre-cuenta",
+            width=100,
+            height=32,
+            fg_color="#334155",
+            command=self._imprimir_precuenta,
+        ).pack(side="left", padx=2)
         ctk.CTkCheckBox(
             acciones,
             text="Imprimir ticket",
@@ -773,11 +983,35 @@ class FacturaManager:
         conn.close()
         self._pintar_grilla()
 
+    def _resolver_imagen(self, imagen_path: str | None) -> str:
+        ruta = (imagen_path or "").strip()
+        if not ruta:
+            return ""
+        if os.path.isfile(ruta):
+            return ruta
+        junto = os.path.join(os.path.dirname(os.path.abspath(__file__)), ruta)
+        if os.path.isfile(junto):
+            return junto
+        return ""
+
+    def _foto_grilla(self, imagen_path: str | None):
+        ruta = self._resolver_imagen(imagen_path)
+        if not ruta:
+            return None
+        try:
+            img = Image.open(ruta)
+            foto = ctk.CTkImage(img, size=(46, 46))
+        except Exception:
+            return None
+        self._imagenes_grilla.append(foto)
+        return foto
+
     def _pintar_grilla(self):
         if self.grid_inner is None:
             return
         for w in self.grid_inner.winfo_children():
             w.destroy()
+        self._imagenes_grilla = []
         rows = self.resultados_busqueda or []
         columnas = 3
         if not rows:
@@ -790,14 +1024,17 @@ class FacturaManager:
             nombre = row[1] or ""
             precio = self._parse_precio(self._precio_para_venta(row))
             stock = row[5]
-            texto = f"{nombre[:22]}\nRD$ {precio:.2f}   ·   {stock}"
+            texto = f"{nombre[:22]}\nRD$ {precio:.2f}   ·   {stock:g}"
+            foto = self._foto_grilla(row[7] if len(row) > 7 else "")
             btn = ctk.CTkButton(
                 self.grid_inner,
                 text=texto,
-                height=64,
+                height=72,
                 fg_color="#1e293b",
                 hover_color="#334155",
                 anchor="w",
+                image=foto,
+                compound="left",
                 command=lambda r=row: self._agregar_fila_producto(r),
             )
             btn.grid(
@@ -892,7 +1129,7 @@ class FacturaManager:
             return
         self._sincronizando_pago = True
         try:
-            total = float(self.total_factura or 0)
+            total = self._a_cobrar()
             metodo = self._metodo_rapido or "efectivo"
             montos = {"efectivo": "0.00", "tarjeta": "0.00", "transferencia": "0.00"}
             otro = "0.00"
@@ -912,6 +1149,9 @@ class FacturaManager:
             if self.entry_pago_otro is not None:
                 self.entry_pago_otro.delete(0, "end")
                 self.entry_pago_otro.insert(0, otro)
+            if getattr(self, "entry_pago_saldo", None) is not None:
+                self.entry_pago_saldo.delete(0, "end")
+                self.entry_pago_saldo.insert(0, "0.00")
         finally:
             self._sincronizando_pago = False
         self._recalcular_cambio_panel()
@@ -919,7 +1159,7 @@ class FacturaManager:
     def _recalcular_cambio_panel(self):
         if self.lbl_cambio_panel is None or self.entry_pago_efectivo is None:
             return
-        total = float(self.total_factura or 0)
+        total = self._a_cobrar()
         try:
             ef = _parse_monto_pago(self.entry_pago_efectivo.get())
             tar = _parse_monto_pago(self.entry_pago_tarjeta.get())
@@ -929,17 +1169,22 @@ class FacturaManager:
                 if self.entry_pago_otro is not None
                 else 0.0
             )
+            saldo = (
+                _parse_monto_pago(self.entry_pago_saldo.get())
+                if getattr(self, "entry_pago_saldo", None) is not None
+                else 0.0
+            )
         except ValueError:
             self.lbl_cambio_panel.configure(text="Cambio: —")
             return
         if self._condicion_es_credito_plazo():
-            cobrado = ef + tar + trf + otro
+            cobrado = ef + tar + trf + otro + saldo
             pend = max(0.0, total - cobrado)
             self.lbl_cambio_panel.configure(
                 text=f"Cobrado: RD$ {cobrado:.2f}   Pendiente: RD$ {pend:.2f}"
             )
             return
-        otros = tar + trf + otro
+        otros = tar + trf + otro + saldo
         por_efectivo = max(0.0, total - otros)
         cambio = max(0.0, ef - por_efectivo)
         self.lbl_cambio_panel.configure(text=f"Cambio: RD$ {cambio:.2f}")
@@ -984,19 +1229,33 @@ class FacturaManager:
             raise ValueError("Elija el método del monto «Otro».")
         return monto, info[0]
 
-    def _construir_pagos(self, ef: float, tar: float, trf: float, otro: float = 0.0, otro_tipo: str | None = None):
+    def _a_cobrar(self) -> float:
+        return round(float(self.total_factura or 0) + float(self.propina_monto or 0), 2)
+
+    def _construir_pagos(self, ef: float, tar: float, trf: float, otro: float = 0.0, otro_tipo: str | None = None, auth: str = "", saldo: float = 0.0):
         """
         Arma los pagos a guardar. El efectivo que queda en caja es el neto
         (lo recibido menos el cambio), no el billete entregado por el cliente.
         """
-        if ef < 0 or tar < 0 or trf < 0 or otro < 0:
+        if ef < 0 or tar < 0 or trf < 0 or otro < 0 or saldo < 0:
             messagebox.showerror("Error", "Los montos deben ser positivos.")
             return None
         if otro > 0 and not otro_tipo:
             messagebox.showerror("Cobro", "Elija el método del monto «Otro».")
             return None
-        total = float(self.total_factura or 0)
-        exactos = tar + trf + otro
+        if saldo > 0:
+            if not self._cliente_id:
+                messagebox.showerror("Saldo a favor", "Para usar saldo a favor elige el cliente.")
+                return None
+            disponible = self.db.saldo_favor_cliente(self._cliente_id)
+            if saldo > disponible + 0.009:
+                messagebox.showerror(
+                    "Saldo a favor",
+                    f"El cliente solo tiene {disponible:.2f} de saldo a favor.",
+                )
+                return None
+        total = self._a_cobrar()
+        exactos = tar + trf + otro + saldo
         total_pagos = ef + exactos
         es_cred = self._condicion_es_credito_plazo()
         if es_cred:
@@ -1022,15 +1281,23 @@ class FacturaManager:
                 )
                 return None
             ef_guardar = round(max(0.0, total - exactos), 2)
+        self._cambio_ticket = 0.0 if es_cred else round(max(0.0, ef - ef_guardar), 2)
+        try:
+            codigo_auth = autorizacion_ok(tar, auth)
+        except ValueError as exc:
+            messagebox.showerror("Tarjeta", str(exc))
+            return None
         pagos = []
         if ef_guardar > 0:
             pagos.append({"tipo": "efectivo", "monto": ef_guardar})
         if tar > 0:
-            pagos.append({"tipo": "tarjeta", "monto": tar})
+            pagos.append({"tipo": "tarjeta", "monto": tar, "referencia": codigo_auth})
         if trf > 0:
             pagos.append({"tipo": "transferencia", "monto": trf})
         if otro > 0 and otro_tipo:
             pagos.append({"tipo": otro_tipo, "monto": round(otro, 2)})
+        if saldo > 0:
+            pagos.append({"tipo": "saldo_favor", "monto": round(saldo, 2)})
         return pagos
 
     def _cobrar_desde_panel(self):
@@ -1039,10 +1306,19 @@ class FacturaManager:
             tar = _parse_monto_pago(self.entry_pago_tarjeta.get())
             trf = _parse_monto_pago(self.entry_pago_transferencia.get())
             otro, otro_tipo = self._otro_pago_actual()
+            saldo = (
+                _parse_monto_pago(self.entry_pago_saldo.get())
+                if getattr(self, "entry_pago_saldo", None) is not None
+                else 0.0
+            )
         except ValueError as exc:
             messagebox.showerror("Error", str(exc) or "Montos de pago inválidos.")
             return
-        pagos = self._construir_pagos(ef, tar, trf, otro, otro_tipo)
+        if self.var_puntos.get() and not self._cliente_id:
+            messagebox.showwarning("Puntos", "Para usar puntos elige el cliente.")
+            return
+        auth = self.entry_auth.get() if self.entry_auth is not None else ""
+        pagos = self._construir_pagos(ef, tar, trf, otro, otro_tipo, auth, saldo)
         if pagos is None:
             return
         self._guardar_y_imprimir_factura(
@@ -1181,6 +1457,8 @@ class FacturaManager:
             if doc:
                 self.entry_rnc_cliente.insert(0, doc)
             top.destroy()
+            self._mostrar_saldo_cliente()
+            self._recalcular_totales_y_refrescar()
 
         tree.bind("<Double-1>", lambda e: usar_sel())
 
@@ -1504,9 +1782,9 @@ class FacturaManager:
         except Exception:
             pass
 
-        if imagen_path and os.path.exists(imagen_path):
+        if self._resolver_imagen(imagen_path):
             try:
-                img = Image.open(imagen_path)
+                img = Image.open(self._resolver_imagen(imagen_path))
                 self.product_ctk_image = ctk.CTkImage(img, size=(110, 80))
                 self.product_image_label.configure(
                     image=self.product_ctk_image,
@@ -1660,6 +1938,12 @@ class FacturaManager:
 
         precio_unit = self._parse_precio(self._precio_para_venta(self.producto_actual))
         aplica = bool(int(aplica_itbis or 1))
+        elegido = self._elegir_extras(int(pid))
+        if elegido is None:
+            return
+        extras, nota_linea = elegido
+        precio_unit, extra_txt = precio_con_extras(precio_unit, extras)
+        nota_linea = limpiar_nota(nota_linea)
 
         permitir_sin_stock = int(facturar_sin_stock or 1)
         if permitir_sin_stock == 0 and cantidad > stock:
@@ -1726,13 +2010,16 @@ class FacturaManager:
         )
         total_linea = round(subtotal_neto + impuesto_item, 2)
 
-        nombre_linea = nombre
-        if int(desc_en_factura or 0) and (descripcion or "").strip():
+        nombre_linea = self._nombre_con_detalle(nombre, extra_txt, nota_linea)
+        if int(desc_en_factura or 0) and (descripcion or "").strip() and not extra_txt and not nota_linea:
             nombre_linea = f"{nombre}\n{(descripcion or '').strip()}"[:900]
 
         item = {
             "id": pid,
             "nombre": nombre_linea,
+            "nombre_base": nombre,
+            "extras_txt": extra_txt,
+            "nota": nota_linea,
             "cantidad": cantidad,
             "precio": precio_unit,
             "descuento": descuento_linea,
@@ -1744,8 +2031,10 @@ class FacturaManager:
         }
 
         fusionado = False
-        if not desc_pct_text and not desc_monto_text:
+        if not desc_pct_text and not desc_monto_text and not extra_txt and not nota_linea:
             for i, existente in enumerate(self.factura_items):
+                if existente.get("nota") or existente.get("extras_txt"):
+                    continue
                 if existente["id"] != pid:
                     continue
                 if abs(float(existente["precio"]) - precio_unit) > 0.001:
@@ -1846,6 +2135,7 @@ class FacturaManager:
             "componentes": [
                 {"id": int(pid), "cantidad": float(cant_comp or 0)} for pid, cant_comp, *_ in comps
             ],
+            "combo_id": int(combo_id),
         }
         for i, existente in enumerate(self.factura_items):
             if existente.get("nombre") != nombre or existente.get("id") is not None:
@@ -1884,12 +2174,15 @@ class FacturaManager:
             imp = float(item.get("impuesto_item") or 0)
             total = float(item.get("total_linea") or subt)
 
+            nombre = item["nombre"]
+            if item.get("cobrar") is False:
+                nombre = f"Se queda · {nombre}"
             self.tree_factura.insert(
                 "",
                 "end",
                 iid=str(idx),
                 values=(
-                    item["nombre"],
+                    nombre,
                     f"{cant:.2f}",
                     f"{precio:.2f}",
                     f"{desc:.2f}",
@@ -1908,6 +2201,11 @@ class FacturaManager:
             self.subtotal_total = 0.0
             self.impuestos_total = 0.0
             self.total_factura = 0.0
+            self.propina_monto = 0.0
+            self.puntos_usados = 0
+            self.puntos_rebaja = 0.0
+            if self._conduce_id is not None:
+                self._olvidar_conduce_en_pantalla()
 
             self._refrescar_tree_factura()
             self._refrescar_totales_ui(0.0)
@@ -1930,12 +2228,29 @@ class FacturaManager:
         self.impuestos_total = sum(
             float(i.get("impuesto_item") or 0) for i in self.factura_items
         )
+        self.puntos_usados = 0
+        self.puntos_rebaja = 0.0
+        if self.var_puntos.get() and self._cliente_id:
+            puntos = self._puntos_del_cliente(self._cliente_id)
+            usados, rebaja = rebaja_puntos(puntos, puntos)
+            tope = self.subtotal_total
+            if rebaja > tope:
+                usados = int(tope)
+                rebaja = float(usados)
+            self.puntos_usados = usados
+            self.puntos_rebaja = round(rebaja, 2)
+            if self.subtotal_total > 0 and self.puntos_rebaja > 0:
+                factor = (self.subtotal_total - self.puntos_rebaja) / self.subtotal_total
+                self.impuestos_total = round(self.impuestos_total * factor, 2)
+                self.subtotal_total = round(self.subtotal_total - self.puntos_rebaja, 2)
         self.total_factura = (
             self.subtotal_total + self.impuestos_total - self.descuento_global_monto
         )
+        base_ley = max(0.0, round(self.subtotal_total - self.descuento_global_monto, 2))
+        self.propina_monto = propina_legal(base_ley, bool(self.var_propina.get()))
 
         self._refrescar_tree_factura()
-        self._refrescar_totales_ui(descuento_total)
+        self._refrescar_totales_ui(descuento_total + self.puntos_rebaja)
 
     def _refrescar_totales_ui(self, descuento_total):
         self.lbl_subtotal.configure(
@@ -1947,9 +2262,18 @@ class FacturaManager:
         self.lbl_impuestos.configure(
             text=f"ITBIS (18%): RD$ {self.impuestos_total:.2f}"
         )
-        self.lbl_total.configure(
-            text=f"Total: RD$ {self.total_factura:.2f}"
-        )
+        if self.propina_monto > 0:
+            self.lbl_total.configure(
+                text=(
+                    f"Total: RD$ {self.total_factura:.2f}\n"
+                    f"10% de ley: RD$ {self.propina_monto:.2f}\n"
+                    f"A cobrar: RD$ {self._a_cobrar():.2f}"
+                )
+            )
+        else:
+            self.lbl_total.configure(
+                text=f"Total: RD$ {self.total_factura:.2f}"
+            )
         self._sync_pago_con_total()
 
     def editar_item_factura(self):
@@ -2267,12 +2591,334 @@ class FacturaManager:
             n = 0
         self.btn_recuperar.configure(text=f"Recuperar ({n})")
 
+    def _nombre_con_detalle(self, base: str, extras_txt: str, nota: str) -> str:
+        detalle = " · ".join(
+            parte for parte in ((extras_txt or "").strip(), (nota or "").strip()) if parte
+        )
+        if not detalle:
+            return base
+        return f"{base} · {detalle}"[:900]
+
+    def _elegir_extras(self, producto_id: int):
+        filas = self.db.modificadores_de(producto_id)
+        if not filas:
+            return [], ""
+        top = self.parent.winfo_toplevel()
+        dlg = ctk.CTkToplevel(top)
+        dlg.title("Extras")
+        dlg.geometry("360x420")
+        dlg.transient(top)
+        dlg.grab_set()
+        ctk.CTkLabel(dlg, text="Extras y nota", font=("Arial", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(12, 6)
+        )
+        marcas = []
+        for mid, nom, precio in filas:
+            var = BooleanVar(value=False)
+            ctk.CTkCheckBox(
+                dlg,
+                text=f"{nom}   RD$ {float(precio):.2f}",
+                variable=var,
+            ).pack(anchor="w", padx=16, pady=2)
+            marcas.append((var, {"id": int(mid), "nombre": nom, "precio": float(precio or 0)}))
+        ctk.CTkLabel(dlg, text="Nota", font=("Arial", 11)).pack(anchor="w", padx=16, pady=(8, 2))
+        entry = ctk.CTkEntry(dlg, width=300, placeholder_text="Sin hielo, para llevar…")
+        entry.pack(anchor="w", padx=16)
+        elegido = {"ok": False}
+
+        def aceptar():
+            elegido["ok"] = True
+            elegido["nota"] = entry.get()
+            elegido["extras"] = [dato for var, dato in marcas if var.get()]
+            dlg.destroy()
+
+        ctk.CTkButton(dlg, text="Agregar", fg_color="#2563eb", command=aceptar).pack(
+            anchor="w", padx=16, pady=12
+        )
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        entry.focus_set()
+        dlg.wait_window()
+        if not elegido["ok"]:
+            return None
+        return elegido["extras"], limpiar_nota(elegido["nota"])
+
+    def _nota_linea(self):
+        selected = self.tree_factura.selection()
+        if not selected:
+            messagebox.showwarning("Nota", "Selecciona una línea.")
+            return
+        item = self.factura_items[int(selected[0])]
+        top = self.parent.winfo_toplevel()
+        dlg = ctk.CTkToplevel(top)
+        dlg.title("Nota")
+        dlg.geometry("360x150")
+        dlg.transient(top)
+        dlg.grab_set()
+        entry = ctk.CTkEntry(dlg, width=320, placeholder_text="Sin hielo, para llevar…")
+        entry.pack(anchor="w", padx=16, pady=16)
+        if item.get("nota"):
+            entry.insert(0, item["nota"])
+
+        def guardar():
+            nota = limpiar_nota(entry.get())
+            base = item.get("nombre_base") or item["nombre"]
+            item["nombre_base"] = base
+            item["nota"] = nota
+            item["nombre"] = self._nombre_con_detalle(base, item.get("extras_txt") or "", nota)
+            dlg.destroy()
+            self._refrescar_tree_factura()
+
+        ctk.CTkButton(dlg, text="Guardar", command=guardar).pack(anchor="w", padx=16)
+        entry.focus_set()
+
+    def _marcar_queda(self):
+        selected = self.tree_factura.selection()
+        if not selected:
+            messagebox.showwarning("Mesa", "Selecciona la línea que se queda.")
+            return
+        item = self.factura_items[int(selected[0])]
+        item["cobrar"] = item.get("cobrar") is False
+        self._refrescar_tree_factura()
+
+    def _linea_conduce_desde_ticket(self, item: dict) -> dict:
+        es_combo = bool(item.get("componentes"))
+        return {
+            "id": item.get("combo_id") if es_combo else item.get("id"),
+            "nombre": item["nombre"],
+            "cantidad": item["cantidad"],
+            "precio": item["precio"],
+            "precio_base": item["precio"],
+            "total": round(float(item.get("total_linea") or 0), 2),
+            "combo": es_combo,
+            "itbis": bool(item.get("aplica_itbis", True)),
+            "nota": item.get("nota") or "",
+            "extras": [],
+        }
+
+    def _dejar_resto_en_mesa(self):
+        if not self._conduce_id:
+            messagebox.showwarning("Mesa", "Trae primero el pedido de la mesa.")
+            return
+        indices = [i for i, item in enumerate(self.factura_items) if item.get("cobrar") is not False]
+        try:
+            van, quedan = partir_lineas(self.factura_items, indices)
+        except ValueError as exc:
+            messagebox.showwarning("Mesa", str(exc))
+            return
+        lineas = [self._linea_conduce_desde_ticket(item) for item in quedan]
+        subtotal = round(sum(float(item.get("subtotal_neto") or 0) for item in quedan), 2)
+        itbis = round(sum(float(item.get("impuesto_item") or 0) for item in quedan), 2)
+        conn = self.db.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE conduces SET items_json=?, subtotal=?, itbis=?, total=? WHERE id=? AND estado='pendiente'",
+                (json.dumps(lineas, ensure_ascii=False), subtotal, itbis, round(subtotal + itbis, 2), int(self._conduce_id)),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Ese pedido ya no está pendiente")
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            messagebox.showerror("Mesa", str(exc))
+            return
+        finally:
+            conn.close()
+        codigo = self._conduce_codigo
+        mesa = self._conduce_mesa
+        self.factura_items = list(van)
+        self._olvidar_conduce_en_pantalla()
+        if getattr(self, "lbl_conduce", None) is not None:
+            self.lbl_conduce.configure(
+                text=f"Lo que se queda sigue en {codigo} · {mesa}. Cobra ahora esta parte."
+            )
+        self._recalcular_totales_y_refrescar()
+        self._refrescar_cola_conduces()
+
+    def _puntos_del_cliente(self, cliente_id: int) -> int:
+        conn = self.db.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT IFNULL(puntos,0) FROM clientes WHERE id=?", (int(cliente_id),))
+        fila = cur.fetchone()
+        conn.close()
+        return int((fila or [0])[0] or 0)
+
+    def _mostrar_saldo_cliente(self):
+        etiqueta = getattr(self, "lbl_cliente_saldo", None)
+        if etiqueta is None:
+            return
+        if not self._cliente_id:
+            etiqueta.configure(text="")
+            return
+        puntos = self._puntos_del_cliente(self._cliente_id)
+        saldo = self.db.saldo_favor_cliente(self._cliente_id)
+        etiqueta.configure(text=f"{puntos} puntos · saldo RD$ {saldo:.2f}")
+
+    def _olvidar_conduce_en_pantalla(self, limpiar_codigo: bool = True):
+        """Suelta el pedido en pantalla. En la base sigue pendiente hasta que se cobre."""
+        self._conduce_id = None
+        self._conduce_codigo = ""
+        self._conduce_mesa = ""
+        self._conduce_usuario = ""
+        if getattr(self, "lbl_conduce", None) is not None:
+            self.lbl_conduce.configure(text="")
+        if limpiar_codigo and getattr(self, "entry_conduce", None) is not None:
+            self.entry_conduce.delete(0, "end")
+
+    def _programar_cola_conduces(self):
+        cola = getattr(self, "cola_conduces", None)
+        if cola is None:
+            return
+        try:
+            if not cola.winfo_exists():
+                return
+        except Exception:
+            return
+        self._refrescar_cola_conduces()
+        try:
+            self.parent.after(8000, self._programar_cola_conduces)
+        except Exception:
+            return
+
+    def _refrescar_cola_conduces(self):
+        cola = getattr(self, "cola_conduces", None)
+        if cola is None:
+            return
+        try:
+            if not cola.winfo_exists():
+                return
+        except Exception:
+            return
+        for hijo in cola.winfo_children():
+            hijo.destroy()
+        conn = self.db.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, codigo, mesa, IFNULL(usuario,''), total
+                FROM conduces
+                WHERE estado = 'pendiente' AND TRIM(IFNULL(codigo,'')) != ''
+                ORDER BY datetime(fecha) ASC, id ASC
+                LIMIT 30
+                """
+            )
+            filas = cur.fetchall()
+        except Exception:
+            filas = []
+        finally:
+            conn.close()
+        if not filas:
+            ctk.CTkLabel(
+                cola,
+                text="Ningún pedido por cobrar.",
+                font=("Arial", 10),
+                text_color="#64748b",
+                anchor="w",
+            ).pack(fill="x")
+            return
+        for cid, codigo, mesa, usuario, total in filas:
+            quien = (usuario or "Mesero").split("@")[0]
+            texto = f"{mesa} · {codigo} · {quien} · RD$ {float(total or 0):.2f}"
+            activo = self._conduce_id == cid
+            ctk.CTkButton(
+                cola,
+                text=texto,
+                height=26,
+                anchor="w",
+                fg_color="#14532d" if activo else "#334155",
+                hover_color="#166534" if activo else "#1e293b",
+                command=lambda c=codigo: self._traer_conduce(c),
+            ).pack(fill="x", pady=1)
+
+    def _traer_conduce(self, codigo: str | None = None):
+        if self.db.fetch_caja_abierta_row() is None:
+            messagebox.showwarning(
+                "Caja",
+                "Abre la caja antes de traer el pedido del mesero.",
+            )
+            return
+        clave = normalizar_codigo_conduce(
+            codigo if codigo is not None else self.entry_conduce.get()
+        )
+        if not clave:
+            return
+        conn = self.db.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT c.id, c.codigo, c.mesa, IFNULL(c.usuario,''), c.items_json,
+                       c.estado, IFNULL(f.numero,'')
+                FROM conduces c
+                LEFT JOIN facturas f ON f.id = c.factura_id
+                WHERE c.codigo = ?
+                """,
+                (clave,),
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if not row:
+            messagebox.showwarning("Pedido", "No hay un pedido con ese código.")
+            return
+        conduce_id, codigo_real, mesa, usuario, items_json, estado, factura = row
+        if estado != "pendiente":
+            detalle = f": {factura}" if factura else ""
+            messagebox.showinfo("Pedido", f"Ese código ya se facturó{detalle}.")
+            return
+        if self.factura_items and self._conduce_id != conduce_id:
+            messagebox.showwarning(
+                "Pedido",
+                f"Este ticket ya tiene productos. Déjalo en cero antes de traer {codigo_real} · {mesa}.",
+            )
+            return
+        try:
+            lineas = json.loads(items_json or "[]")
+        except json.JSONDecodeError:
+            messagebox.showerror("Pedido", "No se pudo leer el pedido del mesero.")
+            return
+        items = []
+        for linea in lineas:
+            if not isinstance(linea, dict):
+                continue
+            componentes = None
+            if linea.get("combo") and linea.get("id"):
+                comps = self.db.componentes_combo(int(linea["id"]))
+                componentes = [
+                    {"id": int(pid), "cantidad": float(cant or 0)}
+                    for pid, cant, *_resto in comps
+                ]
+            item = linea_ticket_desde_conduce(linea, componentes)
+            if item:
+                items.append(item)
+        if not items:
+            messagebox.showwarning("Pedido", "Ese pedido no tiene productos.")
+            return
+        self.factura_items = items
+        self._conduce_id = int(conduce_id)
+        self._conduce_codigo = codigo_real or clave
+        self._conduce_mesa = mesa or ""
+        self._conduce_usuario = usuario or ""
+        self.descuento_global_monto = 0.0
+        self._pago_manual = False
+        self.entry_conduce.delete(0, "end")
+        self.entry_conduce.insert(0, self._conduce_codigo)
+        quien = (usuario or "el mesero").split("@")[0]
+        self.lbl_conduce.configure(
+            text=f"{self._conduce_codigo} de {quien} · {mesa}. Cobra en esta caja para facturar."
+        )
+        self._recalcular_totales_y_refrescar()
+        self._refrescar_cola_conduces()
+        self._enfocar_lector()
+
     def _limpiar_ticket_en_pantalla(self):
         self.factura_items.clear()
         self._cliente_id = None
         self.descuento_global_monto = 0.0
         self._pago_manual = False
         self.var_solo_presupuesto.set(False)
+        self._olvidar_conduce_en_pantalla()
         if self.entry_codigo_cliente is not None:
             self.entry_codigo_cliente.delete(0, "end")
             self.entry_codigo_cliente.insert(0, "MOSTRADOR")
@@ -2283,6 +2929,8 @@ class FacturaManager:
         self.entry_desc_monto.delete(0, "end")
         self._recalcular_totales_y_refrescar()
         self._actualizar_vista_secuencia_documento(regenerar=True)
+        self._refrescar_cola_conduces()
+        self._mostrar_saldo_cliente()
         self._enfocar_lector()
 
     def _poner_en_espera(self):
@@ -2318,7 +2966,19 @@ class FacturaManager:
                     "En espera", "Indique un nombre para el ticket.", parent=dlg
                 )
                 return
-            payload = json.dumps(self.factura_items, ensure_ascii=False)
+            if self._conduce_id:
+                payload = json.dumps(
+                    {
+                        "items": self.factura_items,
+                        "conduce_id": self._conduce_id,
+                        "conduce_codigo": self._conduce_codigo,
+                        "conduce_mesa": self._conduce_mesa,
+                        "conduce_usuario": self._conduce_usuario,
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                payload = json.dumps(self.factura_items, ensure_ascii=False)
             self.db.guardar_venta_espera(
                 etiqueta,
                 self.current_user,
@@ -2467,14 +3127,29 @@ class FacturaManager:
             _fecha,
         ) = row
         try:
-            items = json.loads(items_json or "[]")
+            crudo = json.loads(items_json or "[]")
         except json.JSONDecodeError:
             messagebox.showerror("En espera", "No se pudo leer el ticket guardado.")
             return
-        if not items:
+        conduce = crudo if isinstance(crudo, dict) else None
+        items = (conduce or {}).get("items") if conduce else crudo
+        if not isinstance(items, list) or not items:
             messagebox.showwarning("En espera", "El ticket guardado no tiene productos.")
             return
+        self._olvidar_conduce_en_pantalla()
         self.factura_items = list(items)
+        if conduce and conduce.get("conduce_id"):
+            self._conduce_id = int(conduce["conduce_id"])
+            self._conduce_codigo = str(conduce.get("conduce_codigo") or "")
+            self._conduce_mesa = str(conduce.get("conduce_mesa") or "")
+            self._conduce_usuario = str(conduce.get("conduce_usuario") or "")
+            if getattr(self, "entry_conduce", None) is not None and self._conduce_codigo:
+                self.entry_conduce.insert(0, self._conduce_codigo)
+            if getattr(self, "lbl_conduce", None) is not None:
+                quien = (self._conduce_usuario or "el mesero").split("@")[0]
+                self.lbl_conduce.configure(
+                    text=f"{self._conduce_codigo} de {quien} · {self._conduce_mesa}. Cobra en esta caja para facturar."
+                )
         self._cliente_id = int(cliente_id) if cliente_id else None
         self.descuento_global_monto = float(desc_global or 0)
         self._pago_manual = False
@@ -2585,7 +3260,7 @@ class FacturaManager:
         Diálogo para ingresar pagos (efectivo, tarjeta, transferencia),
         calcular cambio y luego llamar a _guardar_y_imprimir_factura().
         """
-        total = self.total_factura
+        total = self._a_cobrar()
         es_cred_plazo = self._condicion_es_credito_plazo()
 
         dlg = ctk.CTkToplevel(self.parent)
@@ -2638,6 +3313,12 @@ class FacturaManager:
         entry_tr = ctk.CTkEntry(frame_tr, width=120)
         entry_tr.pack(side="left", padx=5)
         entry_tr.insert(0, "0.00")
+
+        frame_auth = ctk.CTkFrame(dlg)
+        frame_auth.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(frame_auth, text="Autorización:").pack(side="left", padx=5)
+        entry_auth = ctk.CTkEntry(frame_auth, width=140, placeholder_text="Voucher")
+        entry_auth.pack(side="left", padx=5)
 
         # ---- CAMBIO / RESUMEN CRÉDITO ----
         lbl_cambio = ctk.CTkLabel(
@@ -2701,7 +3382,7 @@ class FacturaManager:
                 messagebox.showerror("Error", "Montos de pago inválidos.")
                 return
 
-            pagos = self._construir_pagos(ef, tar, trf)
+            pagos = self._construir_pagos(ef, tar, trf, auth=entry_auth.get())
             if pagos is None:
                 return
 
@@ -2732,6 +3413,24 @@ class FacturaManager:
     #    IMPRESIÓN DEL TICKET
     # ==========================
 
+    def _fila_ticket(self, izquierda: str, derecha: str, ancho: int) -> str:
+        izquierda = str(izquierda)
+        derecha = str(derecha)
+        hueco = ancho - len(izquierda) - len(derecha)
+        if hueco < 1:
+            return f"{izquierda} {derecha}"
+        return izquierda + (" " * hueco) + derecha
+
+    def _fecha_ticket(self, valor: str) -> str:
+        s = str(valor or "")
+        if len(s) >= 16 and s[4] == "-" and s[7] == "-":
+            return f"{s[8:10]}/{s[5:7]}/{s[0:4]} {s[11:16]}"
+        return s
+
+    def _es_credito_fiscal(self) -> bool:
+        texto = (self.combo_tipo_comprobante.get() or "").lower() if self.combo_tipo_comprobante else ""
+        return "crédito" in texto or "credito" in texto
+
     def _build_ticket_text(
         self,
         numero,
@@ -2742,109 +3441,151 @@ class FacturaManager:
         descuento_total,
         impuesto_total,
         total,
+        precuenta: bool = False,
+        pagos: list | None = None,
+        propina: float = 0.0,
+        cambio: float = 0.0,
     ):
-        """
-        Construye el texto del ticket ajustándose al ancho configurable.
-        """
-        ticket_width = self.db.get_ticket_width()  # ancho dinámico
+        """Ticket térmico: pre-cuenta, factura de consumo o crédito fiscal."""
+        ancho = self.db.get_ticket_width()
         lines = []
 
-        def center(text):
-            return text.center(ticket_width)
+        def centro(texto: str) -> str:
+            return str(texto)[:ancho].center(ancho)
 
-        def sep(char="-"):
-            return char * ticket_width
+        def corte() -> str:
+            return "-" * ancho
 
-        # -----------------------------------
-        # ENCABEZADO (desde configuración «Empresa»)
-        # -----------------------------------
         emp = self.db.get_empresa_info()
-        nom = (emp.get("nombre") or "Mi empresa").strip() or "Mi empresa"
-        lines.append(center(nom[:ticket_width]))
+        lines.append(centro((emp.get("nombre") or "Mi empresa").strip() or "Mi empresa"))
+        direccion = (emp.get("direccion") or "").replace("\r\n", "\n").replace("\r", "\n")
+        for parte in direccion.split("\n"):
+            resto = parte.strip()
+            while resto:
+                lines.append(centro(resto[:ancho]))
+                resto = resto[ancho:].lstrip()
+        telefono = (emp.get("telefono") or "").strip()
+        if telefono:
+            lines.append(centro(f"Tel. {telefono}"))
         rnc_emisor = (emp.get("rnc") or "").strip()
         if rnc_emisor:
-            lines.append(center(f"RNC: {rnc_emisor}"[:ticket_width]))
-        dir_txt = (emp.get("direccion") or "").replace("\r\n", "\n").replace("\r", "\n")
-        for part in dir_txt.split("\n"):
-            chunk = part.strip()
-            while chunk:
-                lines.append(center(chunk[:ticket_width]))
-                chunk = chunk[ticket_width:].lstrip()
-        lines.append(sep())
-        lines.append(f"Factura: {numero}")
-        ncf = (getattr(self, "_ultimo_ncf", None) or "").strip()
+            lines.append(centro(f"RNC {rnc_emisor}"))
+        lines.append(corte())
+        credito = self._es_credito_fiscal() and not precuenta
+        titulo = "PRE-CUENTA" if precuenta else ("FACTURA PARA CREDITO FISCAL" if credito else "FACTURA")
+        lines.append(centro(titulo))
+        if precuenta:
+            lines.append(centro("Documento no fiscal"))
+        lines.append(corte())
+        lines.append(self._fila_ticket("Fecha", self._fecha_ticket(fecha), ancho))
+        if not precuenta and numero:
+            lines.append(self._fila_ticket("Factura" if credito else "Ticket", str(numero), ancho))
+        ncf = "" if precuenta else (getattr(self, "_ultimo_ncf", None) or "").strip()
         if ncf:
-            lines.append(f"NCF: {ncf}")
-        lines.append(f"Fecha : {fecha}")
-        if usuario:
-            lines.append(f"Cajero: {usuario}")
-        cod_cli = ""
+            lines.append(self._fila_ticket("NCF", ncf, ancho))
+        cliente = ""
         if getattr(self, "entry_codigo_cliente", None) is not None:
-            cod_cli = (self.entry_codigo_cliente.get() or "").strip()
-        if cod_cli:
-            lines.append(f"Cliente: {cod_cli[:ticket_width]}")
-        if getattr(self, "combo_condicion_pago", None) is not None:
-            term = (self.combo_condicion_pago.get() or "").strip()
-            if term:
-                lines.append(f"Condición: {term[:ticket_width]}")
-        if getattr(self, "combo_tipo_comprobante", None) is not None:
-            comp = (self.combo_tipo_comprobante.get() or "").strip()
-            if comp:
-                lines.append(f"Comprobante: {comp[:ticket_width]}")
+            cliente = (self.entry_codigo_cliente.get() or "").strip()
+        lines.append(self._fila_ticket("Cliente", cliente or "Consumidor final", ancho))
+        documento = ""
         if getattr(self, "entry_rnc_cliente", None) is not None:
-            rnc = (self.entry_rnc_cliente.get() or "").strip()
-            if rnc:
-                lines.append(f"RNC/Doc: {rnc[:ticket_width]}")
-        lines.append(sep())
-
-        # -----------------------------------
-        # DETALLES
-        # -----------------------------------
-        lines.append("DESCRIPCIÓN")
-        header_left = "CANT x P.U"
-        header_right = "IMPORTE"
-        spaces_hdr = ticket_width - len(header_left) - len(header_right)
-        if spaces_hdr < 1:
-            spaces_hdr = 1
-        lines.append(header_left + " " * spaces_hdr + header_right)
-        lines.append(sep())
-
+            documento = (self.entry_rnc_cliente.get() or "").strip()
+        if credito and documento:
+            lines.append(self._fila_ticket("RNC", documento, ancho))
+        mesa = (getattr(self, "_conduce_mesa", "") or "").strip()
+        if mesa:
+            lines.append(self._fila_ticket("Mesa", mesa, ancho))
+        pedido = (getattr(self, "_conduce_codigo", "") or "").strip()
+        if pedido:
+            lines.append(self._fila_ticket("Pedido", pedido, ancho))
+        mesero = (getattr(self, "_conduce_usuario", "") or "").strip()
+        if mesero:
+            lines.append(self._fila_ticket("Mesero", mesero.split("@")[0], ancho))
+        lines.append(corte())
+        lines.append(self._fila_ticket("UDS DESCRIPCION", "IMPORTE", ancho))
         for desc, cant, pu, total_linea in detalles:
-            desc = str(desc)
-            # cortar descripción si excede el ancho
-            while len(desc) > ticket_width:
-                lines.append(desc[:ticket_width])
-                desc = desc[ticket_width:]
-            if desc:
-                lines.append(desc)
-
-            left = f"{cant:.2f} x {pu:.2f}"
-            right = f"{total_linea:.2f}"
-
-            spaces = ticket_width - len(left) - len(right)
-            if spaces < 1:
-                spaces = 1
-
-            lines.append(left + " " * spaces + right)
-
-        # -----------------------------------
-        # TOTALES
-        # -----------------------------------
-        lines.append(sep())
-        lines.append(
-            f"SUB.GRAV.:".ljust(ticket_width - 10) + f"{subtotal_gravable:10.2f}"
-        )
-        if impuesto_total and impuesto_total > 0:
-            lines.append(
-                f"ITBIS 18%:".ljust(ticket_width - 10) + f"{impuesto_total:10.2f}"
-            )
-        lines.append(f"DESCUENTO:".ljust(ticket_width - 10) + f"{descuento_total:10.2f}")
-        lines.append(f"TOTAL:".ljust(ticket_width - 10) + f"{total:10.2f}")
-        lines.append(sep())
-        lines.append(center("GRACIAS POR SU COMPRA"))
+            nombre = str(desc)
+            while nombre:
+                lines.append(nombre[:ancho])
+                nombre = nombre[ancho:]
+            cant_txt = f"{float(cant):g}"
+            lines.append(self._fila_ticket(f"  {cant_txt} x {float(pu):,.2f}", f"{float(total_linea):,.2f}", ancho))
+        lines.append(corte())
+        if descuento_total and descuento_total > 0:
+            lines.append(self._fila_ticket("Descuento", f"{float(descuento_total):,.2f}", ancho))
+        lines.append(self._fila_ticket("Sub Total", f"{float(subtotal_gravable):,.2f}", ancho))
+        lines.append(self._fila_ticket("ITBIS 18%", f"{float(impuesto_total or 0):,.2f}", ancho))
+        if propina and propina > 0:
+            lines.append(self._fila_ticket("10% de ley", f"{float(propina):,.2f}", ancho))
+        a_cobrar = round(float(total or 0) + float(propina or 0), 2)
+        lines.append(self._fila_ticket("TOTAL", f"RD$ {a_cobrar:,.2f}", ancho))
+        if credito:
+            lines.append(corte())
+            lines.append(self._fila_ticket("BASE 0%", "0.00", ancho))
+            lines.append(self._fila_ticket("BASE 18%", f"{float(subtotal_gravable):,.2f}", ancho))
+            lines.append(self._fila_ticket("ITBIS", f"{float(impuesto_total or 0):,.2f}", ancho))
+        if not precuenta and pagos:
+            lines.append(corte())
+            for pago in pagos:
+                lines.append(self._fila_ticket(str(pago.get("tipo") or "Pago"), f"{float(pago.get('monto') or 0):,.2f}", ancho))
+                if pago.get("referencia"):
+                    lines.append(f"Aut. {pago['referencia']}"[:ancho])
+            lines.append(self._fila_ticket("Devuelta" if credito else "Cambio", f"{float(cambio or 0):,.2f}", ancho))
+        if usuario and not precuenta:
+            lines.append("")
+            lines.append(centro(f"Le atendió: {str(usuario).upper()}"))
+        lines.append(corte())
+        lines.append(centro("GRACIAS POR SU VISITA"))
         lines.append("\n\n\n")
-
         return "\n".join(lines)
+
+    def _imprimir_precuenta(self):
+        if not self.factura_items:
+            messagebox.showwarning("Pre-cuenta", "El ticket está vacío.")
+            return
+        self._recalcular_totales_y_refrescar()
+        detalles = [
+            (
+                item["nombre"],
+                item["cantidad"],
+                item["precio"],
+                float(item.get("subtotal_neto") or 0),
+            )
+            for item in self.factura_items
+        ]
+        descuento = self.descuentos_items_total + self.descuento_global_monto
+        texto = self._build_ticket_text(
+            "",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            self.current_user,
+            detalles,
+            self.subtotal_total,
+            descuento,
+            self.impuestos_total,
+            self.total_factura,
+            precuenta=True,
+            propina=self.propina_monto,
+        )
+        self._send_to_printer(texto)
+
+    def _guardar_asiento(self, cursor, concepto: str, origen: str, origen_id: int, lineas: list) -> None:
+        cursor.execute("SELECT id FROM asientos WHERE origen=? AND origen_id=?", (origen, int(origen_id)))
+        if cursor.fetchone():
+            return
+        cursor.execute(
+            "INSERT INTO asientos (fecha, concepto, origen, origen_id, usuario) VALUES (?,?,?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), concepto[:180], origen, int(origen_id), self.current_user),
+        )
+        asiento_id = int(cursor.lastrowid)
+        for codigo, debito, credito in lineas:
+            cursor.execute("SELECT id FROM cuentas WHERE codigo=?", (codigo,))
+            cuenta = cursor.fetchone()
+            if not cuenta:
+                raise ValueError(f"Falta la cuenta {codigo} en el libro")
+            cursor.execute(
+                "INSERT INTO asiento_lineas (asiento_id, cuenta_id, debito, credito) VALUES (?,?,?,?)",
+                (asiento_id, cuenta[0], debito, credito),
+            )
 
     def _send_to_printer(self, ticket_text: str):
         """
@@ -3058,7 +3799,9 @@ class FacturaManager:
             conn = self.db.get_connection()
             cursor = conn.cursor()
 
-            descuento_total = self.descuentos_items_total + self.descuento_global_monto
+            descuento_total = (
+                self.descuentos_items_total + self.descuento_global_monto + self.puntos_rebaja
+            )
 
             lbl_comp = (self.combo_tipo_comprobante.get() or "").lower()
             if "gubernamental" in lbl_comp:
@@ -3073,7 +3816,18 @@ class FacturaManager:
             # Guardar encabezado
             caja_abierta = self.db.fetch_caja_abierta_row()
             cierre_id = int(caja_abierta[0]) if caja_abierta else None
-            ncf = self.db.tomar_siguiente_ncf(tipo_comp_db, conn=conn)
+            encf = None
+            if (self.db.get_config("ecf_activo", "0") or "0") == "1":
+                from ecf import dgii as _dgii
+                tipo_electronico = _dgii.tipo_ecf_de(tipo_comp_db)
+                if tipo_electronico:
+                    reserva = self.db.tomar_siguiente_encf(tipo_electronico, conn)
+                    if reserva is None:
+                        raise ValueError(
+                            f"No hay e-NCF disponibles del tipo {tipo_electronico}."
+                        )
+                    encf = reserva[0]
+            ncf = encf or self.db.tomar_siguiente_ncf(tipo_comp_db, conn=conn)
             self._ultimo_ncf = ncf
             lista = self.combo_lista.get() if self.combo_lista is not None else "Público"
             numero = self._numero_factura_libre(cursor)
@@ -3083,8 +3837,8 @@ class FacturaManager:
                     (numero, tipo_comprobante, cliente_id, subtotal,
                      descuento_total, impuesto_total, total, estado, usuario, caja,
                      condicion_pago_id, fecha_vencimiento, moneda, tasa_cambio,
-                     cierre_id, ncf, lista_precio)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DOP', 1.0, ?, ?, ?)
+                     cierre_id, ncf, lista_precio, encf, propina)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DOP', 1.0, ?, ?, ?, ?, ?)
                 """,
                 (
                     numero,
@@ -3102,6 +3856,8 @@ class FacturaManager:
                     cierre_id,
                     ncf,
                     lista,
+                    encf,
+                    round(self.propina_monto, 2),
                 )
             )
 
@@ -3165,9 +3921,12 @@ class FacturaManager:
                             descripcion_mov=f"Venta combo: Factura {numero}",
                             conn=conn,
                         )
-                        cursor.execute("SELECT stock FROM productos WHERE id = ?", (cpid,))
-                        stk = cursor.fetchone()[0]
-                        if stk <= 10:
+                        cursor.execute(
+                            "SELECT stock, IFNULL(stock_minimo, 0) FROM productos WHERE id = ?",
+                            (cpid,),
+                        )
+                        stk, minimo = cursor.fetchone()
+                        if stk <= minimo:
                             low_stock.append((item["nombre"], stk))
                 elif item.get("id"):
                     cursor.execute(
@@ -3205,11 +3964,11 @@ class FacturaManager:
                     )
 
                     cursor.execute(
-                        "SELECT stock FROM productos WHERE id = ?",
-                        (item["id"],)
+                        "SELECT stock, IFNULL(stock_minimo, 0) FROM productos WHERE id = ?",
+                        (item["id"],),
                     )
-                    stk = cursor.fetchone()[0]
-                    if stk <= 10:
+                    stk, minimo = cursor.fetchone()
+                    if stk <= minimo:
                         low_stock.append((item["nombre"], stk))
 
                 # agregar al ticket
@@ -3218,19 +3977,70 @@ class FacturaManager:
                         item["nombre"],
                         item["cantidad"],
                         item["precio"],
-                        float(item.get("total_linea") or item["subtotal_neto"]),
+                        float(item.get("subtotal_neto") or 0),
                     )
                 )
 
-            # Guardar pagos
+            ahora_pago = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for p in pagos:
                 cursor.execute(
                     """
-                    INSERT INTO pagos_factura (factura_id, tipo_pago, monto)
-                    VALUES (?, ?, ?)
+                    INSERT INTO pagos_factura
+                        (factura_id, tipo_pago, monto, referencia, cierre_id, fecha, usuario, es_abono)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
                     """,
-                    (factura_id, p["tipo"], round(p["monto"], 2))
+                    (
+                        factura_id,
+                        p["tipo"],
+                        round(p["monto"], 2),
+                        p.get("referencia") or None,
+                        cierre_id,
+                        ahora_pago,
+                        self.current_user,
+                    ),
                 )
+
+            cursor.execute(
+                "SELECT codigo FROM metodos_pago WHERE IFNULL(activo,1)=1 AND IFNULL(afecta_caja,0)=1"
+            )
+            afectan = {fila[0] for fila in cursor.fetchall()} or {"efectivo"}
+            caja = round(sum(p["monto"] for p in pagos if p["tipo"] in afectan), 2)
+            saldo = round(sum(p["monto"] for p in pagos if p["tipo"] == "saldo_favor"), 2)
+            banco = round(sum(p["monto"] for p in pagos if p["tipo"] not in afectan and p["tipo"] != "saldo_favor"), 2)
+            fiado = round(max(0.0, self._a_cobrar() - caja - banco - saldo), 2)
+            self._guardar_asiento(
+                cursor,
+                f"Venta {numero}",
+                "factura",
+                factura_id,
+                asiento_venta(
+                    caja=caja,
+                    banco=banco,
+                    saldo=saldo,
+                    fiado=fiado,
+                    ventas=round(self.total_factura - self.impuestos_total, 2),
+                    itbis=round(self.impuestos_total, 2),
+                    propina=round(self.propina_monto, 2),
+                ),
+            )
+            cursor.execute("SELECT cliente_id FROM facturas WHERE id=?", (factura_id,))
+            cliente_id = cursor.fetchone()[0]
+            if cliente_id:
+                cursor.execute(
+                    "UPDATE clientes SET puntos = MAX(0, IFNULL(puntos,0) - ? + ?) WHERE id = ?",
+                    (self.puntos_usados, puntos_ganados(self.total_factura), cliente_id),
+                )
+            saldo_usado = round(sum(p["monto"] for p in pagos if p["tipo"] == "saldo_favor"), 2)
+            if saldo_usado > 0 and cliente_id:
+                cursor.execute(
+                    """
+                    INSERT INTO saldos_cliente (cliente_id, monto, concepto, factura_id, usuario)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (cliente_id, -saldo_usado, f"Usado en {numero}", factura_id, self.current_user),
+                )
+            if self._conduce_id:
+                marcar_conduce_facturado(cursor, int(self._conduce_id), int(factura_id))
 
             # Fecha real guardada
             cursor.execute("SELECT fecha FROM facturas WHERE id = ?", (factura_id,))
@@ -3242,12 +4052,30 @@ class FacturaManager:
             conn.commit()
             conn.close()
 
+            ecf_aviso = None
+            if encf:
+                try:
+                    from ecf import servicio as ecf_srv
+                    reg = ecf_srv.emitir_factura(self.db, factura_id) or {}
+                    if reg.get("id"):
+                        ecf_srv.enviar_en_segundo_plano(lambda: self.db, reg["id"])
+                    if reg.get("estado") == "error":
+                        ecf_aviso = reg.get("mensaje") or "No se pudo firmar el e-CF"
+                except Exception as exc:
+                    ecf_aviso = str(exc)
+
             # Avisos
             if low_stock:
                 msg = "Productos con stock bajo:\n\n"
                 for n, s in low_stock:
                     msg += f"• {n} → {s}\n"
                 messagebox.showwarning("Stock bajo", msg)
+            if ecf_aviso:
+                messagebox.showwarning(
+                    "e-CF",
+                    "La factura quedó guardada. El comprobante electrónico no se firmó:\n"
+                    + ecf_aviso,
+                )
 
             # -----------------------------
             # GENERAR TICKET DINÁMICO
@@ -3261,6 +4089,9 @@ class FacturaManager:
                 descuento_total,
                 self.impuestos_total,
                 self.total_factura,
+                pagos=pagos,
+                propina=self.propina_monto,
+                cambio=self._cambio_ticket,
             )
 
             # Guardar ticket en carpeta 'facturas'
@@ -3295,6 +4126,7 @@ class FacturaManager:
             self._cliente_id = None
             self._recalcular_totales_y_refrescar()
             self._actualizar_vista_secuencia_documento(regenerar=True)
+            self._refrescar_cola_conduces()
 
         except Exception as e:
             try:

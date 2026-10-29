@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 
 from app_paths import is_frozen, data_directory
+from operacion_local import asiento_simple
 
 
 def _tipo_codigo_default(tipo_movimiento: str) -> str:
@@ -991,9 +992,229 @@ class Database:
             referencia=f"COMPRA-{compra_id}",
             descripcion_mov=f"Compra {compra_id}", conn=conn,
         )
+        self.guardar_asiento(
+            cur, f"Compra {compra_id}", "compra", compra_id,
+            asiento_simple("5.1", "2.4", total), usuario,
+        )
         conn.commit()
         conn.close()
         return compra_id
+
+    def guardar_asiento(self, cursor, concepto: str, origen: str, origen_id: int, lineas: list, usuario: str | None) -> None:
+        cursor.execute(
+            "SELECT id FROM asientos WHERE origen=? AND origen_id=?",
+            (origen, int(origen_id)),
+        )
+        if cursor.fetchone():
+            return
+        cursor.execute(
+            "INSERT INTO asientos (fecha, concepto, origen, origen_id, usuario) VALUES (?,?,?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (concepto or "")[:180], origen, int(origen_id), usuario),
+        )
+        asiento_id = int(cursor.lastrowid)
+        for codigo, debito, credito in lineas:
+            cursor.execute("SELECT id FROM cuentas WHERE codigo=?", (codigo,))
+            cuenta = cursor.fetchone()
+            if not cuenta:
+                raise ValueError(f"Falta la cuenta {codigo} en el libro")
+            cursor.execute(
+                "INSERT INTO asiento_lineas (asiento_id, cuenta_id, debito, credito) VALUES (?,?,?,?)",
+                (asiento_id, cuenta[0], debito, credito),
+            )
+
+    def listar_compras_por_pagar(self) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT c.id, c.fecha, IFNULL(c.nota,''), c.total, IFNULL(p.nombre,'')
+            FROM compras c
+            LEFT JOIN proveedores p ON p.id = c.proveedor_id
+            WHERE IFNULL(c.pagada,0) = 0
+            ORDER BY c.id DESC
+            LIMIT 80
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def pagar_compra(self, compra_id: int, usuario: str | None) -> None:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT total FROM compras WHERE id=? AND IFNULL(pagada,0)=0", (int(compra_id),))
+            fila = cur.fetchone()
+            if not fila:
+                raise ValueError("Esa compra ya estaba pagada o no existe")
+            cur.execute("UPDATE compras SET pagada=1 WHERE id=?", (int(compra_id),))
+            self.guardar_asiento(
+                cur, f"Pago de la compra {compra_id}", "pago_compra", int(compra_id),
+                asiento_simple("2.4", "1.1", float(fila[0] or 0)), usuario,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+        conn.close()
+
+    def registrar_gasto(self, monto: float, nota: str, usuario: str | None) -> int:
+        monto = round(float(monto or 0), 2)
+        if monto <= 0:
+            raise ValueError("El gasto tiene que ser mayor que cero")
+        conn = self.get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO gastos (fecha, monto, nota, usuario) VALUES (?,?,?,?)",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), monto, (nota or "").strip()[:120], usuario),
+            )
+            gasto_id = int(cur.lastrowid)
+            self.guardar_asiento(
+                cur, (nota or "Gasto").strip()[:180] or "Gasto", "gasto", gasto_id,
+                asiento_simple("6.1", "1.1", monto), usuario,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+        conn.close()
+        return gasto_id
+
+    def resultado_periodo(self, desde: str, hasta: str) -> dict:
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        inicio = (desde or hoy)[:10]
+        fin = (hasta or hoy)[:10]
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT c.codigo, c.nombre, c.tipo, IFNULL(SUM(l.debito),0), IFNULL(SUM(l.credito),0)
+            FROM asiento_lineas l
+            JOIN cuentas c ON c.id = l.cuenta_id
+            JOIN asientos a ON a.id = l.asiento_id
+            WHERE date(a.fecha) BETWEEN ? AND ?
+            GROUP BY c.id
+            ORDER BY c.codigo
+            """,
+            (inicio, fin),
+        )
+        cuentas = []
+        ingresos = 0.0
+        gastos = 0.0
+        for codigo, nombre, tipo, debito, credito in cur.fetchall():
+            saldo = (
+                round(float(credito or 0) - float(debito or 0), 2)
+                if tipo == "ingreso"
+                else round(float(debito or 0) - float(credito or 0), 2)
+            )
+            cuentas.append({"codigo": codigo, "nombre": nombre, "tipo": tipo, "saldo": saldo})
+            if tipo == "ingreso":
+                ingresos += saldo
+            elif tipo == "gasto":
+                gastos += saldo
+        conn.close()
+        return {
+            "desde": inicio,
+            "hasta": fin,
+            "cuentas": cuentas,
+            "ingresos": round(ingresos, 2),
+            "gastos": round(gastos, 2),
+            "resultado": round(ingresos - gastos, 2),
+        }
+
+    def modificadores_de(self, producto_id: int) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, nombre, precio
+            FROM modificadores
+            WHERE producto_id=? AND activo=1
+            ORDER BY nombre
+            """,
+            (int(producto_id),),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def listar_combos(self) -> list[tuple]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, nombre, precio_combo, IFNULL(descripcion,''), IFNULL(activo,1)
+            FROM combos
+            ORDER BY id DESC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
+    def guardar_combo(self, nombre: str, precio: float, lineas: list[tuple], combo_id: int | None = None) -> int:
+        nombre = " ".join((nombre or "").split())[:80]
+        if len(nombre) < 2:
+            raise ValueError("Ponle nombre al combo")
+        precio = round(float(precio or 0), 2)
+        if precio <= 0:
+            raise ValueError("El combo necesita un precio")
+        limpias = []
+        for pid, cant in lineas:
+            cant = float(cant)
+            if cant <= 0:
+                raise ValueError("La cantidad de cada producto tiene que ser mayor que cero")
+            limpias.append((int(pid), cant))
+        if len(limpias) < 2 and not (len(limpias) == 1 and limpias[0][1] >= 2):
+            raise ValueError("Un combo junta productos. Agrega al menos dos.")
+        conn = self.get_connection()
+        cur = conn.cursor()
+        try:
+            partes = []
+            for pid, cant in limpias:
+                cur.execute("SELECT nombre FROM productos WHERE id=?", (pid,))
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError(f"No existe el producto {pid}")
+                partes.append(f"{cant:g} {row[0]}")
+            texto = ", ".join(partes)[:240]
+            if combo_id:
+                cur.execute("SELECT id FROM combos WHERE id=?", (int(combo_id),))
+                if not cur.fetchone():
+                    raise ValueError("Combo no encontrado")
+                cur.execute(
+                    "UPDATE combos SET nombre=?, descripcion=?, precio_combo=?, activo=1 WHERE id=?",
+                    (nombre, texto, precio, int(combo_id)),
+                )
+                cur.execute("DELETE FROM combos_detalle WHERE combo_id=?", (int(combo_id),))
+                nuevo = int(combo_id)
+            else:
+                cur.execute(
+                    "INSERT INTO combos (nombre, descripcion, precio_combo, activo) VALUES (?,?,?,1)",
+                    (nombre, texto, precio),
+                )
+                nuevo = int(cur.lastrowid)
+            for pid, cant in limpias:
+                cur.execute(
+                    "INSERT INTO combos_detalle (combo_id, producto_id, cantidad) VALUES (?,?,?)",
+                    (nuevo, pid, cant),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+        conn.close()
+        return nuevo
+
+    def desactivar_combo(self, combo_id: int) -> None:
+        conn = self.get_connection()
+        conn.execute("UPDATE combos SET activo=0 WHERE id=?", (int(combo_id),))
+        conn.commit()
+        conn.close()
 
     def tomar_siguiente_ncf(self, tipo: str, conn=None) -> str | None:
         close_after = conn is None

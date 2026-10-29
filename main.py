@@ -220,7 +220,7 @@ class BarSystemApp:
 
         role = self.db.validate_user(username, password)
         if role:
-            self._abrir_sesion(username, role)
+            self._abrir_sesion(username, role, password)
             return
 
         if self.db.usuario_existe(username):
@@ -269,11 +269,12 @@ class BarSystemApp:
             "El usuario quedó guardado en esta computadora.\n"
             "El siguiente paso es sincronizar los datos.",
         )
-        self._abrir_sesion(username, rol)
+        self._abrir_sesion(username, rol, password)
 
-    def _abrir_sesion(self, username, role):
+    def _abrir_sesion(self, username, role, password=""):
         self.current_user = username
         self.current_role = role
+        self._clave_sesion = password or ""
 
         self.root.unbind("<Return>")
         self.login_frame.destroy()
@@ -366,6 +367,10 @@ class BarSystemApp:
             width=100,
         )
         add_btn(r2, "otros", "Promociones", self.show_promociones, width=110)
+        add_btn(r2, "combos", "Combos", self.show_combos, width=90)
+        add_btn(r2, "libro", "Libro", self.show_libro, width=80)
+        if self._user_can_manage_inventory():
+            add_btn(r2, "sync", "Sincronizar", self._abrir_sincronizacion, width=110)
         if self.current_role == "admin":
             add_btn(r2, "users", "👤 Usuarios", self.show_usuarios, width=110)
         add_btn(
@@ -703,6 +708,28 @@ class BarSystemApp:
             self.main_container, current_user=self.current_user
         ).pack(fill="both", expand=True, padx=8, pady=8)
         self._set_active_nav("devoluciones")
+
+    def show_combos(self):
+        from operaciones_pos import CombosFrame
+
+        self.clear_main_container()
+        CombosFrame(self.main_container).pack(fill="both", expand=True, padx=8, pady=8)
+        self._set_active_nav("combos")
+
+    def _abrir_sincronizacion(self):
+        from sincronizar_inventario import abrir_dialogo
+
+        self._set_active_nav("sync")
+        abrir_dialogo(self)
+
+    def show_libro(self):
+        from operaciones_pos import LibroFrame
+
+        self.clear_main_container()
+        LibroFrame(self.main_container, current_user=self.current_user).pack(
+            fill="both", expand=True, padx=8, pady=8
+        )
+        self._set_active_nav("libro")
 
     def show_promociones(self):
         from operaciones_pos import PromocionesFrame
