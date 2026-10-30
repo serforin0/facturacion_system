@@ -65,6 +65,17 @@ def db() -> Database:
     return Database()
 
 
+def _impresora(base: Database) -> dict:
+    """Caracteres por línea configurados en el escritorio para cada ancho de papel."""
+    def entero(clave: str, defecto: int) -> int:
+        try:
+            valor = int(base.get_config(clave, str(defecto)) or defecto)
+        except (TypeError, ValueError):
+            return defecto
+        return valor if 20 <= valor <= 64 else defecto
+    return {"caracteres_80": entero("printer_width_epson_80", 42), "caracteres_58": entero("printer_width_movil_58", 32)}
+
+
 def _pdf_etiquetas(productos: list[dict]) -> bytes:
     from io import BytesIO
 
@@ -667,6 +678,7 @@ def estado(request: Request):
         "permisos": _permisos(usuario),
         "empresa": base.get_empresa_info(),
         "itbis_incluido": _itbis_incluido(base),
+        "impresora": _impresora(base),
         "caja": None
         if caja is None
         else {
@@ -806,13 +818,14 @@ def _venta_previa(base: Database, id_local: str) -> dict | None:
         "SELECT tipo_pago, monto, IFNULL(referencia,'') FROM pagos_factura WHERE factura_id=? AND IFNULL(es_abono,0)=0",
         (fila[0],),
     )
+    filas_pago = cur.fetchall()
+    conn.close()
     nombres_pago = {codigo: nombre for codigo, nombre, *_resto in base.listar_metodos_pago(False)}
     nombres_pago.setdefault("saldo_favor", "Saldo a favor")
     pagos = [
         {"codigo": codigo, "nombre": nombres_pago.get(codigo, codigo), "monto": round(float(monto or 0), 2), "referencia": ref}
-        for codigo, monto, ref in cur.fetchall()
+        for codigo, monto, ref in filas_pago
     ]
-    conn.close()
     propina = round(float(fila[9] or 0), 2)
     a_cobrar = round(float(fila[5] or 0) + propina, 2)
     pagado = float(fila[8] or 0)
@@ -1510,6 +1523,16 @@ def cerrar_caja(request: Request, body: CerrarCajaIn):
     return {"ok": True, "id": caja[0], "esperado": round(esperado, 2), "diferencia": diff}
 
 
+def _resumen_pagos_turno(base: Database, cierre_id: int, apertura: str) -> list[dict]:
+    nombres = {codigo: nombre for codigo, nombre, *_resto in base.listar_metodos_pago(False)}
+    nombres.setdefault("saldo_favor", "Saldo a favor")
+    afectan = base.codigos_afectan_caja()
+    return [
+        {"codigo": p["tipo"], "nombre": nombres.get(p["tipo"], p["tipo"]), "monto": p["monto"], "en_caja": p["tipo"] in afectan}
+        for p in _pagos_del_cuadre(base, cierre_id, apertura, False)
+    ]
+
+
 def _panel_caja(base: Database, desde: str = "", hasta: str = "") -> dict:
     caja = base.fetch_caja_abierta_row()
     abierta = None
@@ -1527,6 +1550,7 @@ def _panel_caja(base: Database, desde: str = "", hasta: str = "") -> dict:
             "ingresos": ingresos,
             "retiros": retiros,
             "esperado": round(fondo + ventas + ingresos - retiros, 2),
+            "pagos": _resumen_pagos_turno(base, caja[0], caja[2]),
             "movimientos": [
                 {"id": i, "tipo": t, "monto": m, "motivo": mot, "usuario": u, "fecha": f}
                 for i, t, m, mot, u, f in base.listar_movimientos_efectivo(caja[0])
@@ -2561,13 +2585,14 @@ def ver_factura(request: Request, factura_id: int):
         "SELECT tipo_pago, monto, IFNULL(referencia,'') FROM pagos_factura WHERE factura_id=? AND IFNULL(es_abono,0)=0",
         (factura_id,),
     )
+    filas_pago = cur.fetchall()
+    conn.close()
     nombres_pago = {codigo: nombre for codigo, nombre, *_resto in db().listar_metodos_pago(False)}
     nombres_pago.setdefault("saldo_favor", "Saldo a favor")
     pagos = [
         {"codigo": codigo, "nombre": nombres_pago.get(codigo, codigo), "monto": round(float(monto or 0), 2), "referencia": ref}
-        for codigo, monto, ref in cur.fetchall()
+        for codigo, monto, ref in filas_pago
     ]
-    conn.close()
     propina = round(float(fac[17] or 0), 2)
     a_cobrar = round(float(fac[3] or 0) + propina, 2)
     return {
@@ -3086,7 +3111,8 @@ def inventario(request: Request, q: str = ""):
                IFNULL(p.precio_2,0), IFNULL(p.precio_3,0), IFNULL(p.precio_4,0),
                IFNULL(p.stock,0),
                IFNULL(p.codigo_barras,''), IFNULL(p.bodega_codigo,'Principal'),
-               IFNULL(c.nombre,''), IFNULL(p.stock_minimo,0), IFNULL(p.activo,1)
+               IFNULL(c.nombre,''), IFNULL(p.stock_minimo,0), IFNULL(p.activo,1),
+               IFNULL(p.imagen_path,'')
         FROM productos p
         LEFT JOIN categorias c ON c.id = p.categoria_id
         WHERE 1=1
@@ -3103,8 +3129,9 @@ def inventario(request: Request, q: str = ""):
             "precio_2": p2, "precio_3": p3, "precio_4": p4,
             "stock": s, "codigo": cb, "bodega": b or "Principal", "categoria": cat,
             "minimo": mn, "activo": bool(a),
+            "imagen": _imagen_de(n, ruta), "foto_propia": bool(_imagen_de("", ruta)),
         }
-        for i, n, p, origen, p2, p3, p4, s, cb, b, cat, mn, a in cur.fetchall()
+        for i, n, p, origen, p2, p3, p4, s, cb, b, cat, mn, a, ruta in cur.fetchall()
     ]
     cur.execute("SELECT producto_id, id, nombre, precio FROM modificadores WHERE activo=1 ORDER BY nombre")
     extras_por_producto: dict[int, list[dict]] = {}
@@ -3206,6 +3233,75 @@ def editar_producto(request: Request, producto_id: int, body: ProductoIn):
         )
     conn.commit()
     conn.close()
+    return {"ok": True}
+
+
+_FOTOS = _STATIC / "fotos"
+_FOTO_MAX = 2_000_000
+
+
+class FotoIn(BaseModel):
+    archivo_base64: str
+
+
+def _ruta_foto(cur, producto_id: int) -> str:
+    cur.execute("SELECT IFNULL(imagen_path,'') FROM productos WHERE id=?", (producto_id,))
+    fila = cur.fetchone()
+    if not fila:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return fila[0]
+
+
+def _borrar_foto_subida(ruta: str) -> None:
+    ruta = (ruta or "").replace("\\", "/")
+    if ruta.startswith("web_static/fotos/"):
+        (_FOTOS / Path(ruta).name).unlink(missing_ok=True)
+
+
+@app.post("/api/inventario/{producto_id}/foto")
+def subir_foto_producto(request: Request, producto_id: int, body: FotoIn):
+    _exigir(request, "inventario")
+    try:
+        crudo = base64.b64decode(body.archivo_base64.split(",", 1)[-1], validate=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="No se pudo leer la foto") from exc
+    if len(crudo) > _FOTO_MAX:
+        raise HTTPException(status_code=400, detail="La foto pesa demasiado (máximo 2 MB)")
+    if crudo.startswith(b"\xff\xd8\xff"):
+        extension = "jpg"
+    elif crudo.startswith(b"\x89PNG\r\n\x1a\n"):
+        extension = "png"
+    elif crudo[:4] == b"RIFF" and crudo[8:12] == b"WEBP":
+        extension = "webp"
+    else:
+        raise HTTPException(status_code=400, detail="Usa una foto JPG, PNG o WEBP")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    try:
+        anterior = _ruta_foto(cur, producto_id)
+        _FOTOS.mkdir(parents=True, exist_ok=True)
+        nombre = f"p{producto_id}-{int(time.time() * 1000)}.{extension}"
+        (_FOTOS / nombre).write_bytes(crudo)
+        cur.execute("UPDATE productos SET imagen_path=? WHERE id=?", (f"web_static/fotos/{nombre}", producto_id))
+        conn.commit()
+    finally:
+        conn.close()
+    _borrar_foto_subida(anterior)
+    return {"ok": True, "imagen": f"/estaticos/fotos/{nombre}"}
+
+
+@app.delete("/api/inventario/{producto_id}/foto")
+def quitar_foto_producto(request: Request, producto_id: int):
+    _exigir(request, "inventario")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    try:
+        anterior = _ruta_foto(cur, producto_id)
+        cur.execute("UPDATE productos SET imagen_path=NULL WHERE id=?", (producto_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    _borrar_foto_subida(anterior)
     return {"ok": True}
 
 
@@ -3881,6 +3977,23 @@ def ecf_secuencia(request: Request, body: EcfSecuenciaIn):
                 raise HTTPException(status_code=400, detail="Fecha de vencimiento no válida") from exc
     conn = db().get_connection()
     cur = conn.cursor()
+    prefijo = f"E{body.tipo:02d}"
+    cur.execute(
+        """
+        SELECT MAX(CAST(SUBSTR(encf, 4) AS INTEGER)) FROM (
+            SELECT encf FROM ecf_documentos WHERE encf LIKE ? || '%'
+            UNION ALL SELECT encf FROM facturas WHERE encf LIKE ? || '%'
+        )
+        """,
+        (prefijo, prefijo),
+    )
+    usado = int(cur.fetchone()[0] or 0)
+    if body.siguiente <= usado:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ya se emitió hasta {prefijo}{usado:010d}. El próximo número debe ser {usado + 1} o mayor",
+        )
     cur.execute(
         """
         INSERT INTO ecf_secuencias (tipo, siguiente, hasta, vencimiento) VALUES (?,?,?,?)
@@ -5002,6 +5115,54 @@ HTML = """<!DOCTYPE html>
   #barraRed.con-error { background:var(--negative); color:#1a0505; }
   #barraRed button { height:30px; padding:0 12px; font-size:12px; }
   .sin-corte { white-space:nowrap; }
+  .cierre-pop { display:grid; gap:14px; margin-bottom:6px; }
+  tbody tr.cuadre-hoy { background:color-mix(in srgb, var(--warning) 13%, transparent); }
+  tbody tr.cuadre-bien { background:color-mix(in srgb, var(--positive) 8%, transparent); }
+  tbody tr.cuadre-mal { background:color-mix(in srgb, var(--negative) 11%, transparent); }
+  tbody tr.cuadre-hoy td:first-child { box-shadow:inset 4px 0 0 var(--warning); }
+  tbody tr.cuadre-bien td:first-child { box-shadow:inset 4px 0 0 var(--positive); }
+  tbody tr.cuadre-mal td:first-child { box-shadow:inset 4px 0 0 var(--negative); }
+  @media (hover:hover) and (pointer:fine) {
+    tbody tr.cuadre-hoy:hover { background:color-mix(in srgb, var(--warning) 18%, transparent); }
+    tbody tr.cuadre-bien:hover { background:color-mix(in srgb, var(--positive) 12%, transparent); }
+    tbody tr.cuadre-mal:hover { background:color-mix(in srgb, var(--negative) 15%, transparent); }
+  }
+  .leyenda-cuadres { display:flex; flex-wrap:wrap; gap:8px 16px; margin:6px 0 0; font-size:12px; color:var(--muted); }
+  .leyenda-cuadres span { display:inline-flex; align-items:center; gap:6px; }
+  .leyenda-cuadres span::before { content:""; width:10px; height:10px; border-radius:3px; }
+  .leyenda-cuadres .hoy::before { background:var(--warning); }
+  .leyenda-cuadres .bien::before { background:var(--positive); }
+  .leyenda-cuadres .mal::before { background:var(--negative); }
+  .cierre-turno { margin:0; font-size:13px; color:var(--muted); }
+  .cierre-esperado { display:grid; gap:4px; padding:18px 20px; border-radius:16px; background:var(--raised); }
+  .cierre-esperado span { font-size:13px; color:var(--muted); }
+  .cierre-esperado b { font-size:clamp(30px, 7vw, 46px); line-height:1.05; font-weight:700; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; color:var(--text); }
+  .cierre-esperado em { font-style:normal; font-size:12px; color:var(--faint); }
+  .cierre-esperado.bien b { color:var(--positive); }
+  .cierre-esperado.mal b { color:var(--negative); }
+  .cierre-desglose { margin:0; display:grid; }
+  .cierre-desglose div { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid var(--rule); }
+  .cierre-desglose dt { color:var(--muted); }
+  .cierre-desglose dd { margin:0; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .cierre-dif { margin:10px 0 4px; font-size:14px; color:var(--muted); }
+  .cierre-dif.bien { color:var(--positive); }
+  .cierre-dif.mal { color:var(--negative); font-weight:600; }
+  .foto-producto { display:grid; grid-template-columns:140px 1fr; gap:16px; align-items:center; margin-bottom:16px; }
+  .foto-vista { width:140px; height:140px; border-radius:14px; background:var(--raised) center / contain no-repeat;
+    border:1px dashed var(--rule); display:grid; place-items:center; color:var(--muted); font-size:12px; }
+  .foto-vista.con-foto { border-style:solid; }
+  .foto-vista.con-foto span { display:none; }
+  .foto-acciones { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .foto-acciones .hint { flex-basis:100%; margin:0; }
+  .boton-archivo { position:relative; display:inline-flex; align-items:center; height:40px; padding:0 16px; border-radius:999px;
+    background:var(--g, var(--accent)); color:var(--g-ink, #111); font-weight:600; font-size:14px; cursor:pointer; overflow:hidden; }
+  .boton-archivo input { position:absolute; inset:0; opacity:0; cursor:pointer; }
+  .boton-archivo:focus-within { outline:2px solid var(--text); outline-offset:2px; }
+  .con-mini { display:inline-flex; align-items:center; gap:10px; }
+  button.foto-mini { width:40px; height:40px; min-height:40px; padding:0; flex:none; border-radius:10px;
+    background:var(--raised) center / contain no-repeat; color:var(--muted); font-size:18px; }
+  button.foto-mini.vacia { border:1px dashed var(--rule); background-color:transparent; }
+  @media (max-width: 520px) { .foto-producto { grid-template-columns:1fr; justify-items:start; } }
   .estado-ecf { display:grid; gap:4px; justify-items:start; min-width:200px; }
   .estado-ecf .hint { font-size:12px; line-height:1.4; }
   .faltan li { display:list-item; padding:2px 0; border:0; }
@@ -5147,32 +5308,6 @@ HTML = """<!DOCTYPE html>
   .aviso[data-tipo="error"]::before { background:var(--negative); }
   .aviso.saliendo { transform: translateY(8px); opacity:0; transition: transform 200ms var(--ease-out), opacity 180ms ease; }
 
-  #recibo { display:none; }
-  #recibo .bau { font-family: "Courier New", Courier, monospace; font-size:12px; line-height:1.35; color:#111; }
-  #recibo.angosto .bau { font-size:11px; }
-  #recibo .centro { display:block; text-align:center; }
-  #recibo .local { display:block; font-size:15px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
-  #recibo.angosto .local { font-size:13px; }
-  #recibo header span, #recibo .sub, #recibo .pie { display:block; }
-  #recibo .corte { border:0; border-top:1px dashed #111; margin:6px 0; }
-  #recibo .fila { display:flex; justify-content:space-between; gap:8px; }
-  #recibo .nom { flex:1; min-width:0; }
-  #recibo .din { white-space:nowrap; }
-  #recibo .sub { font-size:11px; }
-  #recibo .total { font-size:14px; font-weight:700; }
-  #recibo .cols, #recibo .ley { font-size:11px; }
-  #recibo .titulo { display:block; text-align:center; font-weight:700; letter-spacing:.06em; margin:6px 0 2px; }
-  #recibo .mesa { display:block; text-align:center; font-size:16px; font-weight:700; letter-spacing:.08em; margin:4px 0; }
-  #recibo .cols3 { display:grid; grid-template-columns: 1fr 16mm 20mm; column-gap:4px; }
-  #recibo.angosto .cols3 { grid-template-columns: 1fr 13mm 16mm; }
-  #recibo .d { text-align:right; }
-  #recibo .qr { display:flex; justify-content:center; margin-top:4px; }
-  #recibo .qr svg { width:28mm; height:28mm; }
-  @media print {
-    body * { visibility: hidden; }
-    #recibo, #recibo * { visibility: visible; }
-    #recibo { display:block; position:absolute; left:0; top:0; margin:0; padding:0; color:#111; background:#fff; }
-  }
 
   /* Tablet y teléfono: la barra lateral se pliega en una hoja de menú */
   .barra-ticket { display:none; }
@@ -5398,7 +5533,8 @@ HTML = """<!DOCTYPE html>
               <label id="filaTerminal" hidden>Terminal<select id="termVenta" onchange="elegirTerminal(true)"><option value="">Sin terminal</option></select></label>
               <label id="filaVendedor" hidden>Vendedor<select id="vendVenta"><option value="">Sin vendedor</option></select></label>
               <label>Observaciones<input id="obsVenta" maxlength="500" placeholder="Ej.: entregar en la casa, pagó con cheque"/></label>
-              <label>Ancho del ticket<select id="anchoTicket"><option value="80">80 mm</option><option value="58">58 mm</option></select></label>
+              <label>Papel de la impresora<select id="anchoTicket"><option value="80">80 mm (supermercado)</option><option value="58">58 mm (portátil)</option></select></label>
+              <button type="button" class="sec" onclick="imprimirPrueba()">Probar impresora</button>
             </details>
           </div>
           <div class="ticket-acciones">
@@ -5428,7 +5564,6 @@ HTML = """<!DOCTYPE html>
 <div class="barra-ticket" id="barraTicket" aria-hidden="true"><span id="barraResumen"></span><button type="button" onclick="irAlTicket()">Ver ticket</button></div>
 <div id="avisos" aria-live="polite"></div>
 <div id="barraRed" role="status" aria-live="polite" hidden></div>
-<div id="recibo"></div>
 <script>
 const cart = [];
 function money(n){ return "RD$ " + Number(n||0).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
@@ -5615,6 +5750,7 @@ async function refrescar(){
   aplicarPermisos(e.permisos);
   window._empresa = e.empresa || {};
   window._itbisIncluido = !!e.itbis_incluido;
+  window._impresora = e.impresora || {};
   aplicarPuertaCaja();
   const btn = document.getElementById("btnCaja");
   if (btn) btn.style.display = e.caja || !permisos.includes("caja") ? "none" : "";
@@ -6411,15 +6547,21 @@ async function cargarPanelCaja(nombre){
     : "<p class='hint'>No hay turno abierto.</p>";
   const filas = (d.cierres || []).filter(c => c.estado === "cerrado");
   const vacio = q ? "No hay cuadres en ese período." : "Todavía no hay cuadres cerrados.";
-  box.innerHTML = resumen + `<div id="cuadreVista"></div><h3>Historial de cuadres</h3><div id="cuadreTabla">` + tabla(
+  const ahora = new Date();
+  const hoy = ahora.getFullYear() + "-" + String(ahora.getMonth() + 1).padStart(2, "0") + "-" + String(ahora.getDate()).padStart(2, "0");
+  const estadoCuadre = c => String(c.cierre || "").slice(0, 10) === hoy ? "hoy" : (Math.abs(Number(c.diferencia || 0)) < 0.05 ? "bien" : "mal");
+  const leyenda = filas.length ? `<div class="leyenda-cuadres"><span class="hoy">Cierre de hoy</span><span class="bien">Cuadrado</span><span class="mal">Con sobrante o faltante</span></div>` : "";
+  box.innerHTML = resumen + `<div id="cuadreVista"></div><h3>Historial de cuadres</h3>${leyenda}<div id="cuadreTabla">` + tabla(
     ["Cierre","Turno","Cajero","Fondo","Esperado","Contado","Diferencia",""],
     filas.map(c => [
-      String(c.cierre||"").slice(0,16), escDash(c.nombre), escDash(c.usuario || "—"),
-      money(c.fondo), money(c.esperado), money(c.contado), textoDif(c.diferencia),
+      String(c.cierre||"").slice(0,16) + (estadoCuadre(c) === "hoy" ? ` <span class="pill aviso">Hoy</span>` : ""), escDash(c.nombre), escDash(c.usuario || "—"),
+      money(c.fondo), money(c.esperado), money(c.contado),
+      `<span class="pill ${Math.abs(Number(c.diferencia || 0)) < 0.05 ? "bien" : "mal"}">${textoDif(c.diferencia)}</span>`,
       `<div class="acciones"><button class="sec" onclick="verPdfCuadre(${c.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${c.id})">Imprimir</button><button class="sec" onclick="bajarCuadre(${c.id})">Descargar</button><button class="sec" onclick="editarCierre(${c.id})">Editar</button></div>`
     ]),
     vacio
   ) + `</div>`;
+  box.querySelectorAll("#cuadreTabla tbody tr").forEach((tr, i) => tr.classList.add("cuadre-" + estadoCuadre(filas[i])));
 }
 function htmlCuadre(d){
   const montos = tabla(["Concepto","Monto"], [
@@ -6529,19 +6671,52 @@ function editarTurno(){
   modalTitulo.textContent = "Editar turno";
   btnCajaAbrir.textContent = "Guardar cambios";
 }
-function nuevoCierre(){
+const CAMPOS_CIERRE = `<div class="form">
+    <label>Efectivo contado<input id="cajaContado" type="number" step="0.01" min="0" inputmode="decimal" oninput="pintarDiferenciaCierre()"/></label>
+    <label class="wide">Observación<input id="cajaObs" placeholder="Obligatoria si no cuadra"/></label>
+  </div>
+  <p id="cierreDif" class="cierre-dif" aria-live="polite">Cuenta el efectivo de la gaveta y escríbelo.</p>`;
+async function nuevoCierre(){
   window._cierreEdit = null;
-  abrirModal("Cerrar turno", `<div class="form"><label>Efectivo contado<input id="cajaContado" type="number" step="0.01"/></label><label class="wide">Observación<input id="cajaObs"/></label><button id="btnCerrar" onclick="guardarCierre()">Cerrar turno</button></div>`);
+  let a;
+  try { a = (await api("/api/caja/panel")).abierta; } catch(e) { formMsg.style.color = "var(--danger)"; formMsg.textContent = e.message; return; }
+  if (!a) { abrirModal("Cierre de caja", `<p class="hint">No hay un turno abierto para cerrar.</p>`); return; }
+  window._cierreEsperado = Number(a.esperado || 0);
+  const fuera = (a.pagos || []).filter(p => !p.en_caja && p.monto > 0);
+  abrirModal("Cierre de caja", `<div class="cierre-pop">
+      <p class="cierre-turno">${escDash(a.nombre)} · abrió ${escDash(a.usuario || "—")} · ${escDash(String(a.apertura || "").slice(0, 16))}</p>
+      <div class="cierre-esperado"><span>Debe haber en caja</span><b>${money(a.esperado)}</b><em>Solo el efectivo de la gaveta</em></div>
+      <dl class="cierre-desglose">
+        <div><dt>Caja chica (fondo)</dt><dd>${money(a.fondo)}</dd></div>
+        <div><dt>Ventas en efectivo</dt><dd>+ ${money(a.ventas_efectivo)}</dd></div>
+        <div><dt>Ingresos de efectivo</dt><dd>+ ${money(a.ingresos)}</dd></div>
+        <div><dt>Retiros de efectivo</dt><dd>− ${money(a.retiros)}</dd></div>
+      </dl>
+      ${fuera.length ? `<p class="hint">No va en la gaveta: ${fuera.map(p => `${escDash(p.nombre)} ${money(p.monto)}`).join(" · ")}</p>` : ""}
+    </div>${CAMPOS_CIERRE}
+    <div class="form"><button id="btnCerrar" onclick="guardarCierre()">Cerrar turno</button><button class="sec" type="button" onclick="cerrarModal()">Cancelar</button></div>`);
+  setTimeout(() => { const c = document.getElementById("cajaContado"); if (c) c.focus(); }, 80);
+}
+function pintarDiferenciaCierre(){
+  const el = document.getElementById("cierreDif");
+  if (!el) return;
+  const texto = cajaContado.value.trim();
+  if (!texto) { el.className = "cierre-dif"; el.textContent = "Cuenta el efectivo de la gaveta y escríbelo."; return; }
+  const dif = Math.round((Number(texto) - (window._cierreEsperado || 0)) * 100) / 100;
+  const cuadra = Math.abs(dif) < 0.05;
+  el.className = "cierre-dif " + (cuadra ? "bien" : "mal");
+  el.textContent = cuadra ? "Cuadra exacto." : (dif > 0 ? "Sobran " : "Faltan ") + money(Math.abs(dif)) + ". Escribe una observación.";
 }
 function editarCierre(id){
   const c = ((window._cajaPanel && window._cajaPanel.cierres) || []).find(x => x.id === id);
   if (!c) return;
-  nuevoCierre();
   window._cierreEdit = id;
+  window._cierreEsperado = Number(c.esperado || 0);
+  abrirModal("Corregir cierre", `<div class="cierre-pop"><div class="cierre-esperado"><span>Debía haber en caja</span><b>${money(c.esperado)}</b><em>${escDash(c.nombre)} · cerrado ${escDash(String(c.cierre || "").slice(0, 16))}</em></div></div>${CAMPOS_CIERRE}
+    <div class="form"><button id="btnCerrar" onclick="guardarCierre()">Guardar cambios</button><button class="sec" type="button" onclick="cerrarModal()">Cancelar</button></div>`);
   cajaContado.value = c.contado;
   cajaObs.value = c.observaciones || "";
-  modalTitulo.textContent = "Corregir cierre";
-  btnCerrar.textContent = "Guardar cambios";
+  pintarDiferenciaCierre();
 }
 async function guardarCaja(){
   if (cajaFondo.value.trim() === "" || Number.isNaN(Number(cajaFondo.value)) || Number(cajaFondo.value) < 0) {
@@ -6604,14 +6779,29 @@ async function guardarMov(tipo){
   } catch(e){ errorModal(e); }
 }
 async function guardarCierre(){
+  if (!cajaContado.value.trim()) { errorModal({message: "Escribe el efectivo que contaste en la gaveta."}); cajaContado.focus(); return; }
   try {
     const editando = window._cierreEdit;
-    const payload = {contado: Number(cajaContado.value), observaciones: cajaObs.value};
+    const contado = Number(cajaContado.value);
+    const payload = {contado, observaciones: cajaObs.value};
     const url = editando ? "/api/caja/cierre/" + editando : "/api/caja/cerrar";
     const r = await api(url, {method:"POST", body: JSON.stringify(payload)});
     const cerradoId = editando || r.id;
     window._cierreEdit = null;
-    okModal((editando ? "Cierre actualizado. " : "Cerrado. ") + "Esperado " + money(r.esperado) + " · diferencia " + money(r.diferencia));
+    if (editando) {
+      okModal("Cierre actualizado. Esperado " + money(r.esperado) + " · " + textoDif(r.diferencia) + ".");
+    } else {
+      const cuadra = Math.abs(Number(r.diferencia || 0)) < 0.05;
+      abrirModal("Caja cerrada", `<div class="cierre-pop">
+          <div class="cierre-esperado ${cuadra ? "bien" : "mal"}"><span>Resultado del cierre</span><b>${textoDif(r.diferencia)}</b><em>Turno cerrado ${fechaTicket("")}</em></div>
+          <dl class="cierre-desglose">
+            <div><dt>Debía haber en caja</dt><dd>${money(r.esperado)}</dd></div>
+            <div><dt>Efectivo contado</dt><dd>${money(contado)}</dd></div>
+            <div><dt>Diferencia</dt><dd>${money(r.diferencia)}</dd></div>
+          </dl>
+        </div>
+        <div class="form"><button type="button" onclick="imprimirCierre(${cerradoId})">Imprimir cierre</button><button class="sec" type="button" onclick="cerrarModal()">Listo</button></div>`);
+    }
     await refrescar();
     await cargarPanelCaja("cerrar");
     if (!editando && cerradoId) await imprimirCierre(cerradoId);
@@ -6885,11 +7075,66 @@ function pintarEtiquetasMayor(){
 }
 function formProducto(){
   const x = window._descuentos || {p2:2, p3:5, p4:10};
-  return `<div class="form"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invOriginal" type="number" step="0.01"/></label><label>Precio mínimo de venta<input id="invPrecio" type="number" step="0.01" oninput="recalcularPreciosMayor()"/></label><label>Al ${x.p2}%<input id="invP2" type="number" step="0.01"/></label><label>Al ${x.p3}%<input id="invP3" type="number" step="0.01"/></label><label>Al ${x.p4}%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div>`;
+  return `<div class="foto-producto">
+    <div id="invFotoVista" class="foto-vista"><span>Sin foto</span></div>
+    <div class="foto-acciones">
+      <label class="boton-archivo">Elegir foto<input id="invFoto" type="file" accept="image/jpeg,image/png,image/webp" onchange="elegirFotoProducto(this)"/></label>
+      <button id="invFotoQuitar" class="sec" type="button" onclick="quitarFotoProducto()" hidden>Quitar foto</button>
+      <p class="hint">JPG, PNG o WEBP. Se reduce sola para que cargue rápido en el mostrador.</p>
+    </div>
+  </div>
+  <div class="form"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invOriginal" type="number" step="0.01"/></label><label>Precio mínimo de venta<input id="invPrecio" type="number" step="0.01" oninput="recalcularPreciosMayor()"/></label><label>Al ${x.p2}%<input id="invP2" type="number" step="0.01"/></label><label>Al ${x.p3}%<input id="invP3" type="number" step="0.01"/></label><label>Al ${x.p4}%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div>`;
 }
 function nuevoProducto(){
   window._prodId = null;
+  window._foto = {nueva: null, quitar: false, actual: ""};
   abrirModal("Crear producto", formProducto());
+}
+function pintarFotoProducto(){
+  const f = window._foto || {};
+  const url = f.nueva || (f.quitar ? "" : f.actual);
+  invFotoVista.style.backgroundImage = url ? `url('${url}')` : "";
+  invFotoVista.classList.toggle("con-foto", !!url);
+  invFotoQuitar.hidden = !url;
+}
+function reducirFoto(archivo){
+  return new Promise((ok, mal) => {
+    if (!/^image\\/(jpeg|png|webp)$/.test(archivo.type)) return mal(new Error("Usa una foto JPG, PNG o WEBP."));
+    const url = URL.createObjectURL(archivo);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const conFondo = archivo.type !== "image/png";
+      const lado = conFondo ? 900 : 640;
+      const escala = Math.min(1, lado / Math.max(img.naturalWidth, img.naturalHeight));
+      const lienzo = document.createElement("canvas");
+      lienzo.width = Math.max(1, Math.round(img.naturalWidth * escala));
+      lienzo.height = Math.max(1, Math.round(img.naturalHeight * escala));
+      const g = lienzo.getContext("2d");
+      if (conFondo) { g.fillStyle = "#fff"; g.fillRect(0, 0, lienzo.width, lienzo.height); }
+      g.drawImage(img, 0, 0, lienzo.width, lienzo.height);
+      let datos = conFondo ? lienzo.toDataURL("image/jpeg", 0.85) : lienzo.toDataURL("image/png");
+      if (datos.length > 600000) datos = lienzo.toDataURL("image/jpeg", 0.72);
+      ok(datos);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); mal(new Error("No se pudo abrir esa imagen.")); };
+    img.src = url;
+  });
+}
+async function elegirFotoProducto(input){
+  const archivo = input.files && input.files[0];
+  input.value = "";
+  if (!archivo) return;
+  try {
+    window._foto.nueva = await reducirFoto(archivo);
+    window._foto.quitar = false;
+    pintarFotoProducto();
+  } catch(e){ errorModal(e); }
+}
+function quitarFotoProducto(){
+  window._foto.nueva = null;
+  window._foto.quitar = !!window._foto.actual;
+  pintarFotoProducto();
 }
 function recalcularPreciosMayor(){
   if (!document.getElementById("invPrecio")) return;
@@ -6912,7 +7157,8 @@ async function cargarInventario(){
   }
   const x = window._descuentos || {p2:2, p3:5, p4:10};
   invTabla.innerHTML = tabla(["","Producto","","Original","Mínimo", x.p2+"%", x.p3+"%", x.p4+"%", "Stock","Código","Bodega","Categoría"], window._prods.map(p => [
-    `<input class="etiq" type="checkbox" value="${p.id}"/>`, escDash(p.nombre),
+    `<input class="etiq" type="checkbox" value="${p.id}"/>`,
+    `<span class="con-mini"><button type="button" class="sec foto-mini${p.imagen ? "" : " vacia"}" ${p.imagen ? `style="background-image:url('${p.imagen}')"` : ""} onclick="editarProducto(${p.id})" aria-label="Foto de ${escDash(p.nombre)}">${p.imagen ? "" : "+"}</button>${escDash(p.nombre)}</span>`,
     `<button class="sec" onclick="editarProducto(${p.id})">Editar</button> <button class="sec" onclick="extrasProducto(${p.id})">Extras</button>`,
     money(p.precio_original), money(p.precio), money(precioNivel(p.precio_2, p.precio, x.p2)), money(precioNivel(p.precio_3, p.precio, x.p3)), money(precioNivel(p.precio_4, p.precio, x.p4)),
     p.stock, escDash(p.codigo || "—"), escDash(p.bodega), escDash(p.categoria || "—")
@@ -6958,6 +7204,8 @@ function editarProducto(id){
   invCod.value = p.codigo || "";
   invBod.value = p.bodega || "Principal";
   invCat.value = p.categoria || "";
+  window._foto.actual = p.foto_propia ? p.imagen : "";
+  pintarFotoProducto();
   modalTitulo.textContent = "Editar producto";
   btnProd.textContent = "Guardar cambios";
   invNom.focus();
@@ -7010,7 +7258,12 @@ async function guardarProducto(){
       stock: Number(invStock.value||0), codigo: invCod.value, bodega: invBod.value, categoria: invCat.value
     };
     const url = editando ? "/api/inventario/" + editando : "/api/inventario";
-    await api(url, {method:"POST", body: JSON.stringify(body)});
+    const r = await api(url, {method:"POST", body: JSON.stringify(body)});
+    const id = editando || r.id;
+    const foto = window._foto || {};
+    if (foto.nueva) await api(`/api/inventario/${id}/foto`, {method:"POST", body: JSON.stringify({archivo_base64: foto.nueva})});
+    else if (foto.quitar) await api(`/api/inventario/${id}/foto`, {method:"DELETE"});
+    window._foto = null;
     window._prodId = null;
     okModal(editando ? "Producto actualizado." : "Producto creado.");
     productosCache = [];
@@ -7448,17 +7701,71 @@ async function registrarAbono(id){
   } catch(e){ errorModal(e); }
 }
 function papelTicket(){
-  const ancho = (document.getElementById("anchoTicket") || {}).value === "58" ? "58" : "80";
-  let tag = document.getElementById("papelTicket");
-  if (!tag) {
-    tag = document.createElement("style");
-    tag.id = "papelTicket";
-    document.head.appendChild(tag);
-  }
-  tag.textContent = `@page{size:${ancho}mm auto;margin:2mm}`;
-  recibo.style.width = ancho + "mm";
-  recibo.className = ancho === "58" ? "angosto" : "";
-  return ancho;
+  const ancho = (document.getElementById("anchoTicket") || {}).value === "58" ? 58 : 80;
+  const imp = window._impresora || {};
+  const caracteres = ancho === 58 ? Number(imp.caracteres_58 || 32) : Number(imp.caracteres_80 || 42);
+  const util = ancho === 58 ? 48 : 72;
+  return {papel: ancho, util, caracteres, letra: Math.round(util / caracteres / 0.6 * 1000) / 1000};
+}
+(function(){
+  const sel = document.getElementById("anchoTicket");
+  if (!sel) return;
+  sel.value = localStorage.getItem("papel_ticket") === "58" ? "58" : "80";
+  sel.onchange = () => localStorage.setItem("papel_ticket", sel.value);
+})();
+const CSS_TICKET = `
+  html, body { margin:0; padding:0; background:#fff; color:#000; }
+  .bau { box-sizing:border-box; width:var(--util); margin:0 auto; padding:3mm 0 7mm; color:#000;
+    font-family:"Courier New", Courier, "Liberation Mono", monospace; font-size:var(--letra); line-height:1.28; font-weight:700; overflow-wrap:anywhere; }
+  .bau p { margin:0; }
+  .centro { display:block; text-align:center; }
+  .local { display:block; font-size:1.3em; letter-spacing:.02em; text-transform:uppercase; }
+  header span, .sub, .pie { display:block; }
+  .corte { border:0; border-top:.3mm dashed #000; margin:1.6mm 0; }
+  .fila { display:flex; justify-content:space-between; gap:1ch; }
+  .nom { flex:1; min-width:0; }
+  .din { white-space:nowrap; }
+  .sub, .ley, .cols { font-size:.92em; }
+  .total { font-size:1.25em; }
+  .titulo { display:block; text-align:center; letter-spacing:.06em; margin:1.6mm 0 .6mm; }
+  .mesa { display:block; text-align:center; font-size:1.4em; letter-spacing:.08em; margin:1mm 0; }
+  .cols3 { display:grid; grid-template-columns:1fr 9ch 10ch; column-gap:1ch; }
+  .d { text-align:right; }
+  .regla { white-space:pre; overflow:hidden; }
+  .qr { display:flex; justify-content:center; margin-top:1.5mm; }
+  .qr svg { width:28mm; height:28mm; }
+`;
+async function imprimirTicket(html){
+  const p = papelTicket();
+  const viejo = document.getElementById("marcoTicket");
+  if (viejo) viejo.remove();
+  const marco = document.createElement("iframe");
+  marco.id = "marcoTicket";
+  marco.title = "Ticket";
+  marco.setAttribute("aria-hidden", "true");
+  marco.tabIndex = -1;
+  marco.style.cssText = `position:fixed;left:-300mm;top:0;width:${p.papel}mm;height:20mm;border:0;opacity:0;pointer-events:none`;
+  document.body.appendChild(marco);
+  const doc = marco.contentDocument;
+  doc.open();
+  doc.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Ticket</title><style id="pagina">@page{size:${p.papel}mm 400mm;margin:0}</style><style>${CSS_TICKET}</style></head><body style="--util:${p.util}mm;--letra:${p.letra}mm;width:${p.papel}mm">${html}</body></html>`);
+  doc.close();
+  if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const alto = Math.ceil(doc.body.getBoundingClientRect().height * 25.4 / 96) + 2;
+  doc.getElementById("pagina").textContent = `@page{size:${p.papel}mm ${alto}mm;margin:0}`;
+  marco.contentWindow.focus();
+  marco.contentWindow.print();
+}
+function imprimirPrueba(){
+  const p = papelTicket();
+  const emp = window._empresa || {};
+  const regla = Array.from({length: p.caracteres}, (_, i) => String((i + 1) % 10)).join("");
+  imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">PRUEBA DE IMPRESORA</span><hr class="corte">`
+    + filaTicket("Papel", p.papel + " mm") + filaTicket("Caracteres por línea", String(p.caracteres))
+    + `<hr class="corte"><div class="regla">${regla}</div><p class="sub">Los números deben caber en una sola línea, sin cortarse.</p>`
+    + cabezaLineas() + lineasTicket({lineas: [{nombre: "Producto de ejemplo con nombre largo", cantidad: 2, precio: 1250, total: 2500}]})
+    + `<hr class="corte">` + filaTicket("TOTAL", "RD$ 2,500.00", "total") + pieTicket() + `</div>`);
 }
 function fechaTicket(valor){
   const m = String(valor || "").match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})/);
@@ -7505,18 +7812,24 @@ function esCreditoFiscal(data){
   const ncf = String(data.ncf || (data.ecf && data.ecf.encf) || "");
   return ncf.startsWith("B01") || ncf.startsWith("E31");
 }
+function cabezaLineas(){
+  return papelTicket().papel === 58
+    ? filaTicket("UDS DESCRIPCION", "IMPORTE", "ley")
+    : `<div class="cols3 ley"><span>UDS DESCRIPCION</span><span class="d">PRECIO</span><span class="d">IMPORTE</span></div>`;
+}
 function lineasTicket(data){
+  const angosto = papelTicket().papel === 58;
   return (data.lineas || []).map(l => {
     const cant = Number(l.cantidad);
     const cantTxt = Number.isInteger(cant) ? String(cant) : cant.toFixed(2);
     const precio = l.precio != null ? numTicket(l.precio) : "";
+    if (angosto) return `<div>${escDash(l.nombre)}</div>` + filaTicket(`&nbsp;&nbsp;${cantTxt}${precio ? " x " + precio : ""}`, numTicket(l.total));
     return `<div class="cols3"><span>${cantTxt} ${escDash(l.nombre)}</span><span class="d">${precio}</span><span class="d">${numTicket(l.total)}</span></div>`;
   }).join("");
 }
 function imprimirReciboAbono(r){
   const emp = window._empresa || {};
-  papelTicket();
-  recibo.innerHTML = `<div class="bau">${cabezaTicket(emp)}<p class="centro"><b>RECIBO DE ABONO</b></p><hr class="corte">`
+  imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<p class="centro"><b>RECIBO DE ABONO</b></p><hr class="corte">`
     + filaTicket("Fecha", fechaTicket(""))
     + filaTicket("Factura", escDash(r.numero || ""))
     + filaTicket("Cliente", escDash(r.cliente || ""))
@@ -7524,8 +7837,7 @@ function imprimirReciboAbono(r){
     + filaTicket("Abono", money(r.abonado), "total")
     + filaTicket("Queda", money(Math.max(0, r.pendiente || 0)))
     + (Number(r.cambio || 0) > 0 ? filaTicket("Cambio", money(r.cambio)) : "")
-    + pieTicket() + `</div>`;
-  window.print();
+    + pieTicket() + `</div>`);
 }
 async function cargarClientes(){
   const d = await api("/api/clientes");
@@ -7911,7 +8223,6 @@ function imprimirPrecuenta(){
 }
 async function imprimirRecibo(data){
   const emp = window._empresa || {};
-  papelTicket();
   const lugar = datosMesa(notaTicket(data));
   const propina = Number(data.propina || 0);
   const aCobrar = data.a_cobrar != null ? Number(data.a_cobrar) : Number(data.total || 0);
@@ -7964,8 +8275,7 @@ async function imprimirRecibo(data){
   const firma = data.precuenta
     ? (lugar.camarero ? filaTicket("Camarero", escDash(lugar.camarero)) : "")
     : (atendio ? `<p class="centro">Le atendió: ${escDash(String(atendio).toUpperCase())}</p>` : "");
-  recibo.innerHTML = `<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte"><div class="cols3 ley"><span>UDS DESCRIPCION</span><span class="d">PRECIO</span><span class="d">IMPORTE</span></div>${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`;
-  window.print();
+  await imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte">${cabezaLineas()}${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`);
 }
 async function cargarMetodos(){
   const d = await api("/api/metodos");

@@ -88,9 +88,25 @@ def _firmar_y_guardar(base, conn, datos: dgii.DatosECF, factura_id: int | None, 
     return {"id": doc_id, **registro}
 
 
+def _con_transaccion(base, trabajo, *args):
+    conn = base.get_connection()
+    try:
+        resultado = trabajo(base, conn, *args)
+        conn.commit()
+        return resultado
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def emitir_factura(base, factura_id: int) -> dict | None:
     """Firma y guarda el e-CF de una factura que ya tiene e-NCF. Devuelve el registro o None."""
-    conn = base.get_connection()
+    return _con_transaccion(base, _emitir_factura, factura_id)
+
+
+def _emitir_factura(base, conn, factura_id: int) -> dict | None:
     cur = conn.cursor()
     cur.execute(
         """
@@ -103,7 +119,6 @@ def emitir_factura(base, factura_id: int) -> dict | None:
     )
     fila = cur.fetchone()
     if not fila or not fila[0]:
-        conn.close()
         return None
     encf, comprobante, fecha, numero, desc, incluido, vence, total, doc, nombre, pagado = fila
     tipo = int(encf[1:3])
@@ -127,14 +142,15 @@ def emitir_factura(base, factura_id: int) -> dict | None:
     )
     registro = _firmar_y_guardar(base, conn, datos, factura_id, None)
     cur.execute("UPDATE facturas SET ecf_estado = ? WHERE id = ?", (registro["estado"], factura_id))
-    conn.commit()
-    conn.close()
     return registro
 
 
 def emitir_nota_credito(base, nota_id: int) -> dict | None:
     """e-CF 34 para una nota de crédito sobre una factura electrónica."""
-    conn = base.get_connection()
+    return _con_transaccion(base, _emitir_nota_credito, nota_id)
+
+
+def _emitir_nota_credito(base, conn, nota_id: int) -> dict | None:
     cur = conn.cursor()
     cur.execute(
         """
@@ -146,7 +162,6 @@ def emitir_nota_credito(base, nota_id: int) -> dict | None:
     )
     fila = cur.fetchone()
     if not fila or not fila[2]:
-        conn.close()
         return None
     reserva = base.tomar_siguiente_encf(34, conn)
     if reserva is None:
@@ -154,8 +169,6 @@ def emitir_nota_credito(base, nota_id: int) -> dict | None:
             "INSERT INTO ecf_documentos (nota_credito_id, factura_id, tipo, encf, estado, mensaje) VALUES (?,?,34,?, 'error', ?)",
             (nota_id, fila[0], f"SIN-E34-{nota_id}", "No hay secuencia e-NCF tipo 34 para la nota de crédito"),
         )
-        conn.commit()
-        conn.close()
         return {"estado": "error", "mensaje": "No hay secuencia e-NCF tipo 34"}
     encf, _venc = reserva
     cur.execute(
@@ -181,10 +194,7 @@ def emitir_nota_credito(base, nota_id: int) -> dict | None:
         precios_incluyen_itbis=True, ncf_modificado=fila[2], fecha_ncf_modificado=dgii.fecha_dgii(fila[3]),
         razon_modificacion=fila[1],
     )
-    registro = _firmar_y_guardar(base, conn, datos, fila[0], nota_id)
-    conn.commit()
-    conn.close()
-    return registro
+    return _firmar_y_guardar(base, conn, datos, fila[0], nota_id)
 
 
 def enviar(base, doc_id: int) -> dict:
@@ -194,12 +204,11 @@ def enviar(base, doc_id: int) -> dict:
         cur = conn.cursor()
         cur.execute("SELECT tipo, encf, total, estado, xml_envio, factura_id, ambiente FROM ecf_documentos WHERE id = ?", (doc_id,))
         fila = cur.fetchone()
+        conn.close()
         if not fila:
-            conn.close()
             return {"estado": "error", "mensaje": "Documento no encontrado"}
         tipo, encf, total, estado, xml_envio, factura_id, ambiente = fila
         if not xml_envio or estado in ("sin_certificado",):
-            conn.close()
             return {"estado": estado, "mensaje": "El documento no está firmado: carga el certificado y vuelve a emitir"}
         cfg = config(base)
         resultado: dict
@@ -218,6 +227,8 @@ def enviar(base, doc_id: int) -> dict:
             resultado = {"estado": "error_envio", "track_id": None, "mensaje": str(exc)[:500]}
         except Exception as exc:  # noqa: BLE001
             resultado = {"estado": "error_envio", "track_id": None, "mensaje": f"{type(exc).__name__}: {exc}"[:500]}
+        conn = base.get_connection()
+        cur = conn.cursor()
         cur.execute(
             """
             UPDATE ecf_documentos SET estado = ?, track_id = COALESCE(?, track_id), mensaje = ?,
