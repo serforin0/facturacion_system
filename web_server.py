@@ -66,14 +66,28 @@ def db() -> Database:
 
 
 def _impresora(base: Database) -> dict:
-    """Caracteres por línea configurados en el escritorio para cada ancho de papel."""
-    def entero(clave: str, defecto: int) -> int:
+    """Papel, caracteres y formato con el que sale el cuadre en el rollo térmico."""
+    def entero(clave: str, defecto: int, piso: int, techo: int) -> int:
         try:
             valor = int(base.get_config(clave, str(defecto)) or defecto)
         except (TypeError, ValueError):
             return defecto
-        return valor if 20 <= valor <= 64 else defecto
-    return {"caracteres_80": entero("printer_width_epson_80", 42), "caracteres_58": entero("printer_width_movil_58", 32)}
+        return valor if piso <= valor <= techo else defecto
+
+    papel = str(base.get_config("printer_papel", "80") or "80")
+    if papel not in ("58", "80"):
+        papel = "80"
+    formato = str(base.get_config("printer_cuadre_formato", "ticket") or "ticket")
+    if formato not in ("ticket", "carta"):
+        formato = "ticket"
+    return {
+        "papel": int(papel),
+        "caracteres_80": entero("printer_width_epson_80", 42, 24, 64),
+        "caracteres_58": entero("printer_width_movil_58", 32, 20, 42),
+        "cuadre": formato,
+        "margen": entero("printer_margen_mm", 0, 0, 8),
+        "nombre": (base.get_config("printer_nombre", "") or "").strip()[:80],
+    }
 
 
 def _pdf_etiquetas(productos: list[dict]) -> bytes:
@@ -1763,6 +1777,48 @@ def pdf_cuadre(request: Request, cierre_id: int, descarga: int = 0):
         media_type="application/pdf",
         headers={"Content-Disposition": f"{modo}; filename={nombre}"},
     )
+
+
+class ImpresionIn(BaseModel):
+    papel: int = 80
+    caracteres_80: int = 42
+    caracteres_58: int = 32
+    cuadre: str = "ticket"
+    margen: int = 0
+    nombre: str = ""
+
+
+@app.get("/api/impresion")
+def leer_impresion(request: Request):
+    _exigir_alguno(request, ("caja", "apariencia"))
+    return _impresora(db())
+
+
+@app.post("/api/impresion")
+def guardar_impresion(request: Request, body: ImpresionIn):
+    _exigir_alguno(request, ("caja", "apariencia"))
+    if body.papel not in (58, 80):
+        raise HTTPException(status_code=400, detail="El papel es 58 mm o 80 mm")
+    if body.cuadre not in ("ticket", "carta"):
+        raise HTTPException(status_code=400, detail="El cuadre se imprime en ticket o en hoja carta")
+    if not 24 <= int(body.caracteres_80) <= 64:
+        raise HTTPException(status_code=400, detail="En 80 mm caben entre 24 y 64 caracteres")
+    if not 20 <= int(body.caracteres_58) <= 42:
+        raise HTTPException(status_code=400, detail="En 58 mm caben entre 20 y 42 caracteres")
+    if not 0 <= int(body.margen) <= 8:
+        raise HTTPException(status_code=400, detail="El margen va de 0 a 8 mm")
+    base = db()
+    perfil = "movil_58" if int(body.papel) == 58 else "epson_80"
+    base.set_printer_profile(
+        perfil,
+        width_movil_58=int(body.caracteres_58),
+        width_epson_80=int(body.caracteres_80),
+    )
+    base.set_config("printer_papel", str(int(body.papel)))
+    base.set_config("printer_cuadre_formato", body.cuadre)
+    base.set_config("printer_margen_mm", str(int(body.margen)))
+    base.set_config("printer_nombre", (body.nombre or "").strip()[:80])
+    return _impresora(base)
 
 
 class TurnoEditIn(BaseModel):
@@ -5177,6 +5233,8 @@ HTML = """<!DOCTYPE html>
   .opciones summary { cursor:pointer; padding:4px 0; }
   .opciones label { margin-top:8px; }
   .opciones[open] summary { color:var(--text); }
+  .muestra-impresion { background:#d6d3d1; border-radius:16px; padding:16px 8px; overflow:auto; }
+  .muestra-impresion iframe { display:block; margin:0 auto; background:#fff; border:0; box-shadow:0 8px 24px rgba(0,0,0,.22); }
   .ticket-acciones { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
   .ticket-acciones button { width:100%; }
   #esperas { margin-top:14px; display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; }
@@ -5433,6 +5491,7 @@ HTML = """<!DOCTYPE html>
       <button class="nav" data-view="ingreso" data-mod="caja" onclick="ver('ingreso')">Ingreso de efectivo</button>
       <button class="nav" data-view="retiro" data-mod="caja" onclick="ver('retiro')">Retiro de efectivo</button>
       <button class="nav" data-view="cerrar" data-mod="caja" onclick="ver('cerrar')">Cuadre y cierre</button>
+      <button class="nav" data-view="impresion" data-mod="caja" onclick="ver('impresion')">Impresión</button>
       <div class="nav-grupo" data-grupo="inventario">Inventario</div>
       <button class="nav" data-view="inventario" data-mod="inventario" onclick="ver('inventario')">Productos</button>
       <button class="nav" data-view="combos" data-mod="inventario" onclick="ver('combos')">Combos</button>
@@ -5751,6 +5810,8 @@ async function refrescar(){
   window._empresa = e.empresa || {};
   window._itbisIncluido = !!e.itbis_incluido;
   window._impresora = e.impresora || {};
+  const selPapel = document.getElementById("anchoTicket");
+  if (selPapel && window._impresora.papel) selPapel.value = String(window._impresora.papel) === "58" ? "58" : "80";
   aplicarPuertaCaja();
   const btn = document.getElementById("btnCaja");
   if (btn) btn.style.display = e.caja || !permisos.includes("caja") ? "none" : "";
@@ -6427,7 +6488,7 @@ async function pintarForm(nombre){
       `<div class="form"><button onclick="nuevoMov('ingreso')">Registrar ingreso</button></div><div id="movLista"></div>`],
     retiro: ["Retiro de efectivo", "No puede superar el efectivo esperado del turno. Abajo están los retiros de este turno.",
       `<div class="form"><button onclick="nuevoMov('retiro')">Registrar retiro</button></div><div id="movLista"></div>`],
-    cerrar: ["Cuadre y cierre", "El historial muestra todos los cuadres para compararlos. Filtra por fechas si quieres un período. Cada cuadre se abre en PDF para verlo o imprimirlo.",
+    cerrar: ["Cuadre y cierre", "El historial muestra todos los cuadres. Imprimir manda un ticket del ancho del rollo. Ver PDF abre la hoja carta, para archivar o para una impresora de oficina.",
       `<div class="form"><button onclick="nuevoCierre()">Cerrar turno</button><label>Desde<input id="cuadreDesde" type="date"/></label><label>Hasta<input id="cuadreHasta" type="date"/></label><button class="sec" onclick="cargarPanelCaja('cerrar')">Filtrar</button></div><div id="cajaInfo"></div>`],
     compra: ["Compras", "Pulsa Registrar compra. Varias líneas entran en la misma compra y suman existencia.",
       `<div class="form"><button onclick="nuevaCompra()">Registrar compra</button></div><div id="compLista"></div>`],
@@ -6465,6 +6526,8 @@ async function pintarForm(nombre){
     usuarios: ["Usuarios y permisos", "El administrador ve todo. El cajero entra a los módulos que marques y es quien cuadra la caja. El mesero queda por debajo: solo usa la tablet y sus pedidos se cobran en la caja abierta. La contraseña vacía, al editar, no la cambia.",
       `<div class="form"><button onclick="nuevoUsuario()">Crear usuario</button></div><div id="usuTabla"></div>`],
     seguimiento: ["Seguimiento de cajeros", "Cuánto vendió cada cajero y qué turnos descuadraron. Deja una nota de seguimiento.", ""],
+    impresion: ["Impresión", "La térmica 2connet POS80 usa rollo de 80 mm. El cuadre en hoja carta no cabe en ese rollo y sale cortado. Aquí el cuadre se arma como ticket, y puedes afinar caracteres y margen hasta que la regla quepa en una línea.",
+      `<div class="form"><label class="wide">Nombre de la impresora<input id="impNombre" maxlength="80" placeholder="2connet POS80-01"/></label><label>Papel<select id="impPapel" onchange="cambiarPapelImpresion()"><option value="80">80 mm · POS80</option><option value="58">58 mm · portátil</option></select></label><label><span id="impCharsLabel">Caracteres por línea</span><input id="impChars" type="number" min="20" max="64" step="1" oninput="vistaImpresion()"/></label><label>Margen izquierdo (mm)<input id="impMargen" type="number" min="0" max="8" step="1" oninput="vistaImpresion()"/></label><label>El cuadre se imprime en<select id="impCuadre"><option value="ticket">Ticket del rollo (esta térmica)</option><option value="carta">Hoja carta (impresora de oficina)</option></select></label><div class="wide"><button type="button" onclick="guardarImpresion()">Guardar</button> <button type="button" class="sec" onclick="imprimirPrueba()">Probar impresora</button> <button type="button" class="sec" onclick="imprimirMuestraCuadre()">Probar cuadre</button></div><p class="hint wide">Al salir el cuadro de impresión, elige esta impresora, escala 100% y márgenes en Ninguno. La vista de abajo es el ancho real del rollo.</p><div class="wide muestra-impresion" id="impMuestra"></div></div>`],
     empresa: ["Empresa y correo", "Datos del ticket y el servidor que envía el comprobante por correo.",
       `<div class="form"><label>Nombre<input id="empNom"/></label><label class="wide">Dirección<input id="empDir"/></label><label>Teléfono<input id="empTel" placeholder="809-000-0000"/></label><label>RNC<input id="empRnc"/></label><label>Servidor SMTP<input id="smtpHost" placeholder="smtp.hostinger.com"/></label><label>Puerto<input id="smtpPort" value="587"/></label><label>Usuario<input id="smtpUser"/></label><label>Contraseña<input id="smtpPass" type="password" placeholder="Vacía para no cambiarla"/></label><label>Remitente<input id="smtpFrom" placeholder="facturas@tudominio.com"/></label><label class="check wide"><input type="checkbox" id="empItbisIncl"/> Los precios del catálogo ya incluyen el ITBIS (lo normal en colmado y tienda)</label><button onclick="guardarEmpresa()">Guardar</button></div>`],
     porpagar: ["Por pagar", "Compras que todavía no se marcaron como pagadas al suplidor.",
@@ -6502,6 +6565,7 @@ async function pintarForm(nombre){
   if(nombre==="terminales") await cargarTerminales();
   if(nombre==="usuarios") await cargarUsuarios();
   if(nombre==="empresa") await cargarEmpresa();
+  if(nombre==="impresion") await cargarImpresion();
   if(nombre==="porpagar") await pintarPorPagar();
   if(nombre==="resultado") await pintarResultado();
   if(nombre==="seguimiento") await cargarSeguimiento();
@@ -6543,7 +6607,7 @@ async function cargarPanelCaja(nombre){
   }
   const a = d.abierta;
   const resumen = a
-    ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p><div class="acciones"><button class="sec" onclick="verPdfCuadre(${a.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${a.id})">Imprimir</button></div></div>`
+    ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p><div class="acciones"><button class="sec" onclick="verPdfCuadre(${a.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${a.id})">Imprimir ticket</button></div></div>`
     : "<p class='hint'>No hay turno abierto.</p>";
   const filas = (d.cierres || []).filter(c => c.estado === "cerrado");
   const vacio = q ? "No hay cuadres en ese período." : "Todavía no hay cuadres cerrados.";
@@ -6557,7 +6621,7 @@ async function cargarPanelCaja(nombre){
       String(c.cierre||"").slice(0,16) + (estadoCuadre(c) === "hoy" ? ` <span class="pill aviso">Hoy</span>` : ""), escDash(c.nombre), escDash(c.usuario || "—"),
       money(c.fondo), money(c.esperado), money(c.contado),
       `<span class="pill ${Math.abs(Number(c.diferencia || 0)) < 0.05 ? "bien" : "mal"}">${textoDif(c.diferencia)}</span>`,
-      `<div class="acciones"><button class="sec" onclick="verPdfCuadre(${c.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${c.id})">Imprimir</button><button class="sec" onclick="bajarCuadre(${c.id})">Descargar</button><button class="sec" onclick="editarCierre(${c.id})">Editar</button></div>`
+      `<div class="acciones"><button class="sec" onclick="verPdfCuadre(${c.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${c.id})">Imprimir ticket</button><button class="sec" onclick="bajarCuadre(${c.id})">Descargar</button><button class="sec" onclick="editarCierre(${c.id})">Editar</button></div>`
     ]),
     vacio
   ) + `</div>`;
@@ -6601,7 +6665,7 @@ async function verPdfCuadre(id){
     window._pdfCuadreUrl = url;
     const vista = document.getElementById("cuadreVista");
     if (!vista) return;
-    vista.innerHTML = `<div class="doc"><div class="acciones"><button type="button" onclick="imprimirVisorPdf()">Imprimir</button><button type="button" class="sec" onclick="bajarCuadre(${id})">Descargar PDF</button></div><iframe id="pdfCuadre" title="Cuadre de caja" src="${url}" style="width:100%;height:72vh;border:1px solid var(--line);border-radius:12px;background:#fff"></iframe></div>`;
+    vista.innerHTML = `<div class="doc"><div class="acciones"><button type="button" onclick="imprimirCuadreTicket(${id})">Imprimir ticket</button><button type="button" class="sec" onclick="imprimirVisorPdf()">Imprimir hoja carta</button><button type="button" class="sec" onclick="bajarCuadre(${id})">Descargar PDF</button></div><p class="hint">El ticket cabe en el rollo de la térmica. La hoja carta queda para archivar o para una impresora de oficina.</p><iframe id="pdfCuadre" title="Cuadre de caja" src="${url}" style="width:100%;height:72vh;border:1px solid var(--line);border-radius:12px;background:#fff"></iframe></div>`;
     vista.scrollIntoView({block:"nearest"});
   } catch(e) {
     formMsg.style.color = "var(--danger)";
@@ -6644,14 +6708,31 @@ async function verCuadreDesdeFactura(id){
   await verCuadre(id);
 }
 async function imprimirCierre(id){
+  if (((window._impresora || {}).cuadre) === "carta") {
+    try {
+      await verPdfCuadre(id);
+      const frame = document.getElementById("pdfCuadre");
+      if (!frame) return;
+      const lanzar = () => {
+        try { frame.contentWindow.focus(); frame.contentWindow.print(); } catch (err) {}
+      };
+      frame.addEventListener("load", lanzar, {once:true});
+    } catch(e) {
+      formMsg.style.color = "var(--danger)";
+      formMsg.textContent = e.message;
+    }
+    return;
+  }
+  await imprimirCuadreTicket(id);
+}
+async function imprimirCuadreTicket(id){
   try {
-    await verPdfCuadre(id);
-    const frame = document.getElementById("pdfCuadre");
-    if (!frame) return;
-    const lanzar = () => {
-      try { frame.contentWindow.focus(); frame.contentWindow.print(); } catch (err) {}
-    };
-    frame.addEventListener("load", lanzar, {once:true});
+    const d = await api("/api/caja/cierre/" + id);
+    await imprimirTicket(htmlCuadreTicket(d));
+    const p = papelTicket();
+    const cual = p.nombre || "la térmica";
+    formMsg.style.color = "var(--ok)";
+    formMsg.textContent = "Ticket de " + p.papel + " mm listo. En el cuadro elige " + cual + ", escala 100% y márgenes en Ninguno.";
   } catch(e) {
     formMsg.style.color = "var(--danger)";
     formMsg.textContent = e.message;
@@ -7700,12 +7781,179 @@ async function registrarAbono(id){
     await cargarCobros();
   } catch(e){ errorModal(e); }
 }
+function medidasTicket(cfg){
+  cfg = cfg || {};
+  const papel = Number(cfg.papel) === 58 ? 58 : 80;
+  const crudo = papel === 58 ? Number(cfg.caracteres_58 || 32) : Number(cfg.caracteres_80 || 42);
+  const piso = papel === 58 ? 20 : 24;
+  const tope = papel === 58 ? 42 : 64;
+  const caracteres = Math.max(piso, Math.min(tope, Math.round(crudo) || (papel === 58 ? 32 : 42)));
+  const margen = Math.max(0, Math.min(8, Math.round(Number(cfg.margen || 0)) || 0));
+  const util = Math.max(28, (papel === 58 ? 48 : 72) - margen);
+  return {
+    papel, util, caracteres, margen,
+    letra: Math.round(util / caracteres / 0.6 * 1000) / 1000,
+    nombre: String(cfg.nombre || "").trim()
+  };
+}
 function papelTicket(){
-  const ancho = (document.getElementById("anchoTicket") || {}).value === "58" ? 58 : 80;
-  const imp = window._impresora || {};
-  const caracteres = ancho === 58 ? Number(imp.caracteres_58 || 32) : Number(imp.caracteres_80 || 42);
-  const util = ancho === 58 ? 48 : 72;
-  return {papel: ancho, util, caracteres, letra: Math.round(util / caracteres / 0.6 * 1000) / 1000};
+  if (document.getElementById("impPapel") && document.querySelector('.nav.on[data-view="impresion"]')) {
+    return medidasTicket(leerAjustesImpresion());
+  }
+  const cfg = Object.assign({papel: 80}, window._impresora || {});
+  const sel = document.getElementById("anchoTicket");
+  if (sel && sel.value) cfg.papel = Number(sel.value);
+  return medidasTicket(cfg);
+}
+function leerAjustesImpresion(){
+  const papel = Number(impPapel.value) === 58 ? 58 : 80;
+  const chars = Number(impChars.value);
+  const memoria = window._charsPorPapel || {};
+  const base = window._impresora || {};
+  return {
+    papel,
+    caracteres_80: papel === 80 ? chars : Number(memoria[80] || base.caracteres_80 || 42),
+    caracteres_58: papel === 58 ? chars : Number(memoria[58] || base.caracteres_58 || 32),
+    margen: Number(impMargen.value || 0),
+    cuadre: impCuadre.value === "carta" ? "carta" : "ticket",
+    nombre: impNombre.value || ""
+  };
+}
+function cambiarPapelImpresion(){
+  const papel = Number(impPapel.value) === 58 ? 58 : 80;
+  const base = window._impresora || {};
+  const memoria = window._charsPorPapel || {};
+  impChars.value = papel === 58 ? (memoria[58] || base.caracteres_58 || 32) : (memoria[80] || base.caracteres_80 || 42);
+  vistaImpresion();
+}
+async function cargarImpresion(){
+  try {
+    const d = await api("/api/impresion");
+    window._impresora = d;
+    window._charsPorPapel = {80: d.caracteres_80, 58: d.caracteres_58};
+    impNombre.value = d.nombre || "";
+    impPapel.value = String(d.papel) === "58" ? "58" : "80";
+    impChars.value = d.papel === 58 ? d.caracteres_58 : d.caracteres_80;
+    impMargen.value = d.margen || 0;
+    impCuadre.value = d.cuadre === "carta" ? "carta" : "ticket";
+    const sel = document.getElementById("anchoTicket");
+    if (sel) sel.value = impPapel.value;
+    await vistaImpresion();
+  } catch(e) {
+    formMsg.style.color = "var(--danger)";
+    formMsg.textContent = e.message;
+  }
+}
+async function guardarImpresion(){
+  try {
+    const body = leerAjustesImpresion();
+    const ajustado = medidasTicket(body);
+    body.papel = ajustado.papel;
+    body.margen = ajustado.margen;
+    if (body.papel === 58) body.caracteres_58 = ajustado.caracteres;
+    else body.caracteres_80 = ajustado.caracteres;
+    impChars.value = ajustado.caracteres;
+    impMargen.value = ajustado.margen;
+    const d = await api("/api/impresion", {method:"POST", body: JSON.stringify(body)});
+    window._impresora = d;
+    window._charsPorPapel = {80: d.caracteres_80, 58: d.caracteres_58};
+    const sel = document.getElementById("anchoTicket");
+    if (sel) sel.value = String(d.papel);
+    localStorage.setItem("papel_ticket", String(d.papel));
+    formMsg.style.color = "var(--ok)";
+    formMsg.textContent = "Impresora guardada. El cuadre sale en " + (d.cuadre === "carta" ? "hoja carta" : "ticket de " + d.papel + " mm") + ".";
+    await vistaImpresion();
+  } catch(e) {
+    formMsg.style.color = "var(--danger)";
+    formMsg.textContent = e.message;
+  }
+}
+function cuadreDeMuestra(){
+  return {
+    nombre: "Caja 1", estado: "cerrado",
+    usuario_apertura: "cajera", usuario_cierre: "cajera",
+    apertura: "2026-11-04 09:00:00", cierre: "2026-11-04 18:00:00",
+    n_facturas: 2, n_anuladas: 0, ventas_total: 1500,
+    fondo: 500, ventas_efectivo: 800, ingresos: 0, retiros: 100,
+    esperado: 1200, contado: 1200, diferencia: 0,
+    pagos: [{tipo: "efectivo", monto: 800}, {tipo: "tarjeta", monto: 700}],
+    movimientos: [{fecha: "2026-11-04 12:00", tipo: "retiro", monto: 100, motivo: "Pago al suplidor", usuario: "cajera"}],
+    facturas: [
+      {numero: "F-1001", fecha: "2026-11-04 10:15", estado: "emitida", cliente: "Consumidor final", total: 800},
+      {numero: "F-1002", fecha: "2026-11-04 11:40", estado: "emitida", cliente: "Cliente de ejemplo con nombre largo", total: 700}
+    ],
+    observaciones: "Cuadrado"
+  };
+}
+function fechaCortaTicket(valor){
+  const m = String(valor || "").match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})/);
+  if (!m) return escDash(String(valor || "").slice(0, 16));
+  return m[3] + "/" + m[2] + " " + m[4] + ":" + m[5];
+}
+function htmlCuadreTicket(d, extra){
+  const emp = window._empresa || {};
+  const cerrado = (d.estado || "") === "cerrado";
+  const pagos = (d.pagos || []).map(p => filaTicket(escDash(String(p.tipo || "otro").replaceAll("_", " ")), money(p.monto))).join("");
+  const movs = (d.movimientos || []).map(m =>
+    `<p class="sub">${fechaCortaTicket(m.fecha)} · ${escDash(m.tipo || "")} · ${escDash(m.usuario || "")}</p>`
+    + filaTicket(escDash(m.motivo || "—"), money(m.monto))
+  ).join("");
+  const facs = (d.facturas || []).map(f =>
+    `<p class="sub">${escDash(f.numero || "")} · ${fechaCortaTicket(f.fecha)} · ${escDash(f.estado || "")}</p>`
+    + filaTicket(escDash(f.cliente || "Consumidor final"), money(f.total))
+  ).join("");
+  return `<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${cerrado ? "CUADRE DE CAJA" : "PRE-CUADRE"}</span>`
+    + filaTicket("Turno", escDash(d.nombre || "Caja"))
+    + filaTicket("Abrió", escDash(d.usuario_apertura || "—"))
+    + filaTicket("Apertura", fechaTicket(d.apertura))
+    + filaTicket("Cerró", escDash(d.usuario_cierre || "—"))
+    + filaTicket("Cierre", d.cierre ? fechaTicket(d.cierre) : "Turno abierto")
+    + filaTicket("Facturas", String(d.n_facturas || 0))
+    + (Number(d.n_anuladas || 0) ? filaTicket("Anuladas", String(d.n_anuladas)) : "")
+    + filaTicket("Venta total", money(d.ventas_total))
+    + `<hr class="corte"><span class="titulo">EFECTIVO</span>`
+    + filaTicket("Fondo", money(d.fondo))
+    + filaTicket("Ventas en efectivo", money(d.ventas_efectivo))
+    + filaTicket("Ingresos", money(d.ingresos))
+    + filaTicket("Retiros", money(d.retiros))
+    + filaTicket("Esperado", money(d.esperado))
+    + filaTicket("Contado", cerrado ? money(d.contado) : "Pendiente")
+    + filaTicket("Resultado", cerrado ? textoDif(d.diferencia) : "Pendiente de conteo", "total")
+    + `<hr class="corte"><span class="titulo">FORMAS DE PAGO</span>`
+    + (pagos || `<p class="sub">Sin cobros en este turno.</p>`)
+    + `<hr class="corte"><span class="titulo">MOVIMIENTOS</span>`
+    + (movs || `<p class="sub">Sin ingresos ni retiros.</p>`)
+    + `<hr class="corte"><span class="titulo">FACTURAS</span>`
+    + (facs || `<p class="sub">Sin facturas en este turno.</p>`)
+    + `<hr class="corte"><p>${escDash(String(d.observaciones || "").trim() || "Sin observación")}</p>`
+    + `<p class="centro" style="margin-top:6mm">________________</p><p class="centro sub">Cajero</p>`
+    + pieTicket()
+    + (extra || "")
+    + `</div>`;
+}
+async function vistaImpresion(){
+  const caja = document.getElementById("impMuestra");
+  if (!caja || !document.getElementById("impPapel")) return;
+  const p = medidasTicket(leerAjustesImpresion());
+  window._charsPorPapel = window._charsPorPapel || {};
+  window._charsPorPapel[p.papel] = p.caracteres;
+  const etiqueta = document.getElementById("impCharsLabel");
+  if (etiqueta) etiqueta.textContent = "Caracteres en " + p.papel + " mm";
+  const regla = Array.from({length: p.caracteres}, (_, i) => String((i + 1) % 10)).join("");
+  const extra = `<hr class="corte"><div class="regla">${regla}</div><p class="sub">${p.caracteres} caracteres en ${p.papel} mm. La regla tiene que verse completa, en una sola línea.</p>`;
+  caja.innerHTML = "";
+  const marco = document.createElement("iframe");
+  marco.title = "Vista del ticket";
+  marco.style.width = p.papel + "mm";
+  marco.style.height = "40mm";
+  marco.style.border = "0";
+  caja.appendChild(marco);
+  await escribirTicket(marco, htmlCuadreTicket(cuadreDeMuestra(), extra), p, false);
+}
+function imprimirMuestraCuadre(){
+  const p = papelTicket();
+  const regla = Array.from({length: p.caracteres}, (_, i) => String((i + 1) % 10)).join("");
+  imprimirTicket(htmlCuadreTicket(cuadreDeMuestra(), `<hr class="corte"><div class="regla">${regla}</div>`));
 }
 (function(){
   const sel = document.getElementById("anchoTicket");
@@ -7715,7 +7963,8 @@ function papelTicket(){
 })();
 const CSS_TICKET = `
   html, body { margin:0; padding:0; background:#fff; color:#000; }
-  .bau { box-sizing:border-box; width:var(--util); margin:0 auto; padding:3mm 0 7mm; color:#000;
+  @media print { html, body { width: var(--papel, 80mm) !important; margin: 0 !important; } }
+  .bau { box-sizing:border-box; width:var(--util); margin:0 auto 0 var(--izq, auto); padding:3mm 0 7mm; color:#000;
     font-family:"Courier New", Courier, "Liberation Mono", monospace; font-size:var(--letra); line-height:1.28; font-weight:700; overflow-wrap:anywhere; }
   .bau p { margin:0; }
   .centro { display:block; text-align:center; }
@@ -7735,6 +7984,24 @@ const CSS_TICKET = `
   .qr { display:flex; justify-content:center; margin-top:1.5mm; }
   .qr svg { width:28mm; height:28mm; }
 `;
+async function escribirTicket(marco, html, medidas, paraImprimir){
+  const p = medidas || papelTicket();
+  const doc = marco.contentDocument;
+  const titulo = (p.nombre || "Ticket").replace(/[<>"']/g, "");
+  const izq = p.margen ? p.margen + "mm" : "auto";
+  doc.open();
+  doc.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${titulo}</title><style id="pagina">@page{size:${p.papel}mm 400mm;margin:0}</style><style>${CSS_TICKET}</style></head><body style="--papel:${p.papel}mm;--util:${p.util}mm;--letra:${p.letra}mm;--izq:${izq};width:${p.papel}mm">${html}</body></html>`);
+  doc.close();
+  if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const alto = Math.ceil(doc.body.getBoundingClientRect().height * 25.4 / 96) + 2;
+  doc.getElementById("pagina").textContent = `@page{size:${p.papel}mm ${alto}mm;margin:0}`;
+  marco.style.height = Math.max(alto, 20) + "mm";
+  if (paraImprimir) {
+    marco.contentWindow.focus();
+    marco.contentWindow.print();
+  }
+}
 async function imprimirTicket(html){
   const p = papelTicket();
   const viejo = document.getElementById("marcoTicket");
@@ -7746,16 +8013,7 @@ async function imprimirTicket(html){
   marco.tabIndex = -1;
   marco.style.cssText = `position:fixed;left:-300mm;top:0;width:${p.papel}mm;height:20mm;border:0;opacity:0;pointer-events:none`;
   document.body.appendChild(marco);
-  const doc = marco.contentDocument;
-  doc.open();
-  doc.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Ticket</title><style id="pagina">@page{size:${p.papel}mm 400mm;margin:0}</style><style>${CSS_TICKET}</style></head><body style="--util:${p.util}mm;--letra:${p.letra}mm;width:${p.papel}mm">${html}</body></html>`);
-  doc.close();
-  if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-  const alto = Math.ceil(doc.body.getBoundingClientRect().height * 25.4 / 96) + 2;
-  doc.getElementById("pagina").textContent = `@page{size:${p.papel}mm ${alto}mm;margin:0}`;
-  marco.contentWindow.focus();
-  marco.contentWindow.print();
+  await escribirTicket(marco, html, p, true);
 }
 function imprimirPrueba(){
   const p = papelTicket();
