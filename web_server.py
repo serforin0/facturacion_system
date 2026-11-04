@@ -7789,10 +7789,10 @@ function medidasTicket(cfg){
   const tope = papel === 58 ? 42 : 64;
   const caracteres = Math.max(piso, Math.min(tope, Math.round(crudo) || (papel === 58 ? 32 : 42)));
   const margen = Math.max(0, Math.min(8, Math.round(Number(cfg.margen || 0)) || 0));
-  const util = Math.max(28, (papel === 58 ? 42 : 62) - margen);
+  const util = Math.max(28, (papel === 58 ? 48 : 72) - margen);
   return {
     papel, util, caracteres, margen,
-    letra: Math.round(util / caracteres / 0.75 * 1000) / 1000,
+    letra: Math.round(util / caracteres / 0.6 * 1000) / 1000,
     nombre: String(cfg.nombre || "").trim()
   };
 }
@@ -7978,10 +7978,10 @@ const CSS_TICKET = `
   html, body { margin:0; padding:0; background:#fff; color:#000; }
   @media print { html, body { width: var(--papel, 80mm) !important; margin: 0 !important; } }
   .bau { box-sizing:border-box; width:var(--util); margin:0 auto 0 var(--izq, auto); padding:3mm 0 7mm; color:#000;
-    font-family:"Courier New", Courier, "Liberation Mono", monospace; font-size:var(--letra); line-height:1.25; font-weight:700; }
+    font-family:"Courier New", Courier, "Liberation Mono", monospace; font-size:var(--letra); line-height:1.28; font-weight:700; }
   .bau p { margin:0; }
   .centro { display:block; text-align:center; }
-  .local { display:block; font-size:1.25em; letter-spacing:.02em; text-transform:uppercase; }
+  .local { display:block; font-size:1.3em; letter-spacing:.02em; text-transform:uppercase; }
   header span, .sub, .pie { display:block; }
   .corte { border:0; border-top:.3mm dashed #000; margin:1.6mm 0; }
   .fila { display:table; width:100%; table-layout:auto; }
@@ -7989,8 +7989,9 @@ const CSS_TICKET = `
   .din { display:table-cell; width:1%; text-align:right; white-space:nowrap; vertical-align:baseline; padding-left:3mm; }
   .bloque { margin:0 0 1.4mm; }
   .sub, .ley, .cols { font-size:.92em; }
-  .total { font-size:1.08em; }
+  .total { font-size:1.2em; }
   .renglon { display:block; overflow-wrap:break-word; }
+  .der { text-align:right; }
   .atendio { margin-top:1.6mm; }
   .titulo { display:block; text-align:center; letter-spacing:.06em; margin:1.6mm 0 .6mm; }
   .mesa { display:block; text-align:center; font-size:1.4em; letter-spacing:.08em; margin:1mm 0; }
@@ -8072,7 +8073,12 @@ function pieTicket(){
   return `<hr class="corte"><p class="centro pie">GRACIAS POR SU VISITA</p>`;
 }
 function filaTicket(izq, der, clase){
-  return `<div class="fila${clase ? " " + clase : ""}"><span class="nom">${izq}</span><span class="din">${der}</span></div>`;
+  const claseFila = clase ? " " + clase : "";
+  const texto = String(der == null ? "" : der).replace(/<[^>]*>/g, "");
+  if (texto.length > 22) {
+    return `<div class="fila${claseFila}"><span class="nom">${izq}</span></div><div class="renglon der">${der}</div>`;
+  }
+  return `<div class="fila${claseFila}"><span class="nom">${izq}</span><span class="din">${der}</span></div>`;
 }
 function datosMesa(nota){
   const partes = String(nota || "").split("·").map(s => s.trim()).filter(Boolean);
