@@ -7989,7 +7989,9 @@ const CSS_TICKET = `
   .din { display:table-cell; width:1%; text-align:right; white-space:nowrap; vertical-align:baseline; padding-left:3mm; }
   .bloque { margin:0 0 1.4mm; }
   .sub, .ley, .cols { font-size:.92em; }
-  .total { font-size:1.25em; }
+  .total { font-size:1.08em; }
+  .renglon { display:block; overflow-wrap:break-word; }
+  .atendio { margin-top:1.6mm; }
   .titulo { display:block; text-align:center; letter-spacing:.06em; margin:1.6mm 0 .6mm; }
   .mesa { display:block; text-align:center; font-size:1.4em; letter-spacing:.08em; margin:1mm 0; }
   .cols3 { display:grid; grid-template-columns:1fr 9ch 10ch; column-gap:1ch; }
@@ -8058,8 +8060,10 @@ function numTicket(n){
   return Number(n || 0).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2});
 }
 function cabezaTicket(emp){
+  const dir = String(emp.direccion || "").split(/\\n|,/).map(s => s.trim()).filter(Boolean)
+    .map(s => `<span>${escDash(s)}</span>`).join("");
   return `<header class="centro"><strong class="local">${escDash(emp.nombre || "Ticket")}</strong>`
-    + (emp.direccion ? `<span>${escDash(emp.direccion)}</span>` : "")
+    + dir
     + (emp.telefono ? `<span>Tel. ${escDash(emp.telefono)}</span>` : "")
     + (emp.rnc ? `<span>RNC ${escDash(emp.rnc)}</span>` : "")
     + `</header>`;
@@ -8085,18 +8089,15 @@ function esCreditoFiscal(data){
   return ncf.startsWith("B01") || ncf.startsWith("E31");
 }
 function cabezaLineas(){
-  return papelTicket().papel === 58
-    ? filaTicket("UDS DESCRIPCION", "IMPORTE", "ley")
-    : `<div class="cols3 ley"><span>UDS DESCRIPCION</span><span class="d">PRECIO</span><span class="d">IMPORTE</span></div>`;
+  return filaTicket("DESCRIPCION", "IMPORTE", "ley");
 }
 function lineasTicket(data){
-  const angosto = papelTicket().papel === 58;
   return (data.lineas || []).map(l => {
     const cant = Number(l.cantidad);
     const cantTxt = Number.isInteger(cant) ? String(cant) : cant.toFixed(2);
     const precio = l.precio != null ? numTicket(l.precio) : "";
-    if (angosto) return `<div>${escDash(l.nombre)}</div>` + filaTicket(`&nbsp;&nbsp;${cantTxt}${precio ? " x " + precio : ""}`, numTicket(l.total));
-    return `<div class="cols3"><span>${cantTxt} ${escDash(l.nombre)}</span><span class="d">${precio}</span><span class="d">${numTicket(l.total)}</span></div>`;
+    const detalle = precio ? cantTxt + " x " + precio : cantTxt;
+    return `<div class="bloque"><div class="renglon">${escDash(l.nombre)}</div>${filaTicket(detalle, numTicket(l.total))}</div>`;
   }).join("");
 }
 function imprimirReciboAbono(r){
@@ -8531,9 +8532,10 @@ async function imprimirRecibo(data){
   let impuestos = "";
   if (credito) {
     const gravada = Number(data.subtotal || 0);
-    impuestos = `<hr class="corte"><div class="cols3 ley"><span>Impuesto</span><span class="d">B.IMP.</span><span class="d">IMPORTE</span></div>`
-      + `<div class="cols3"><span>0.00%</span><span class="d">${numTicket(0)}</span><span class="d">${numTicket(0)}</span></div>`
-      + `<div class="cols3"><span>18.00%</span><span class="d">${numTicket(gravada)}</span><span class="d">${numTicket(data.itbis)}</span></div>`;
+    impuestos = `<hr class="corte">`
+      + filaTicket("Base 0%", numTicket(0))
+      + filaTicket("Base 18%", numTicket(gravada))
+      + filaTicket("ITBIS 18%", numTicket(data.itbis));
   }
   const pagos = data.precuenta ? "" : (data.pagos || []).map(p => {
     const aut = p.referencia ? `<div class="sub">Aut. ${escDash(p.referencia)}</div>` : "";
@@ -8546,7 +8548,7 @@ async function imprimirRecibo(data){
     : "";
   const firma = data.precuenta
     ? (lugar.camarero ? filaTicket("Camarero", escDash(lugar.camarero)) : "")
-    : (atendio ? `<p class="centro">Le atendió: ${escDash(String(atendio).toUpperCase())}</p>` : "");
+    : (atendio ? `<hr class="corte"><p class="centro atendio">Le atendió: ${escDash(String(atendio).toUpperCase())}</p>` : "");
   await imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte">${cabezaLineas()}${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`);
 }
 async function cargarMetodos(){
