@@ -7789,10 +7789,10 @@ function medidasTicket(cfg){
   const tope = papel === 58 ? 42 : 64;
   const caracteres = Math.max(piso, Math.min(tope, Math.round(crudo) || (papel === 58 ? 32 : 42)));
   const margen = Math.max(0, Math.min(8, Math.round(Number(cfg.margen || 0)) || 0));
-  const util = Math.max(28, (papel === 58 ? 48 : 72) - margen);
+  const util = Math.max(28, (papel === 58 ? 42 : 62) - margen);
   return {
     papel, util, caracteres, margen,
-    letra: Math.round(util / caracteres / 0.6 * 1000) / 1000,
+    letra: Math.round(util / caracteres / 0.75 * 1000) / 1000,
     nombre: String(cfg.nombre || "").trim()
   };
 }
@@ -7885,6 +7885,16 @@ function cuadreDeMuestra(){
     observaciones: "Cuadrado"
   };
 }
+function etiquetaPago(tipo){
+  const t = String(tipo || "otro").replaceAll("_", " ").trim();
+  return escDash(t ? t.charAt(0).toUpperCase() + t.slice(1) : "Otro");
+}
+function notaCuadre(d, cerrado){
+  const nota = String(d.observaciones || "").trim();
+  const resultado = cerrado ? textoDif(d.diferencia) : "";
+  if (!nota || nota.toLowerCase() === String(resultado).toLowerCase()) return "";
+  return `<hr class="corte"><p>Nota: ${escDash(nota)}</p>`;
+}
 function fechaCortaTicket(valor){
   const m = String(valor || "").match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})/);
   if (!m) return escDash(String(valor || "").slice(0, 16));
@@ -7893,14 +7903,17 @@ function fechaCortaTicket(valor){
 function htmlCuadreTicket(d, extra){
   const emp = window._empresa || {};
   const cerrado = (d.estado || "") === "cerrado";
-  const pagos = (d.pagos || []).map(p => filaTicket(escDash(String(p.tipo || "otro").replaceAll("_", " ")), money(p.monto))).join("");
+  const pagos = (d.pagos || []).map(p => filaTicket(etiquetaPago(p.tipo), money(p.monto))).join("");
   const movs = (d.movimientos || []).map(m =>
-    `<p class="sub">${fechaCortaTicket(m.fecha)} · ${escDash(m.tipo || "")} · ${escDash(m.usuario || "")}</p>`
-    + filaTicket(escDash(m.motivo || "—"), money(m.monto))
+    filaTicket(escDash(m.motivo || m.tipo || "—"), money(m.monto))
+    + `<p class="sub">${fechaCortaTicket(m.fecha)} · ${escDash(m.tipo || "")} · ${escDash(m.usuario || "")}</p>`
   ).join("");
   const facs = (d.facturas || []).map(f =>
-    `<p class="sub">${escDash(f.numero || "")} · ${fechaCortaTicket(f.fecha)} · ${escDash(f.estado || "")}</p>`
-    + filaTicket(escDash(f.cliente || "Consumidor final"), money(f.total))
+    `<div class="bloque">`
+    + filaTicket(escDash(f.numero || "Factura"), money(f.total))
+    + `<p class="sub">${fechaCortaTicket(f.fecha)} · ${escDash(f.estado || "")}</p>`
+    + `<p class="sub">${escDash(f.cliente || "Consumidor final")}</p>`
+    + `</div>`
   ).join("");
   return `<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${cerrado ? "CUADRE DE CAJA" : "PRE-CUADRE"}</span>`
     + filaTicket("Turno", escDash(d.nombre || "Caja"))
@@ -7925,7 +7938,7 @@ function htmlCuadreTicket(d, extra){
     + (movs || `<p class="sub">Sin ingresos ni retiros.</p>`)
     + `<hr class="corte"><span class="titulo">FACTURAS</span>`
     + (facs || `<p class="sub">Sin facturas en este turno.</p>`)
-    + `<hr class="corte"><p>${escDash(String(d.observaciones || "").trim() || "Sin observación")}</p>`
+    + notaCuadre(d, cerrado)
     + `<p class="centro" style="margin-top:6mm">________________</p><p class="centro sub">Cajero</p>`
     + pieTicket()
     + (extra || "")
@@ -7965,22 +7978,23 @@ const CSS_TICKET = `
   html, body { margin:0; padding:0; background:#fff; color:#000; }
   @media print { html, body { width: var(--papel, 80mm) !important; margin: 0 !important; } }
   .bau { box-sizing:border-box; width:var(--util); margin:0 auto 0 var(--izq, auto); padding:3mm 0 7mm; color:#000;
-    font-family:"Courier New", Courier, "Liberation Mono", monospace; font-size:var(--letra); line-height:1.28; font-weight:700; overflow-wrap:anywhere; }
+    font-family:"Courier New", Courier, "Liberation Mono", monospace; font-size:var(--letra); line-height:1.25; font-weight:700; }
   .bau p { margin:0; }
   .centro { display:block; text-align:center; }
-  .local { display:block; font-size:1.3em; letter-spacing:.02em; text-transform:uppercase; }
+  .local { display:block; font-size:1.25em; letter-spacing:.02em; text-transform:uppercase; }
   header span, .sub, .pie { display:block; }
   .corte { border:0; border-top:.3mm dashed #000; margin:1.6mm 0; }
-  .fila { display:flex; justify-content:space-between; gap:1ch; }
-  .nom { flex:1; min-width:0; }
-  .din { white-space:nowrap; }
+  .fila { display:table; width:100%; table-layout:auto; }
+  .nom { display:table-cell; text-align:left; vertical-align:baseline; overflow-wrap:break-word; }
+  .din { display:table-cell; width:1%; text-align:right; white-space:nowrap; vertical-align:baseline; padding-left:3mm; }
+  .bloque { margin:0 0 1.4mm; }
   .sub, .ley, .cols { font-size:.92em; }
   .total { font-size:1.25em; }
   .titulo { display:block; text-align:center; letter-spacing:.06em; margin:1.6mm 0 .6mm; }
   .mesa { display:block; text-align:center; font-size:1.4em; letter-spacing:.08em; margin:1mm 0; }
   .cols3 { display:grid; grid-template-columns:1fr 9ch 10ch; column-gap:1ch; }
   .d { text-align:right; }
-  .regla { white-space:pre; overflow:hidden; }
+  .regla { white-space:nowrap; overflow:hidden; letter-spacing:0; }
   .qr { display:flex; justify-content:center; margin-top:1.5mm; }
   .qr svg { width:28mm; height:28mm; }
 `;
