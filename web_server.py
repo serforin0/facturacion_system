@@ -3,6 +3,7 @@ Mostrador web. Usa la misma base SQLite que el programa de escritorio.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -10,12 +11,13 @@ import json
 import os
 import sqlite3
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -35,6 +37,9 @@ TASA_ITBIS = 0.18
 SECRET_PATH = Path(os.environ.get("FACTURACION_SECRET", ".session_secret"))
 app = FastAPI(title="Facturación")
 _sessions: dict[str, str] = {}
+_empresa_oyentes: list[asyncio.Queue] = []
+_empresa_loop: asyncio.AbstractEventLoop | None = None
+_empresa_lock = threading.Lock()
 _STATIC = Path(__file__).resolve().parent / "web_static"
 _FONDOS = (
     ("agua", "agua.jpg"),
@@ -231,24 +236,69 @@ def _permisos(username: str) -> list[str]:
         conn.close()
         return ["pedidos"]
     cur.execute("SELECT modulo FROM usuario_permisos WHERE username=? ORDER BY modulo", (username,))
-    mods = [r[0] for r in cur.fetchall() if r[0] in MODULOS]
+    rows = [r[0] for r in cur.fetchall()]
     conn.close()
-    return mods or ["mostrador"]
+    if not rows:
+        return ["mostrador"]
+    return [r for r in rows if _clave_valida(r)]
 
 
-def _exigir(request: Request, modulo: str) -> str:
+def _rol(username: str) -> str:
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM users WHERE username=?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else ""
+
+
+def _exigir_admin(request: Request) -> str:
     user = _user(request)
-    if modulo not in _permisos(user):
+    if _rol(user) != "admin":
+        raise HTTPException(status_code=403, detail="Solo el administrador puede ver la empresa")
+    return user
+
+
+def _fecha_factura(factura_id: int) -> tuple[str, str]:
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT IFNULL(fecha,''), IFNULL(estado,'') FROM facturas WHERE id=?", (factura_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    return str(row[0] or ""), str(row[1] or "")
+
+
+def _exigir_factura_visible(request: Request, factura_id: int) -> None:
+    user = _user(request)
+    if _rol(user) == "admin":
+        return
+    fecha, estado = _fecha_factura(factura_id)
+    if estado == "cotizacion" and "cotizaciones" in _permisos(user):
+        return
+    if str(fecha)[:10] != datetime.now().strftime("%Y-%m-%d"):
+        raise HTTPException(status_code=403, detail="Solo puedes ver las facturas de hoy")
+
+
+def _exigir(request: Request, modulo: str, funcion: str | None = None) -> str:
+    user = _user(request)
+    clave = f"{modulo}:{funcion}" if funcion else modulo
+    if not _puede(_permisos(user), clave):
         raise HTTPException(status_code=403, detail="No tienes permiso para este módulo")
     return user
 
 
-def _exigir_alguno(request: Request, modulos: tuple[str, ...]) -> str:
+def _exigir_alguno(request: Request, claves: tuple[str, ...]) -> str:
     user = _user(request)
     tiene = _permisos(user)
-    if not any(modulo in tiene for modulo in modulos):
+    if not any(_puede(tiene, clave) for clave in claves):
         raise HTTPException(status_code=403, detail="No tienes permiso para este módulo")
     return user
+
+
+def _exigir_alguna_funcion(request: Request, modulo: str, funciones: tuple[str, ...]) -> str:
+    return _exigir_alguno(request, tuple(f"{modulo}:{funcion}" for funcion in funciones))
 
 
 def _itbis_incluido(base: Database) -> bool:
@@ -333,6 +383,99 @@ MODULOS = [
     "promociones", "devoluciones", "transferir", "ncf", "seguimiento", "metodos",
     "cobros", "vendedores", "terminales", "pedidos",
 ]
+
+FUNCIONES = {
+    "mostrador": ("venta", "cocina"),
+    "caja": ("caja", "ingreso", "retiro", "cerrar", "impresion"),
+    "inventario": ("inventario", "combos"),
+    "compras": ("compra", "porpagar"),
+    "reportes": ("reportes", "resultado"),
+    "ncf": ("ncf", "ecf"),
+}
+
+PERMISOS_ARBOL = [
+    {"grupo": "Venta", "id": "mostrador", "nombre": "Venta", "hijos": [
+        {"id": "venta", "nombre": "Mostrador"},
+        {"id": "cocina", "nombre": "Cocina"},
+    ]},
+    {"grupo": "Venta", "id": "cotizaciones", "nombre": "Cotizaciones", "hijos": []},
+    {"grupo": "Venta", "id": "historial", "nombre": "Facturas emitidas", "hijos": []},
+    {"grupo": "Venta", "id": "cobros", "nombre": "Cuentas por cobrar", "hijos": []},
+    {"grupo": "Venta", "id": "devoluciones", "nombre": "Devoluciones", "hijos": []},
+    {"grupo": "Caja", "id": "caja", "nombre": "Caja", "hijos": [
+        {"id": "caja", "nombre": "Abrir caja"},
+        {"id": "ingreso", "nombre": "Ingreso de efectivo"},
+        {"id": "retiro", "nombre": "Retiro de efectivo"},
+        {"id": "cerrar", "nombre": "Cuadre y cierre"},
+        {"id": "impresion", "nombre": "Impresión"},
+    ]},
+    {"grupo": "Inventario", "id": "inventario", "nombre": "Inventario", "hijos": [
+        {"id": "inventario", "nombre": "Productos"},
+        {"id": "combos", "nombre": "Combos"},
+    ]},
+    {"grupo": "Inventario", "id": "compras", "nombre": "Compras", "hijos": [
+        {"id": "compra", "nombre": "Registrar compra"},
+        {"id": "porpagar", "nombre": "Por pagar"},
+    ]},
+    {"grupo": "Inventario", "id": "kardex", "nombre": "Kardex", "hijos": []},
+    {"grupo": "Inventario", "id": "transferir", "nombre": "Bodegas y traslados", "hijos": []},
+    {"grupo": "Inventario", "id": "promociones", "nombre": "Promociones", "hijos": []},
+    {"grupo": "Análisis", "id": "indicadores", "nombre": "Indicadores", "hijos": []},
+    {"grupo": "Análisis", "id": "reportes", "nombre": "Reportes", "hijos": [
+        {"id": "reportes", "nombre": "Reportes"},
+        {"id": "resultado", "nombre": "Resultado"},
+    ]},
+    {"grupo": "Análisis", "id": "seguimiento", "nombre": "Seguimiento de cajeros", "hijos": []},
+    {"grupo": "Administración", "id": "clientes", "nombre": "Clientes", "hijos": []},
+    {"grupo": "Administración", "id": "usuarios", "nombre": "Usuarios y permisos", "hijos": []},
+    {"grupo": "Administración", "id": "vendedores", "nombre": "Vendedores", "hijos": []},
+    {"grupo": "Administración", "id": "terminales", "nombre": "Terminales", "hijos": []},
+    {"grupo": "Administración", "id": "ncf", "nombre": "Facturación", "hijos": [
+        {"id": "ncf", "nombre": "Comprobantes NCF"},
+        {"id": "ecf", "nombre": "Facturación electrónica"},
+    ]},
+    {"grupo": "Administración", "id": "metodos", "nombre": "Métodos de pago", "hijos": []},
+]
+
+
+def _clave_valida(clave: str) -> bool:
+    if clave in ("pedidos", "apariencia"):
+        return False
+    if clave in MODULOS:
+        return True
+    if clave.count(":") != 1:
+        return False
+    padre, hijo = clave.split(":", 1)
+    return padre in FUNCIONES and hijo in FUNCIONES[padre]
+
+
+def _puede(lista: list[str], clave: str) -> bool:
+    if clave in lista:
+        return True
+    if ":" in clave and clave.split(":", 1)[0] in lista:
+        return True
+    return False
+
+
+def _resumen_permisos(role: str, claves: list[str]) -> str:
+    if role == "admin":
+        return "Todo"
+    if role == "mesero":
+        return "Pedidos en la tablet"
+    partes = []
+    for item in PERMISOS_ARBOL:
+        hijos = item["hijos"]
+        if item["id"] in claves:
+            partes.append(item["nombre"])
+            continue
+        if not hijos:
+            continue
+        nombres = [h["nombre"] for h in hijos if f"{item['id']}:{h['id']}" in claves]
+        if len(nombres) == len(hijos):
+            partes.append(item["nombre"])
+        elif nombres:
+            partes.append(item["nombre"] + ": " + ", ".join(nombres))
+    return ", ".join(partes) if partes else "Sin pantallas"
 
 
 def _precio(row, nivel: int, descuentos: tuple[float, float, float] = (2.0, 5.0, 10.0)) -> float:
@@ -690,7 +833,7 @@ def estado(request: Request):
         "usuario": usuario,
         "rol": role,
         "permisos": _permisos(usuario),
-        "empresa": base.get_empresa_info(),
+        "empresa": _empresa_visible(base),
         "itbis_incluido": _itbis_incluido(base),
         "impresora": _impresora(base),
         "caja": None
@@ -782,7 +925,7 @@ def _fondo_caja(valor: float | None) -> float:
 
 @app.post("/api/caja/abrir")
 def abrir_caja(request: Request, body: AbrirCajaIn):
-    usuario = _exigir(request, "caja")
+    usuario = _exigir(request, "caja", "caja")
     fondo = _fondo_caja(body.fondo)
     base = db()
     if base.fetch_caja_abierta_row() is not None:
@@ -917,7 +1060,7 @@ def _guardar_asiento(cur, concepto: str, origen: str, origen_id: int, lineas: li
 
 @app.post("/api/vender")
 def vender(request: Request, body: VentaIn):
-    usuario = _exigir(request, "mostrador")
+    usuario = _exigir(request, "mostrador", "venta")
     base = db()
     caja = base.fetch_caja_abierta_row()
     if caja is None:
@@ -1457,14 +1600,14 @@ def _efectivo_del_turno(base: Database, cierre_id: int) -> float:
 
 @app.post("/api/caja/movimiento")
 def movimiento(request: Request, body: MovimientoIn):
-    usuario = _exigir(request, "caja")
+    tipo = (body.tipo or "").lower()
+    if tipo not in ("ingreso", "retiro"):
+        raise HTTPException(status_code=400, detail="El tipo debe ser ingreso o retiro")
+    usuario = _exigir(request, "caja", tipo)
     base = db()
     caja = base.fetch_caja_abierta_row()
     if caja is None:
         raise HTTPException(status_code=400, detail="No hay turno abierto")
-    tipo = (body.tipo or "").lower()
-    if tipo not in ("ingreso", "retiro"):
-        raise HTTPException(status_code=400, detail="El tipo debe ser ingreso o retiro")
     if body.monto <= 0 or len((body.motivo or "").strip()) < 3:
         raise HTTPException(status_code=400, detail="Indica monto y un motivo")
     if body.id:
@@ -1504,7 +1647,7 @@ def movimiento(request: Request, body: MovimientoIn):
 
 @app.post("/api/caja/cerrar")
 def cerrar_caja(request: Request, body: CerrarCajaIn):
-    usuario = _exigir(request, "caja")
+    usuario = _exigir(request, "caja", "cerrar")
     base = db()
     caja = base.fetch_caja_abierta_row()
     if caja is None:
@@ -1626,7 +1769,7 @@ def _panel_caja(base: Database, desde: str = "", hasta: str = "") -> dict:
 
 @app.get("/api/caja/panel")
 def panel_caja(request: Request, desde: str = "", hasta: str = ""):
-    _exigir(request, "caja")
+    _exigir_alguna_funcion(request, "caja", ("caja", "ingreso", "retiro", "cerrar"))
     return _panel_caja(db(), desde, hasta)
 
 
@@ -1661,7 +1804,7 @@ def _pagos_del_cuadre(base: Database, cierre_id: int, apertura: str, cerrado: bo
 
 @app.get("/api/caja/cierre/{cierre_id}")
 def ver_cuadre(request: Request, cierre_id: int):
-    _exigir_alguno(request, ("caja", "historial"))
+    _exigir_alguno(request, ("caja:cerrar", "historial"))
     return _datos_cuadre(db(), cierre_id)
 
 
@@ -1761,7 +1904,7 @@ def _datos_cuadre(base: Database, cierre_id: int) -> dict:
 
 @app.get("/api/caja/cierre/{cierre_id}/pdf")
 def pdf_cuadre(request: Request, cierre_id: int, descarga: int = 0):
-    _exigir_alguno(request, ("caja", "historial"))
+    _exigir_alguno(request, ("caja:cerrar", "historial"))
     from report_pdf_builder import build_cuadre_caja_pdf
 
     base = db()
@@ -1790,13 +1933,13 @@ class ImpresionIn(BaseModel):
 
 @app.get("/api/impresion")
 def leer_impresion(request: Request):
-    _exigir_alguno(request, ("caja", "apariencia"))
+    _exigir_alguno(request, ("caja:impresion", "apariencia"))
     return _impresora(db())
 
 
 @app.post("/api/impresion")
 def guardar_impresion(request: Request, body: ImpresionIn):
-    _exigir_alguno(request, ("caja", "apariencia"))
+    _exigir_alguno(request, ("caja:impresion", "apariencia"))
     if body.papel not in (58, 80):
         raise HTTPException(status_code=400, detail="El papel es 58 mm o 80 mm")
     if body.cuadre not in ("ticket", "carta"):
@@ -1828,7 +1971,7 @@ class TurnoEditIn(BaseModel):
 
 @app.post("/api/caja/turno/{cierre_id}")
 def editar_turno(request: Request, cierre_id: int, body: TurnoEditIn):
-    _exigir(request, "caja")
+    _exigir(request, "caja", "caja")
     fondo = _fondo_caja(body.fondo)
     conn = db().get_connection()
     cur = conn.cursor()
@@ -1850,7 +1993,7 @@ def editar_turno(request: Request, cierre_id: int, body: TurnoEditIn):
 
 @app.post("/api/caja/cierre/{cierre_id}")
 def editar_cierre(request: Request, cierre_id: int, body: CerrarCajaIn):
-    _exigir(request, "caja")
+    _exigir(request, "caja", "cerrar")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1890,7 +2033,7 @@ def _filtro_fecha(desde: str | None, hasta: str | None, dias: int, columna: str)
 
 @app.get("/api/reportes")
 def reportes(request: Request, dias: int = 30, desde: str = "", hasta: str = ""):
-    _exigir(request, "reportes")
+    _exigir(request, "reportes", "reportes")
     conn = db().get_connection()
     cur = conn.cursor()
     donde, params = _filtro_fecha(desde, hasta, dias, "f.fecha")
@@ -1961,7 +2104,7 @@ def reportes(request: Request, dias: int = 30, desde: str = "", hasta: str = "")
 
 @app.post("/api/compras")
 def compras(request: Request, body: CompraIn):
-    usuario = _exigir(request, "compras")
+    usuario = _exigir(request, "compras", "compra")
     base = db()
     nombre = body.proveedor.strip()
     if len(nombre) < 2:
@@ -2032,7 +2175,7 @@ class NotaCompraIn(BaseModel):
 
 @app.post("/api/compras/{compra_id}")
 def editar_compra_nota(request: Request, compra_id: int, body: NotaCompraIn):
-    _exigir(request, "compras")
+    _exigir(request, "compras", "compra")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE compras SET nota=? WHERE id=?", (body.nota.strip(), compra_id))
@@ -2046,7 +2189,7 @@ def editar_compra_nota(request: Request, compra_id: int, body: NotaCompraIn):
 
 @app.get("/api/compras/{compra_id}/lineas")
 def ver_compra(request: Request, compra_id: int):
-    _exigir(request, "compras")
+    _exigir(request, "compras", "compra")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2081,7 +2224,7 @@ def promociones(request: Request):
 
 @app.get("/api/promociones/vitrina")
 def vitrina_promociones(request: Request):
-    _exigir_alguno(request, ("mostrador", "promociones"))
+    _exigir_alguno(request, ("mostrador:venta", "promociones"))
     return {
         "items": [
             {"nombre": n, "tipo": t, "valor": v}
@@ -2173,7 +2316,7 @@ def _texto_componentes(lineas: list[tuple[int, float, str]]) -> str:
 
 @app.get("/api/combos")
 def listar_combos_admin(request: Request):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "combos")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2226,13 +2369,13 @@ def listar_combos_admin(request: Request):
 
 @app.post("/api/combos")
 def crear_combo(request: Request, body: ComboIn):
-    usuario = _exigir(request, "inventario")
+    usuario = _exigir(request, "inventario", "combos")
     return _guardar_combo_http(body, usuario, None)
 
 
 @app.post("/api/combos/{combo_id}")
 def editar_combo(request: Request, combo_id: int, body: ComboIn):
-    usuario = _exigir(request, "inventario")
+    usuario = _exigir(request, "inventario", "combos")
     return _guardar_combo_http(body, usuario, combo_id)
 
 
@@ -2281,7 +2424,7 @@ def _guardar_combo_http(body: ComboIn, usuario: str, combo_id: int | None):
 
 @app.post("/api/combos/{combo_id}/quitar")
 def quitar_combo(request: Request, combo_id: int):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "combos")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE combos SET activo=0 WHERE id=?", (combo_id,))
@@ -2295,7 +2438,7 @@ def quitar_combo(request: Request, combo_id: int):
 
 @app.post("/api/especiales")
 def crear_especial(request: Request, body: EspecialIn):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "combos")
     if body.tipo not in ("2x1", "3x2"):
         raise HTTPException(status_code=400, detail="El especial es 2x1 o 3x2")
     conn = db().get_connection()
@@ -2432,7 +2575,7 @@ def devolver(request: Request, body: DevolucionIn):
 
 @app.get("/api/clientes/{cliente_id}/saldo")
 def saldo_cliente(request: Request, cliente_id: int):
-    _exigir_alguno(request, ("mostrador", "clientes", "cobros"))
+    _exigir_alguno(request, ("mostrador:venta", "clientes", "cobros"))
     base = db()
     conn = base.get_connection()
     cur = conn.cursor()
@@ -2529,9 +2672,76 @@ def transferir(request: Request, body: TransferIn):
     return {"ok": True}
 
 
+class EsperaIn(BaseModel):
+    etiqueta: str = ""
+    items: list[dict]
+    total: float = 0
+    cliente_id: int | None = None
+    descuento: float = 0
+    comprobante: str = "consumidor_final"
+    observaciones: str = ""
+    propina: bool = False
+    a_credito: bool = False
+    pagos: list[dict] = []
+    conduce_id: int | None = None
+    conduce_codigo: str = ""
+    conduce_mesa: str = ""
+    conduce_usuario: str = ""
+    auth: str = ""
+
+
+def _json_espera(body: EsperaIn) -> str:
+    return json.dumps(
+        {
+            "items": body.items,
+            "descuento": body.descuento,
+            "comprobante": body.comprobante,
+            "observaciones": body.observaciones,
+            "propina": body.propina,
+            "a_credito": body.a_credito,
+            "pagos": body.pagos,
+            "conduce_id": body.conduce_id,
+            "conduce_codigo": body.conduce_codigo,
+            "conduce_mesa": body.conduce_mesa,
+            "conduce_usuario": body.conduce_usuario,
+            "auth": body.auth,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _leer_espera(row) -> dict:
+    try:
+        crudo = json.loads(row[9] or "[]")
+    except json.JSONDecodeError:
+        crudo = []
+    extra = crudo if isinstance(crudo, dict) else {}
+    items = extra.get("items") if isinstance(crudo, dict) else crudo
+    if not isinstance(items, list):
+        items = []
+    return {
+        "id": row[0],
+        "etiqueta": row[1],
+        "cliente_id": row[3],
+        "items": items,
+        "descuento": float(extra.get("descuento", row[8]) or 0),
+        "comprobante": extra.get("comprobante") or "consumidor_final",
+        "observaciones": extra.get("observaciones") or "",
+        "propina": bool(extra.get("propina")),
+        "a_credito": bool(extra.get("a_credito")),
+        "pagos": extra.get("pagos") if isinstance(extra.get("pagos"), list) else [],
+        "conduce_id": extra.get("conduce_id"),
+        "conduce_codigo": extra.get("conduce_codigo") or "",
+        "conduce_mesa": extra.get("conduce_mesa") or "",
+        "conduce_usuario": extra.get("conduce_usuario") or "",
+        "auth": extra.get("auth") or "",
+        "total": float(row[10] or 0),
+    }
+
+
 @app.get("/api/espera")
 def listar_espera(request: Request):
-    _exigir(request, "mostrador")
+    _exigir(request, "mostrador", "venta")
     return {
         "items": [
             {"id": i, "etiqueta": e, "usuario": u, "total": t, "fecha": f}
@@ -2540,35 +2750,71 @@ def listar_espera(request: Request):
     }
 
 
+@app.get("/api/espera/{espera_id}")
+def ver_espera(request: Request, espera_id: int):
+    _exigir(request, "mostrador", "venta")
+    row = db().obtener_venta_espera(espera_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Esa factura pendiente ya no está")
+    return _leer_espera(row)
+
+
 @app.post("/api/espera")
 def crear_espera(request: Request, body: EsperaIn):
-    usuario = _exigir(request, "mostrador")
+    usuario = _exigir(request, "mostrador", "venta")
     if not body.items:
         raise HTTPException(status_code=400, detail="El ticket está vacío")
     nuevo = db().guardar_venta_espera(
-        body.etiqueta.strip() or "Espera",
+        body.etiqueta.strip() or "Factura",
         usuario,
         body.cliente_id,
         "",
         "",
         None,
-        "consumidor_final",
-        0,
-        json.dumps(body.items),
+        body.comprobante or "consumidor_final",
+        body.descuento,
+        _json_espera(body),
         body.total,
     )
     return {"ok": True, "id": nuevo}
 
 
+@app.put("/api/espera/{espera_id}")
+def actualizar_espera(request: Request, espera_id: int, body: EsperaIn):
+    usuario = _exigir(request, "mostrador", "venta")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="El ticket está vacío")
+    ok = db().actualizar_venta_espera(
+        espera_id,
+        body.etiqueta.strip() or "Factura",
+        usuario,
+        body.cliente_id,
+        body.comprobante or "consumidor_final",
+        body.descuento,
+        _json_espera(body),
+        body.total,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Esa factura pendiente ya no está")
+    return {"ok": True, "id": espera_id}
+
+
+@app.delete("/api/espera/{espera_id}")
+def borrar_espera(request: Request, espera_id: int):
+    _exigir(request, "mostrador", "venta")
+    db().eliminar_venta_espera(espera_id)
+    return {"ok": True}
+
+
 @app.post("/api/espera/{espera_id}/tomar")
 def tomar_espera(request: Request, espera_id: int):
-    _exigir(request, "mostrador")
+    _exigir(request, "mostrador", "venta")
     row = db().obtener_venta_espera(espera_id)
     if not row:
         raise HTTPException(status_code=404, detail="Esa venta en espera ya no está")
-    items = json.loads(row[9] or "[]")
+    datos = _leer_espera(row)
     db().eliminar_venta_espera(espera_id)
-    return {"etiqueta": row[1], "items": items, "cliente_id": row[3]}
+    return datos
 
 
 def _ecf_de_factura(factura_id: int) -> dict | None:
@@ -2591,6 +2837,7 @@ def _ecf_de_factura(factura_id: int) -> dict | None:
 @app.get("/api/factura/{factura_id}")
 def ver_factura(request: Request, factura_id: int):
     _exigir_alguno(request, ("historial", "cotizaciones"))
+    _exigir_factura_visible(request, factura_id)
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2687,6 +2934,7 @@ def _pdf_factura(factura_id: int) -> tuple[bytes, str]:
 @app.get("/api/factura/{factura_id}/pdf")
 def pdf_factura(request: Request, factura_id: int):
     _exigir(request, "historial")
+    _exigir_factura_visible(request, factura_id)
     pdf, archivo = _pdf_factura(factura_id)
     return Response(
         content=pdf,
@@ -2702,6 +2950,7 @@ class CorreoIn(BaseModel):
 @app.post("/api/factura/{factura_id}/correo")
 def correo_factura(request: Request, factura_id: int, body: CorreoIn):
     _exigir(request, "historial")
+    _exigir_factura_visible(request, factura_id)
     email = body.email.strip()
     if "@" not in email or "." not in email.split("@")[-1] or " " in email:
         raise HTTPException(status_code=400, detail="Correo inválido")
@@ -2730,6 +2979,7 @@ def correo_factura(request: Request, factura_id: int, body: CorreoIn):
 @app.post("/api/historial/anular")
 def anular(request: Request, body: AnularIn):
     usuario = _exigir(request, "historial")
+    _exigir_factura_visible(request, body.factura_id)
     ok, msg = db().anular_factura(body.factura_id, body.motivo, usuario)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
@@ -2843,7 +3093,7 @@ def confirmar_cotizacion(request: Request, body: ConvertirIn):
 
 @app.get("/api/compras/lista")
 def listar_compras(request: Request):
-    _exigir(request, "compras")
+    _exigir(request, "compras", "compra")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2922,15 +3172,20 @@ def crear_bodega(request: Request, body: BodegaIn):
     return {"ok": True}
 
 
+_METODOS_COBRO = ("efectivo", "tarjeta", "transferencia")
+
+
 @app.get("/api/metodos")
 def metodos(request: Request):
     _user(request)
-    return {
-        "items": [
-            {"codigo": c, "nombre": n, "afecta_caja": bool(a), "activo": bool(act)}
-            for c, n, a, act in db().listar_metodos_pago(False)
-        ]
-    }
+    orden = {codigo: i for i, codigo in enumerate(_METODOS_COBRO)}
+    items = [
+        {"codigo": c, "nombre": n, "afecta_caja": bool(a), "activo": bool(act)}
+        for c, n, a, act in db().listar_metodos_pago(False)
+        if c in orden
+    ]
+    items.sort(key=lambda m: orden[m["codigo"]])
+    return {"items": items}
 
 
 @app.post("/api/metodos")
@@ -2938,7 +3193,10 @@ def guardar_metodo(request: Request, body: MetodoIn):
     _exigir(request, "metodos")
     if len(body.codigo.strip()) < 2 or len(body.nombre.strip()) < 2:
         raise HTTPException(status_code=400, detail="Indica código y nombre")
-    db().guardar_metodo_pago(body.codigo, body.nombre, body.afecta_caja, body.activo)
+    try:
+        db().guardar_metodo_pago(body.codigo, body.nombre, body.afecta_caja, body.activo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True}
 
 
@@ -2997,14 +3255,14 @@ def guardar_seguimiento(request: Request, body: SeguimientoIn):
 
 @app.post("/api/ncf")
 def guardar_ncf(request: Request, body: SecuenciaIn):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ncf")
     db().guardar_secuencia_ncf(body.tipo, body.prefijo, body.siguiente, body.hasta)
     return {"ok": True}
 
 
 @app.get("/api/ncf")
 def ncf(request: Request):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ncf")
     return {
         "secuencias": [
             {"tipo": t, "prefijo": p, "siguiente": s, "hasta": h}
@@ -3092,13 +3350,6 @@ class SeguimientoIn(BaseModel):
     nota: str = ""
 
 
-class EsperaIn(BaseModel):
-    etiqueta: str
-    items: list[dict]
-    total: float
-    cliente_id: int | None = None
-
-
 class AnularIn(BaseModel):
     factura_id: int
     motivo: str
@@ -3132,7 +3383,7 @@ class EtiquetasIn(BaseModel):
 
 @app.post("/api/clientes/rapido")
 def cliente_rapido(request: Request, body: ClienteIn):
-    _exigir(request, "mostrador")
+    _exigir(request, "mostrador", "venta")
     if len(body.nombre.strip()) < 2:
         raise HTTPException(status_code=400, detail="Indica el nombre")
     nuevo = db().crear_cliente_rapido(
@@ -3155,11 +3406,13 @@ class EmpresaIn(BaseModel):
     smtp_password: str = ""
     smtp_from: str = ""
     precios_incluyen_itbis: bool | None = None
+    logo_base64: str = ""
+    quitar_logo: bool = False
 
 
 @app.get("/api/inventario")
 def inventario(request: Request, q: str = ""):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     conn = db().get_connection()
     cur = conn.cursor()
     sql = """
@@ -3204,7 +3457,7 @@ def inventario(request: Request, q: str = ""):
 
 @app.post("/api/inventario")
 def crear_producto(request: Request, body: ProductoIn):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     nombre = body.nombre.strip()
     if len(nombre) < 2:
         raise HTTPException(status_code=400, detail="Indica el nombre del producto")
@@ -3251,7 +3504,7 @@ def _categoria_id(cur, nombre: str):
 
 @app.post("/api/inventario/{producto_id}")
 def editar_producto(request: Request, producto_id: int, body: ProductoIn):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     nombre = body.nombre.strip()
     if len(nombre) < 2:
         raise HTTPException(status_code=400, detail="Indica el nombre del producto")
@@ -3293,7 +3546,66 @@ def editar_producto(request: Request, producto_id: int, body: ProductoIn):
 
 
 _FOTOS = _STATIC / "fotos"
+_LOGO_DIR = _STATIC / "empresa"
 _FOTO_MAX = 2_000_000
+_LOGO_TIPOS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+
+
+def _archivo_logo(base: Database | None = None) -> Path | None:
+    if _LOGO_DIR.is_dir():
+        for ruta in sorted(_LOGO_DIR.glob("logo.*")):
+            if ruta.is_file() and ruta.suffix.lower() in _LOGO_TIPOS:
+                return ruta
+    externo = (base or db()).get_app_logo_path()
+    return Path(externo) if externo else None
+
+
+def _url_logo(base: Database | None = None) -> str:
+    ruta = _archivo_logo(base)
+    if not ruta:
+        return ""
+    return f"/api/empresa/logo?v={int(ruta.stat().st_mtime)}"
+
+
+def _empresa_visible(base: Database) -> dict:
+    info = base.get_empresa_info()
+    info["logo"] = _url_logo(base)
+    return info
+
+
+def _guardar_logo(crudo: bytes) -> str:
+    if len(crudo) > _FOTO_MAX:
+        raise HTTPException(status_code=400, detail="El logo pesa demasiado (máximo 2 MB)")
+    if crudo.startswith(b"\xff\xd8\xff"):
+        extension = "jpg"
+    elif crudo.startswith(b"\x89PNG\r\n\x1a\n"):
+        extension = "png"
+    elif len(crudo) >= 12 and crudo[:4] == b"RIFF" and crudo[8:12] == b"WEBP":
+        extension = "webp"
+    else:
+        raise HTTPException(status_code=400, detail="Usa un logo JPG, PNG o WEBP")
+    _LOGO_DIR.mkdir(parents=True, exist_ok=True)
+    for viejo in _LOGO_DIR.glob("logo.*"):
+        viejo.unlink(missing_ok=True)
+    destino = _LOGO_DIR / f"logo.{extension}"
+    destino.write_bytes(crudo)
+    db().set_config("app_logo_path", str(destino.resolve()))
+    return _url_logo()
+
+
+def _quitar_logo() -> None:
+    if _LOGO_DIR.is_dir():
+        for viejo in _LOGO_DIR.glob("logo.*"):
+            viejo.unlink(missing_ok=True)
+    base = db()
+    ruta = (base.get_config("app_logo_path", "") or "").strip()
+    if ruta:
+        try:
+            if Path(ruta).resolve().is_relative_to(_LOGO_DIR.resolve()):
+                Path(ruta).unlink(missing_ok=True)
+        except OSError:
+            pass
+    base.set_config("app_logo_path", "")
 
 
 class FotoIn(BaseModel):
@@ -3316,7 +3628,7 @@ def _borrar_foto_subida(ruta: str) -> None:
 
 @app.post("/api/inventario/{producto_id}/foto")
 def subir_foto_producto(request: Request, producto_id: int, body: FotoIn):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     try:
         crudo = base64.b64decode(body.archivo_base64.split(",", 1)[-1], validate=True)
     except ValueError as exc:
@@ -3348,7 +3660,7 @@ def subir_foto_producto(request: Request, producto_id: int, body: FotoIn):
 
 @app.delete("/api/inventario/{producto_id}/foto")
 def quitar_foto_producto(request: Request, producto_id: int):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     conn = db().get_connection()
     cur = conn.cursor()
     try:
@@ -3406,7 +3718,7 @@ class SyncIn(BaseModel):
 
 @app.post("/api/sync/inventario")
 def sync_inventario(request: Request, body: SyncIn):
-    usuario = _exigir(request, "inventario")
+    usuario = _exigir(request, "inventario", "inventario")
     from sincronizar_inventario import responder
 
     base = db()
@@ -3419,14 +3731,14 @@ def sync_inventario(request: Request, body: SyncIn):
 
 @app.get("/api/precios-mayor")
 def ver_precios_mayor(request: Request):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     d2, d3, d4 = _descuentos_mayor(db())
     return {"p2": d2, "p3": d3, "p4": d4}
 
 
 @app.post("/api/precios-mayor")
 def guardar_precios_mayor(request: Request, body: DescuentosMayorIn):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     d2 = min(90.0, max(0.0, float(body.p2)))
     d3 = min(90.0, max(0.0, float(body.p3)))
     d4 = min(90.0, max(0.0, float(body.p4)))
@@ -3453,7 +3765,7 @@ def guardar_precios_mayor(request: Request, body: DescuentosMayorIn):
 
 @app.post("/api/etiquetas")
 def etiquetas_pdf(request: Request, body: EtiquetasIn):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     ids = []
     for valor in body.ids:
         try:
@@ -3511,10 +3823,32 @@ def kardex(request: Request, producto_id: int):
 
 
 @app.get("/api/historial")
-def historial(request: Request, estado: str = "todos"):
-    _exigir(request, "historial")
+def historial(request: Request, estado: str = "todos", desde: str = "", hasta: str = ""):
+    user = _exigir(request, "historial")
+    admin = _rol(user) == "admin"
     modo = {"presupuestos": "presupuestos", "anuladas": "anuladas", "emitidas": "emitidas"}.get(estado, "todos")
-    filas = db().list_facturas_modulo_erp(estado_docs=modo, ultimos_n=80)
+    if not admin and modo == "presupuestos" and "cotizaciones" not in _permisos(user):
+        raise HTTPException(status_code=403, detail="Solo el administrador ve el historial completo")
+    if not admin and modo != "presupuestos":
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        filas = db().list_facturas_modulo_erp(
+            estado_docs="emitidas",
+            modo_filtro="fecha",
+            fecha_desde=hoy,
+            fecha_hasta=hoy,
+        )
+    else:
+        inicio = (desde or "").strip()[:10]
+        fin = (hasta or "").strip()[:10]
+        if inicio and fin:
+            filas = db().list_facturas_modulo_erp(
+                estado_docs=modo,
+                modo_filtro="fecha",
+                fecha_desde=inicio,
+                fecha_hasta=fin,
+            )
+        else:
+            filas = db().list_facturas_modulo_erp(estado_docs=modo, modo_filtro="todos", limit=2000)
     correos: dict[int, str] = {}
     ids = [int(r[0]) for r in filas]
     if ids:
@@ -3533,6 +3867,7 @@ def historial(request: Request, estado: str = "todos"):
         correos = {int(i): em or "" for i, em in cur.fetchall()}
         conn.close()
     return {
+        "solo_hoy": not admin,
         "items": [
             {
                 "id": r[0], "numero": r[1], "fecha": r[2], "cliente": r[3],
@@ -3723,9 +4058,12 @@ def _guardar_permisos(username: str, modulos: list[str], role: str):
     if role == "mesero":
         limpios = ["pedidos"]
     else:
-        limpios = [m for m in modulos if m in MODULOS and m not in ("seguimiento", "metodos", "pedidos")]
-        if "mostrador" not in limpios:
-            limpios.insert(0, "mostrador")
+        limpios = []
+        for modulo in modulos:
+            if _clave_valida(modulo) and modulo not in limpios:
+                limpios.append(modulo)
+        if not limpios:
+            limpios = ["ninguno"]
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM usuario_permisos WHERE username=?", (username,))
@@ -3743,8 +4081,15 @@ def usuarios(request: Request):
     _exigir(request, "usuarios")
     items = []
     for i, u, r in db().get_users():
-        items.append({"id": i, "username": u, "role": r, "modulos": _permisos(u)})
-    return {"items": items, "modulos": [m for m in MODULOS if m not in ("seguimiento", "metodos", "pedidos")]}
+        claves = _permisos(u)
+        items.append({
+            "id": i,
+            "username": u,
+            "role": r,
+            "modulos": claves,
+            "resumen": _resumen_permisos(r, claves),
+        })
+    return {"items": items, "arbol": PERMISOS_ARBOL}
 
 
 @app.post("/api/usuarios")
@@ -3900,9 +4245,9 @@ def editar_cliente(request: Request, cliente_id: int, body: ClienteIn):
 
 @app.get("/api/empresa")
 def empresa(request: Request):
-    _exigir(request, "apariencia")
+    _exigir_admin(request)
     base = db()
-    info = base.get_empresa_info()
+    info = _empresa_visible(base)
     info["smtp_host"] = base.get_config("smtp_host", "") or ""
     info["smtp_port"] = base.get_config("smtp_port", "587") or "587"
     info["smtp_user"] = base.get_config("smtp_user", "") or ""
@@ -3914,7 +4259,7 @@ def empresa(request: Request):
 
 @app.post("/api/empresa")
 def guardar_empresa(request: Request, body: EmpresaIn):
-    _exigir(request, "apariencia")
+    _exigir_admin(request)
     base = db()
     base.set_empresa_info(body.nombre.strip(), body.direccion.strip())
     base.set_config("empresa_rnc", body.rnc.strip())
@@ -3933,7 +4278,80 @@ def guardar_empresa(request: Request, body: EmpresaIn):
         base.set_config("smtp_password", body.smtp_password)
     if body.precios_incluyen_itbis is not None:
         base.set_config("precios_incluyen_itbis", "1" if body.precios_incluyen_itbis else "0")
-    return {"ok": True}
+    if (body.logo_base64 or "").strip():
+        try:
+            crudo = base64.b64decode(body.logo_base64.split(",", 1)[-1], validate=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="No se pudo leer el logo") from exc
+        _guardar_logo(crudo)
+    elif body.quitar_logo:
+        _quitar_logo()
+    info = _empresa_visible(base)
+    info["ok"] = True
+    _avisar_empresa(info)
+    return info
+
+
+def _avisar_empresa(info: dict) -> None:
+    """Avisa a las pantallas abiertas. La impresión no vuelve a leer la empresa."""
+    loop = _empresa_loop
+    if loop is None or not loop.is_running():
+        return
+    aviso = {
+        "nombre": info.get("nombre") or "",
+        "direccion": info.get("direccion") or "",
+        "telefono": info.get("telefono") or "",
+        "rnc": info.get("rnc") or "",
+        "logo": info.get("logo") or "",
+    }
+    with _empresa_lock:
+        colas = list(_empresa_oyentes)
+    for cola in colas:
+        loop.call_soon_threadsafe(cola.put_nowait, aviso)
+
+
+@app.get("/api/empresa/aviso")
+async def aviso_empresa(request: Request):
+    _user(request)
+    global _empresa_loop
+    _empresa_loop = asyncio.get_running_loop()
+    cola: asyncio.Queue = asyncio.Queue()
+    with _empresa_lock:
+        _empresa_oyentes.append(cola)
+
+    async def eventos():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    info = await asyncio.wait_for(cola.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+                yield "data: " + json.dumps(info, ensure_ascii=False) + "\n\n"
+        finally:
+            with _empresa_lock:
+                if cola in _empresa_oyentes:
+                    _empresa_oyentes.remove(cola)
+
+    return StreamingResponse(
+        eventos(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/empresa/logo")
+def ver_logo():
+    ruta = _archivo_logo()
+    if not ruta:
+        raise HTTPException(status_code=404, detail="Sin logo")
+    return FileResponse(
+        ruta,
+        media_type=_LOGO_TIPOS.get(ruta.suffix.lower(), "image/png"),
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 class EcfConfigIn(BaseModel):
@@ -3955,7 +4373,7 @@ class EcfSecuenciaIn(BaseModel):
 
 @app.get("/api/ecf/estado")
 def ecf_estado(request: Request):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     from ecf import servicio as ecf_srv
     base = db()
     cfg = ecf_srv.config(base)
@@ -3978,7 +4396,7 @@ def ecf_estado(request: Request):
 
 @app.post("/api/ecf/config")
 def ecf_guardar_config(request: Request, body: EcfConfigIn):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     from ecf import dgii as _dgii
     if body.ambiente not in _dgii.AMBIENTES:
         raise HTTPException(status_code=400, detail="Ambiente no válido")
@@ -3994,7 +4412,7 @@ def ecf_guardar_config(request: Request, body: EcfConfigIn):
 
 @app.post("/api/ecf/certificado")
 def ecf_certificado(request: Request, body: EcfCertificadoIn):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     from ecf import dgii as _dgii
     from ecf import servicio as ecf_srv
     try:
@@ -4017,7 +4435,7 @@ def ecf_certificado(request: Request, body: EcfCertificadoIn):
 
 @app.post("/api/ecf/secuencias")
 def ecf_secuencia(request: Request, body: EcfSecuenciaIn):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     if body.tipo not in (31, 32, 33, 34, 41, 43, 44, 45, 46, 47):
         raise HTTPException(status_code=400, detail="Tipo de e-CF no válido")
     if body.siguiente < 1 or body.hasta < body.siguiente:
@@ -4064,7 +4482,7 @@ def ecf_secuencia(request: Request, body: EcfSecuenciaIn):
 
 @app.get("/api/ecf/documentos")
 def ecf_documentos(request: Request, estado: str = ""):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     conn = db().get_connection()
     cur = conn.cursor()
     sql = """
@@ -4089,21 +4507,21 @@ def ecf_documentos(request: Request, estado: str = ""):
 
 @app.post("/api/ecf/documentos/{doc_id}/enviar")
 def ecf_reenviar(request: Request, doc_id: int):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     from ecf import servicio as ecf_srv
     return ecf_srv.enviar(db(), doc_id)
 
 
 @app.post("/api/ecf/documentos/{doc_id}/consultar")
 def ecf_consultar(request: Request, doc_id: int):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     from ecf import servicio as ecf_srv
     return ecf_srv.consultar(db(), doc_id)
 
 
 @app.get("/api/ecf/documentos/{doc_id}/xml")
 def ecf_xml(request: Request, doc_id: int):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("SELECT encf, xml FROM ecf_documentos WHERE id=?", (doc_id,))
@@ -4118,7 +4536,7 @@ def ecf_xml(request: Request, doc_id: int):
 
 @app.post("/api/ecf/probar")
 def ecf_probar(request: Request):
-    _exigir(request, "ncf")
+    _exigir(request, "ncf", "ecf")
     from ecf import dgii as _dgii
     from ecf import servicio as ecf_srv
     base = db()
@@ -4265,7 +4683,7 @@ class VendedorIn(BaseModel):
 
 @app.get("/api/vendedores")
 def listar_vendedores(request: Request):
-    _exigir_alguno(request, ("mostrador", "vendedores", "reportes"))
+    _exigir_alguno(request, ("mostrador:venta", "vendedores", "reportes:reportes"))
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -4502,7 +4920,7 @@ def conduces_en_cola(items: list[dict]) -> list[dict]:
 
 @app.get("/api/conduces")
 def listar_conduces(request: Request, cola: int = 0):
-    usuario = _exigir_alguno(request, ("pedidos", "mostrador"))
+    usuario = _exigir_alguno(request, ("pedidos", "mostrador:venta"))
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -4538,7 +4956,7 @@ def listar_conduces(request: Request, cola: int = 0):
 
 @app.get("/api/conduces/codigo/{codigo}")
 def ver_conduce(request: Request, codigo: str):
-    usuario = _exigir_alguno(request, ("pedidos", "mostrador"))
+    usuario = _exigir_alguno(request, ("pedidos", "mostrador:venta"))
     clave = _normalizar_codigo_conduce(codigo)
     if not clave:
         raise HTTPException(status_code=400, detail="Escribe el código del conduce")
@@ -4559,7 +4977,7 @@ def ver_conduce(request: Request, codigo: str):
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail=f"No hay un conduce con el código {clave}")
-    if "mostrador" not in _permisos(usuario) and (row[3] or "") != usuario:
+    if not _puede(_permisos(usuario), "mostrador:venta") and (row[3] or "") != usuario:
         raise HTTPException(status_code=409, detail=f"Esa mesa la está atendiendo {row[3]}")
     datos = _fila_conduce(row[:11], row[11] or None)
     return datos
@@ -4695,7 +5113,7 @@ def guardar_conduce(request: Request, body: ConduceIn):
 
 @app.post("/api/conduces/{conduce_id}/partir")
 def partir_conduce(request: Request, conduce_id: int, body: PartirIn):
-    _exigir(request, "mostrador")
+    _exigir(request, "mostrador", "venta")
     if not body.quedan:
         raise HTTPException(status_code=400, detail="Deja al menos un producto en la mesa")
     base = db()
@@ -4718,7 +5136,7 @@ def partir_conduce(request: Request, conduce_id: int, body: PartirIn):
 
 @app.get("/api/cocina")
 def listar_cocina(request: Request):
-    _exigir_alguno(request, ("mostrador", "pedidos"))
+    _exigir_alguno(request, ("mostrador:cocina", "pedidos"))
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -4743,7 +5161,7 @@ def listar_cocina(request: Request):
 
 @app.post("/api/cocina/{conduce_id}")
 def marcar_cocina(request: Request, conduce_id: int, body: CocinaIn):
-    _exigir_alguno(request, ("mostrador", "pedidos"))
+    _exigir_alguno(request, ("mostrador:cocina", "pedidos"))
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -4760,7 +5178,7 @@ def marcar_cocina(request: Request, conduce_id: int, body: CocinaIn):
 
 @app.get("/api/compras/por-pagar")
 def compras_por_pagar(request: Request):
-    _exigir(request, "compras")
+    _exigir(request, "compras", "porpagar")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -4783,7 +5201,7 @@ def compras_por_pagar(request: Request):
 
 @app.post("/api/compras/{compra_id}/pagar")
 def pagar_compra(request: Request, compra_id: int):
-    usuario = _exigir(request, "compras")
+    usuario = _exigir(request, "compras", "porpagar")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("SELECT total FROM compras WHERE id=? AND IFNULL(pagada,0)=0", (compra_id,))
@@ -4807,7 +5225,7 @@ def pagar_compra(request: Request, compra_id: int):
 
 @app.get("/api/resultado")
 def resultado_periodo(request: Request, desde: str = "", hasta: str = ""):
-    _exigir_alguno(request, ("reportes", "compras"))
+    _exigir_alguno(request, ("reportes:resultado", "compras:compra", "compras:porpagar"))
     hoy = datetime.now().strftime("%Y-%m-%d")
     inicio = (desde or hoy)[:10]
     fin = (hasta or hoy)[:10]
@@ -4853,7 +5271,7 @@ class GastoIn(BaseModel):
 
 @app.post("/api/gastos")
 def crear_gasto(request: Request, body: GastoIn):
-    usuario = _exigir_alguno(request, ("reportes", "compras"))
+    usuario = _exigir_alguno(request, ("reportes:resultado", "compras:compra", "compras:porpagar"))
     monto = round(float(body.monto or 0), 2)
     if monto <= 0:
         raise HTTPException(status_code=400, detail="El gasto tiene que ser mayor que cero")
@@ -4888,7 +5306,7 @@ def crear_gasto(request: Request, body: GastoIn):
 
 @app.get("/api/libro")
 def libro_mayor(request: Request, desde: str = "", hasta: str = ""):
-    _exigir_alguno(request, ("reportes", "compras"))
+    _exigir_alguno(request, ("reportes:resultado", "compras:compra", "compras:porpagar"))
     hoy = datetime.now().strftime("%Y-%m-%d")
     inicio = (desde or hoy)[:10]
     fin = (hasta or hoy)[:10]
@@ -4922,7 +5340,7 @@ class ModificadorIn(BaseModel):
 
 @app.post("/api/modificadores")
 def crear_modificador(request: Request, body: ModificadorIn):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     nombre = " ".join((body.nombre or "").split())[:40]
     if len(nombre) < 2:
         raise HTTPException(status_code=400, detail="Ponle nombre al extra")
@@ -4944,7 +5362,7 @@ def crear_modificador(request: Request, body: ModificadorIn):
 
 @app.delete("/api/modificadores/{mod_id}")
 def borrar_modificador(request: Request, mod_id: int):
-    _exigir(request, "inventario")
+    _exigir(request, "inventario", "inventario")
     conn = db().get_connection()
     conn.execute("UPDATE modificadores SET activo=0 WHERE id=?", (mod_id,))
     conn.commit()
@@ -4954,7 +5372,7 @@ def borrar_modificador(request: Request, mod_id: int):
 
 @app.post("/api/conduces/{conduce_id}/facturado")
 def marcar_conduce_facturado(request: Request, conduce_id: int, body: ConduceFacturadoIn):
-    _exigir(request, "mostrador")
+    _exigir(request, "mostrador", "venta")
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("SELECT numero FROM facturas WHERE id=?", (body.factura_id,))
@@ -5062,7 +5480,12 @@ HTML = """<!DOCTYPE html>
   #login .mono { animation: pintar 560ms var(--ease-in-out) 140ms both; }
   @keyframes llegar { from { opacity:0; transform: translateY(12px) scale(0.98); } }
   @keyframes pintar { from { clip-path: inset(0 100% 0 0 round 10px); } to { clip-path: inset(0 0 0 0 round 10px); } }
-  .mono { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:var(--radius-inner); background:var(--r-venta); color:var(--r-venta-ink); font-weight:800; font-stretch:125%; font-size:15px; letter-spacing:0; }
+  .mono { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:var(--radius-inner); background:var(--r-venta); color:var(--r-venta-ink); font-weight:800; font-stretch:125%; font-size:15px; letter-spacing:0; overflow:hidden; }
+  .mono:has(img) { background:transparent; }
+  .mono img { width:40px; height:40px; object-fit:contain; display:block; }
+  .logo-previa { display:flex; align-items:center; gap:14px; }
+  .logo-previa[hidden] { display:none; }
+  .logo-previa img { width:72px; height:72px; object-fit:contain; background:#fff; border-radius:12px; }
 
   /* Shell: barra lateral y barra superior sobre el mismo fondo, divididas por reglas de 1 px */
   #app { display:none; min-height:100vh; }
@@ -5237,9 +5660,12 @@ HTML = """<!DOCTYPE html>
   .muestra-impresion iframe { display:block; margin:0 auto; background:#fff; border:0; box-shadow:0 8px 24px rgba(0,0,0,.22); }
   .ticket-acciones { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
   .ticket-acciones button { width:100%; }
-  #esperas { margin-top:14px; display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; }
-  #esperas h4 { margin:0 0 2px; font-size:12px; font-weight:500; color:var(--faint); }
-  #esperas button.sec { width:100%; text-align:left; border-radius:var(--radius-inner); height:40px; }
+  #facturasAbiertas { display:flex; gap:6px; overflow-x:auto; margin:0 0 12px; padding-bottom:2px; }
+  #facturasAbiertas button { flex:none; height:34px; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0 12px; }
+  #facturasAbiertas button.on { background:var(--r-venta); color:var(--r-venta-ink); }
+  @media (hover:hover) and (pointer:fine) {
+    #facturasAbiertas button.on:hover { background:var(--r-venta); color:var(--r-venta-ink); }
+  }
   #colaConduces { display:flex; flex-direction:column; gap:6px; margin:10px 0 4px; max-height:240px; overflow-y:auto; }
   #colaConduces h4 { margin:0 0 2px; font-size:12px; font-weight:600; color:var(--muted); }
   #colaConduces .vacio { margin:0; color:var(--muted); font-size:13px; }
@@ -5264,6 +5690,13 @@ HTML = """<!DOCTYPE html>
   .form { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; align-items:end; }
   .form label { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); }
   .form .wide { grid-column: 1 / -1; }
+  .permisos { display:flex; flex-direction:column; align-items:stretch; gap:2px; }
+  .permiso-grupo { margin:14px 0 4px; font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); }
+  .permiso-grupo:first-child { margin-top:2px; }
+  .permiso-mod { display:flex; flex-direction:column; gap:2px; padding:2px 0 6px; }
+  .permiso-hijos { display:flex; flex-direction:column; gap:2px; margin-left:26px; }
+  #usuMods label.check { display:flex; flex-direction:row; align-items:center; justify-content:flex-start; gap:10px; width:auto; min-height:32px; font-size:14px; color:var(--text); cursor:pointer; }
+  #usuMods input[type="checkbox"] { width:16px; height:16px; min-width:16px; max-width:16px; margin:0; padding:0; flex:0 0 16px; accent-color:var(--g, var(--r-admin)); }
   .form > button { width:auto; justify-self:start; min-width:140px; }
   .tabla-marco { max-width:100%; overflow-x:auto; }
   table { width:100%; border-collapse:collapse; margin-top:16px; }
@@ -5480,40 +5913,40 @@ HTML = """<!DOCTYPE html>
     <aside class="side" id="side" aria-label="Navegación">
       <div class="brand"><span class="mono" aria-hidden="true">MD</span><div><b>MD Alliance</b><small>Punto de venta</small></div></div>
       <div class="nav-grupo" data-grupo="venta">Venta</div>
-      <button class="nav on" data-view="venta" data-mod="mostrador" onclick="ver('venta')">Mostrador</button>
-      <button class="nav" data-mod="mostrador" type="button" onclick="location.href='/cocina'">Cocina</button>
+      <button class="nav on" data-view="venta" data-mod="mostrador" data-fn="venta" onclick="ver('venta')">Mostrador</button>
+      <button class="nav" data-mod="mostrador" data-fn="cocina" type="button" onclick="location.href='/cocina'">Cocina</button>
       <button class="nav" data-view="cotizaciones" data-mod="cotizaciones" onclick="ver('cotizaciones')">Cotizaciones</button>
       <button class="nav" data-view="historial" data-mod="historial" onclick="ver('historial')">Facturas emitidas</button>
       <button class="nav" data-view="cobros" data-mod="cobros" onclick="ver('cobros')">Cuentas por cobrar</button>
       <button class="nav" data-view="dev" data-mod="devoluciones" onclick="ver('dev')">Devoluciones</button>
       <div class="nav-grupo" data-grupo="caja">Caja</div>
-      <button class="nav" data-view="caja" data-mod="caja" onclick="ver('caja')" id="btnCaja">Abrir caja</button>
-      <button class="nav" data-view="ingreso" data-mod="caja" onclick="ver('ingreso')">Ingreso de efectivo</button>
-      <button class="nav" data-view="retiro" data-mod="caja" onclick="ver('retiro')">Retiro de efectivo</button>
-      <button class="nav" data-view="cerrar" data-mod="caja" onclick="ver('cerrar')">Cuadre y cierre</button>
-      <button class="nav" data-view="impresion" data-mod="caja" onclick="ver('impresion')">Impresión</button>
+      <button class="nav" data-view="caja" data-mod="caja" data-fn="caja" onclick="ver('caja')" id="btnCaja">Abrir caja</button>
+      <button class="nav" data-view="ingreso" data-mod="caja" data-fn="ingreso" onclick="ver('ingreso')">Ingreso de efectivo</button>
+      <button class="nav" data-view="retiro" data-mod="caja" data-fn="retiro" onclick="ver('retiro')">Retiro de efectivo</button>
+      <button class="nav" data-view="cerrar" data-mod="caja" data-fn="cerrar" onclick="ver('cerrar')">Cuadre y cierre</button>
+      <button class="nav" data-view="impresion" data-mod="caja" data-fn="impresion" onclick="ver('impresion')">Impresión</button>
       <div class="nav-grupo" data-grupo="inventario">Inventario</div>
-      <button class="nav" data-view="inventario" data-mod="inventario" onclick="ver('inventario')">Productos</button>
-      <button class="nav" data-view="combos" data-mod="inventario" onclick="ver('combos')">Combos</button>
-      <button class="nav" data-view="compra" data-mod="compras" onclick="ver('compra')">Compras</button>
-      <button class="nav" data-view="porpagar" data-mod="compras" onclick="ver('porpagar')">Por pagar</button>
+      <button class="nav" data-view="inventario" data-mod="inventario" data-fn="inventario" onclick="ver('inventario')">Productos</button>
+      <button class="nav" data-view="combos" data-mod="inventario" data-fn="combos" onclick="ver('combos')">Combos</button>
+      <button class="nav" data-view="compra" data-mod="compras" data-fn="compra" onclick="ver('compra')">Compras</button>
+      <button class="nav" data-view="porpagar" data-mod="compras" data-fn="porpagar" onclick="ver('porpagar')">Por pagar</button>
       <button class="nav" data-view="kardex" data-mod="kardex" onclick="ver('kardex')">Kardex</button>
       <button class="nav" data-view="tr" data-mod="transferir" onclick="ver('tr')">Bodegas y traslados</button>
       <button class="nav" data-view="promo" data-mod="promociones" onclick="ver('promo')">Promociones</button>
       <div class="nav-grupo" data-grupo="analisis">Análisis</div>
       <button class="nav" data-view="indicadores" data-mod="indicadores" onclick="ver('indicadores')">Indicadores</button>
-      <button class="nav" data-view="reportes" data-mod="reportes" onclick="ver('reportes')">Reportes</button>
-      <button class="nav" data-view="resultado" data-mod="reportes" onclick="ver('resultado')">Resultado</button>
+      <button class="nav" data-view="reportes" data-mod="reportes" data-fn="reportes" onclick="ver('reportes')">Reportes</button>
+      <button class="nav" data-view="resultado" data-mod="reportes" data-fn="resultado" onclick="ver('resultado')">Resultado</button>
       <button class="nav" data-view="seguimiento" data-mod="seguimiento" onclick="ver('seguimiento')">Seguimiento de cajeros</button>
       <div class="nav-grupo" data-grupo="admin">Administración</div>
       <button class="nav" data-view="clientes" data-mod="clientes" onclick="ver('clientes')">Clientes</button>
       <button class="nav" data-view="usuarios" data-mod="usuarios" onclick="ver('usuarios')">Usuarios y permisos</button>
       <button class="nav" data-view="vendedores" data-mod="vendedores" onclick="ver('vendedores')">Vendedores</button>
       <button class="nav" data-view="terminales" data-mod="terminales" onclick="ver('terminales')">Terminales</button>
-      <button class="nav" data-view="ncf" data-mod="ncf" onclick="ver('ncf')">Comprobantes NCF</button>
-      <button class="nav" data-view="ecf" data-mod="ncf" onclick="ver('ecf')">Facturación electrónica</button>
+      <button class="nav" data-view="ncf" data-mod="ncf" data-fn="ncf" onclick="ver('ncf')">Comprobantes NCF</button>
+      <button class="nav" data-view="ecf" data-mod="ncf" data-fn="ecf" onclick="ver('ecf')">Facturación electrónica</button>
       <button class="nav" data-view="metodos" data-mod="metodos" onclick="ver('metodos')">Métodos de pago</button>
-      <button class="nav" data-view="empresa" data-mod="apariencia" onclick="ver('empresa')">Empresa y correo</button>
+      <button class="nav" data-view="empresa" data-mod="apariencia" data-solo="admin" onclick="ver('empresa')">Empresa y correo</button>
       <button class="sec salir-menu" type="button" data-tema-btn onclick="cambiarTema(event)">Modo día</button>
       <button class="sec salir-menu" type="button" onclick="salir()">Salir</button>
     </aside>
@@ -5557,6 +5990,7 @@ HTML = """<!DOCTYPE html>
         </section>
         <aside class="rail" aria-label="Ticket">
           <h3>Ticket</h3>
+          <div id="facturasAbiertas" aria-label="Facturas abiertas"></div>
           <div class="campo ancho">
             <label for="codConduce">Código del mesero</label>
             <div style="display:flex;gap:8px">
@@ -5581,7 +6015,6 @@ HTML = """<!DOCTYPE html>
             <label>Comprobante<select id="tipoComp"><option value="consumidor_final">Consumidor final</option><option value="credito_fiscal">Crédito fiscal</option></select></label>
             <label>Descuento (RD$)<input id="desc" type="number" step="0.01" min="0" value="0" oninput="pintar()"/></label>
             <label class="check ancho"><input type="checkbox" id="propina10" onchange="pintar()"/> 10% de ley</label>
-            <label class="check ancho" id="filaPuntos" hidden><input type="checkbox" id="usarPuntos" onchange="pintar()"/> Usar puntos del cliente</label>
             <label>Autorización de la terminal<input id="authTarjeta" autocomplete="off" spellcheck="false" placeholder="La del voucher, mínimo 4"/></label>
             <div id="pagosDyn"></div>
             <label class="check ancho" id="filaCredito"><input type="checkbox" id="aCredito" onchange="pintar()"/> Venta a crédito (fiado)</label>
@@ -5598,13 +6031,12 @@ HTML = """<!DOCTYPE html>
           </div>
           <div class="ticket-acciones">
             <button class="sec" type="button" onclick="imprimirPrecuenta()">Pre-cuenta</button>
-            <button class="sec" onclick="popupApartar()">Apartar</button>
+            <button class="sec" type="button" onclick="nuevaFactura()">Nueva factura</button>
             <button class="sec" onclick="guardarCotizacion()">Cotizar</button>
             <button class="sec" type="button" onclick="dejarEnMesa()">Dejar el resto en la mesa</button>
             <button class="sec" type="button" onclick="abrirCajon()">Abrir cajón</button>
             <a class="sec" href="/pantalla" target="_blank" style="display:grid;place-items:center;height:36px;border-radius:999px;text-decoration:none">Pantalla del cliente</a>
           </div>
-          <div id="esperas"></div>
           <div class="msg" id="msg" role="status"></div>
         </aside>
       </div>
@@ -5762,6 +6194,9 @@ async function entrar(){
   } catch(e){ loginMsg.textContent = e.message; }
 }
 async function sesionInicial(){
+  const sonda = new Image();
+  sonda.onload = () => { if (!window._empresa || !window._empresa.logo) aplicarLogo("/api/empresa/logo"); };
+  sonda.src = "/api/empresa/logo";
   let sesion;
   try {
     sesion = await api("/api/estado");
@@ -5779,11 +6214,19 @@ async function sesionInicial(){
 }
 sesionInicial();
 let permisos = [];
+function tiene(mod, fn){
+  if (!mod) return true;
+  if (permisos.includes(mod)) return true;
+  if (fn && permisos.includes(mod + ":" + fn)) return true;
+  if (!fn && permisos.some(p => p.startsWith(mod + ":"))) return true;
+  return false;
+}
 function aplicarPermisos(mods){
   permisos = mods || [];
   document.querySelectorAll(".nav").forEach(b => {
     const m = b.dataset.mod;
-    b.style.display = !m || permisos.includes(m) ? "" : "none";
+    const soloAdmin = b.dataset.solo === "admin" && window._rol !== "admin";
+    b.style.display = !soloAdmin && tiene(m, b.dataset.fn || "") ? "" : "none";
   });
   actualizarGrupos();
 }
@@ -5801,6 +6244,7 @@ async function refrescar(){
   const e = await api("/api/estado");
   const esc = s => String(s || "").replaceAll("&","&amp;").replaceAll("<","&lt;");
   window._usuario = e.usuario || "";
+  window._rol = e.rol || "";
   window._caja = e.caja || null;
   const turno = e.caja
     ? esc(e.caja.nombre) + " · " + esc(e.caja.usuario || e.usuario) + " · " + esc(String(e.caja.apertura || "").slice(0, 16)) + " · caja chica " + money(e.caja.fondo)
@@ -5808,15 +6252,17 @@ async function refrescar(){
   document.getElementById("top").innerHTML = `<span class="quien">${esc(e.usuario)} · ${esc(e.rol)} · </span><span class="estado${e.caja ? " abierta" : ""}">${turno}</span>`;
   aplicarPermisos(e.permisos);
   window._empresa = e.empresa || {};
+  aplicarLogo(window._empresa.logo || "");
+  observarEmpresa();
   window._itbisIncluido = !!e.itbis_incluido;
   window._impresora = e.impresora || {};
   const selPapel = document.getElementById("anchoTicket");
   if (selPapel && window._impresora.papel) selPapel.value = String(window._impresora.papel) === "58" ? "58" : "80";
   aplicarPuertaCaja();
   const btn = document.getElementById("btnCaja");
-  if (btn) btn.style.display = e.caja || !permisos.includes("caja") ? "none" : "";
+  if (btn) btn.style.display = e.caja || !tiene("caja", "caja") ? "none" : "";
   actualizarGrupos();
-    if (permisos.includes("mostrador")) {
+    if (tiene("mostrador", "venta")) {
     await cargarClientesVenta();
     await cargarMetodos();
     await cargarEsperas();
@@ -5829,7 +6275,7 @@ async function refrescar(){
     } catch (e) { window._promosPantalla = []; }
     if (!window._colaTimer) {
       window._colaTimer = setInterval(() => {
-        if (document.hidden || !permisos.includes("mostrador")) return;
+        if (document.hidden || !tiene("mostrador", "venta")) return;
         cargarColaConduces();
       }, 8000);
     }
@@ -6015,6 +6461,7 @@ async function salir(){
   const pendientes = colaVentas().length;
   if (pendientes && !confirm(`Hay ${pendientes} ${pendientes === 1 ? "venta" : "ventas"} sin conexión en este equipo. Se enviarán cuando vuelvas a entrar. ¿Salir de todos modos?`)) return;
   if (navigator.serviceWorker && navigator.serviceWorker.controller) navigator.serviceWorker.controller.postMessage("limpiar");
+  if (window._obsEmpresa) { window._obsEmpresa.close(); window._obsEmpresa = null; }
   await api("/api/logout", {method:"POST"});
   location.reload();
 }
@@ -6087,7 +6534,7 @@ function aplicarPuertaCaja(){
   const form = document.getElementById("sinCajaForm");
   if (!form || !cerrada) return;
   const escHtml = s => String(s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;");
-  form.innerHTML = permisos.includes("caja")
+  form.innerHTML = tiene("caja", "caja")
     ? `<div class="form"><label>Cajero<input value="${escHtml(window._usuario || "")}" readonly/></label><label>Nombre de la caja<input id="cajaNombreVenta" value="Caja 1"/></label><label>Caja chica<input id="cajaFondoVenta" type="number" min="0" step="0.01" placeholder="Efectivo para el vuelto"/></label><button type="button" onclick="abrirCajaDesdeVenta()">Abrir caja y vender</button></div>`
     : "<p>La cajera de turno tiene que abrir la caja. Hasta entonces no se puede vender.</p>";
 }
@@ -6231,13 +6678,8 @@ function pagosActuales(){
     el
   }));
 }
-function rebajaPuntos(){
-  const box = document.getElementById("usarPuntos");
-  if (!box || !box.checked || !window._cliVenta) return 0;
-  return Math.max(0, Number(window._cliVenta.puntos || 0));
-}
 function totalTicket(){
-  const pedido = Math.max(0, Number(document.getElementById("desc").value||0)) + rebajaPuntos();
+  const pedido = Math.max(0, Number(document.getElementById("desc").value||0));
   let baseTotal;
   if (window._itbisIncluido) {
     let bruto = 0, base = 0;
@@ -6313,6 +6755,7 @@ function pintar(){
   cambio.textContent = fiado && falta > 0.009
     ? "Queda pendiente: " + money(falta)
     : "Cambio: " + money(Math.max(0, enCaja - Math.max(0, t.aCobrar-fuera)));
+  dibujarFacturas();
 }
 async function actualizarClienteVenta(){
   const caja = document.getElementById("infoCliente");
@@ -6320,8 +6763,6 @@ async function actualizarClienteVenta(){
   window._cliVenta = null;
   if (!cliVenta.value) {
     caja.hidden = true;
-    const filaPuntos = document.getElementById("filaPuntos");
-    if (filaPuntos) filaPuntos.hidden = true;
     if (saldoLbl) { saldoLbl.hidden = true; saldoLbl.querySelector("input").value = 0; }
     pintar();
     return;
@@ -6333,9 +6774,6 @@ async function actualizarClienteVenta(){
     if (d.deuda > 0) partes.push(`Debe <b>${money(d.deuda)}</b>`);
     partes.push(d.limite_credito > 0 ? `Crédito disponible <b>${money(d.credito_disponible)}</b>` : `<span>Sin crédito aprobado</span>`);
     if (d.saldo_favor > 0) partes.push(`Saldo a favor <b>${money(d.saldo_favor)}</b>`);
-    if (d.puntos > 0) partes.push(`Puntos <b>${d.puntos}</b>`);
-    const filaPuntos = document.getElementById("filaPuntos");
-    if (filaPuntos) filaPuntos.hidden = !(d.puntos > 0);
     caja.innerHTML = partes.map(x => `<span>${x}</span>`).join("");
     caja.hidden = false;
     if (saldoLbl) {
@@ -6399,6 +6837,9 @@ function tabla(headers, filas, vacio){
   }</tbody></table></div>`;
 }
 async function ver(nombre){
+  const etiqueta = document.querySelector(`.nav[data-view="${nombre}"]`);
+  if (etiqueta && etiqueta.dataset.solo === "admin" && window._rol !== "admin") return;
+  if (etiqueta && !tiene(etiqueta.dataset.mod, etiqueta.dataset.fn || "")) return;
   document.querySelectorAll(".nav").forEach(b => b.classList.toggle("on", b.dataset.view===nombre));
   document.getElementById("view-venta").style.display = nombre==="venta" ? "block" : "none";
   const formulario = document.getElementById("view-form");
@@ -6409,7 +6850,6 @@ async function ver(nombre){
   if (rail) rail.style.display = ancho ? "none" : "";
   formMsg.textContent = "";
   menu(false);
-  const etiqueta = document.querySelector(`.nav[data-view="${nombre}"]`);
   pintarRotulo(etiqueta);
   const vista = nombre === "venta" ? document.getElementById("view-venta") : formulario;
   if (window._vistaActual !== nombre) {
@@ -6500,8 +6940,8 @@ async function pintarForm(nombre){
       `<div class="form"><button onclick="nuevaBodega()">Crear bodega</button><button onclick="nuevaTransfer()">Transferir</button></div><div id="bodLista"></div>`],
     reportes: ["Reportes", "Elige el rango. Si lo dejas vacío, usa los últimos 30 días.",
       `<div class="form"><label>Desde<input id="repDesde" type="date"/></label><label>Hasta<input id="repHasta" type="date"/></label><button class="sec" onclick="pintarReportes()">Ver</button></div><div id="repTabla"></div>`],
-    metodos: ["Métodos de pago", "Los activos salen en el ticket. Si afecta caja, el vuelto se calcula sobre ese monto.",
-      `<div class="form"><button onclick="nuevoMetodo()">Nuevo método</button></div><div id="metTabla"></div>`],
+    metodos: ["Métodos de pago", "En el mostrador solo se cobra con efectivo, tarjeta y transferencia. Si afecta caja, el vuelto se calcula sobre ese monto.",
+      `<div id="metTabla"></div>`],
     ncf: ["Comprobantes NCF", "Secuencias que se imprimen en cada venta.", ""],
     inventario: ["Productos", "Primero va el precio original. El mínimo de venta es el precio de público. Los porcentajes se aplican a ese mínimo, y el dueño puede cambiarlos.",
       `<div class="form"><label class="wide">Buscar<input id="invQ" placeholder="Nombre o código"/></label><button class="sec" onclick="cargarInventario()">Buscar</button><button class="sec" onclick="etiquetasPdf()">Etiquetas PDF</button><button onclick="nuevoProducto()">Crear producto</button></div><div class="form" style="margin-top:14px"><label>1er por mayor %<input id="descP2" type="number" step="0.01" value="2"/></label><label>2do por mayor %<input id="descP3" type="number" step="0.01" value="5"/></label><label>3er por mayor %<input id="descP4" type="number" step="0.01" value="10"/></label><button class="sec" onclick="guardarDescuentos()">Guardar porcentajes</button></div><div id="invTabla"></div>`],
@@ -6510,7 +6950,7 @@ async function pintarForm(nombre){
     kardex: ["Kardex", "Movimientos de un producto: ventas, compras, transferencias y devoluciones.",
       `<div class="form"><label>Producto<select id="kxProd" onchange="cargarKardex()">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
     historial: ["Facturas emitidas", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
-      `<div class="form"><label>Estado<select id="histEstado"><option value="emitidas">Emitidas</option><option value="anuladas">Anuladas</option><option value="todos">Todas</option></select></label><button class="sec" onclick="cargarHistorial()">Cargar</button></div><div id="docVista"></div><div id="histTabla"></div>`],
+      `<div class="form" id="histFiltros"><label id="histEstadoCaja">Estado<select id="histEstado"><option value="emitidas">Emitidas</option><option value="anuladas">Anuladas</option><option value="todos">Todas</option></select></label><label id="histDesdeCaja">Desde<input id="histDesde" type="date"/></label><label id="histHastaCaja">Hasta<input id="histHasta" type="date"/></label><button class="sec" onclick="cargarHistorial()">Cargar</button><p class="hint wide" id="histNota" hidden>Solo ves las facturas emitidas hoy. El historial completo es del administrador.</p></div><div id="docVista"></div><div id="histTabla"></div>`],
     cotizaciones: ["Cotizaciones", "Abre el presupuesto para verlo o cambiar cantidades, productos y cliente.", ""],
     indicadores: ["Indicadores", "Ventas, cajeros, pagos e inventario.", ""],
     terminales: ["Terminales", "Cada caja o punto de venta con su numeración, bodega, lista de precios y cajeros. Se elige en el mostrador, en «Más opciones».",
@@ -6523,13 +6963,13 @@ async function pintarForm(nombre){
       `<div class="form"><label class="wide">Buscar<input id="cobQ" placeholder="Cliente, documento o número de factura" onkeydown="if(event.key==='Enter')cargarCobros()"/></label><button class="sec" onclick="cargarCobros()">Buscar</button></div><div id="cobResumen"></div><div id="cobTabla"></div>`],
     clientes: ["Clientes", "Pulsa Crear cliente. El correo recibe el comprobante. Cada fila se puede editar.",
       `<div class="form"><button onclick="nuevoCliente()">Crear cliente</button></div><div id="cliTabla"></div>`],
-    usuarios: ["Usuarios y permisos", "El administrador ve todo. El cajero entra a los módulos que marques y es quien cuadra la caja. El mesero queda por debajo: solo usa la tablet y sus pedidos se cobran en la caja abierta. La contraseña vacía, al editar, no la cambia.",
+    usuarios: ["Usuarios y permisos", "El administrador ve todo. En los demás marcas el módulo completo o solo las pantallas de ese módulo. El mesero solo usa la tablet. La contraseña vacía, al editar, no la cambia.",
       `<div class="form"><button onclick="nuevoUsuario()">Crear usuario</button></div><div id="usuTabla"></div>`],
     seguimiento: ["Seguimiento de cajeros", "Cuánto vendió cada cajero y qué turnos descuadraron. Deja una nota de seguimiento.", ""],
     impresion: ["Impresión", "La térmica 2connet POS80 usa rollo de 80 mm. El cuadre en hoja carta no cabe en ese rollo y sale cortado. Aquí el cuadre se arma como ticket, y puedes afinar caracteres y margen hasta que la regla quepa en una línea.",
       `<div class="form"><label class="wide">Nombre de la impresora<input id="impNombre" maxlength="80" placeholder="2connet POS80-01"/></label><label>Papel<select id="impPapel" onchange="cambiarPapelImpresion()"><option value="80">80 mm · POS80</option><option value="58">58 mm · portátil</option></select></label><label><span id="impCharsLabel">Caracteres por línea</span><input id="impChars" type="number" min="20" max="64" step="1" oninput="vistaImpresion()"/></label><label>Margen izquierdo (mm)<input id="impMargen" type="number" min="0" max="8" step="1" oninput="vistaImpresion()"/></label><label>El cuadre se imprime en<select id="impCuadre"><option value="ticket">Ticket del rollo (esta térmica)</option><option value="carta">Hoja carta (impresora de oficina)</option></select></label><div class="wide"><button type="button" onclick="guardarImpresion()">Guardar</button> <button type="button" class="sec" onclick="imprimirPrueba()">Probar impresora</button> <button type="button" class="sec" onclick="imprimirMuestraCuadre()">Probar cuadre</button></div><p class="hint wide">Al salir el cuadro de impresión, elige esta impresora, escala 100% y márgenes en Ninguno. La vista de abajo es el ancho real del rollo.</p><div class="wide muestra-impresion" id="impMuestra"></div></div>`],
-    empresa: ["Empresa y correo", "Datos del ticket y el servidor que envía el comprobante por correo.",
-      `<div class="form"><label>Nombre<input id="empNom"/></label><label class="wide">Dirección<input id="empDir"/></label><label>Teléfono<input id="empTel" placeholder="809-000-0000"/></label><label>RNC<input id="empRnc"/></label><label>Servidor SMTP<input id="smtpHost" placeholder="smtp.hostinger.com"/></label><label>Puerto<input id="smtpPort" value="587"/></label><label>Usuario<input id="smtpUser"/></label><label>Contraseña<input id="smtpPass" type="password" placeholder="Vacía para no cambiarla"/></label><label>Remitente<input id="smtpFrom" placeholder="facturas@tudominio.com"/></label><label class="check wide"><input type="checkbox" id="empItbisIncl"/> Los precios del catálogo ya incluyen el ITBIS (lo normal en colmado y tienda)</label><button onclick="guardarEmpresa()">Guardar</button></div>`],
+    empresa: ["Empresa y correo", "Datos del ticket, el logo del negocio y el servidor que envía el comprobante por correo.",
+      `<div class="form"><label>Nombre<input id="empNom"/></label><label class="wide">Dirección<input id="empDir"/></label><label>Teléfono<input id="empTel" placeholder="809-000-0000"/></label><label>RNC<input id="empRnc"/></label><label class="wide">Logo del negocio<input id="empLogoFile" type="file" accept="image/png,image/jpeg,image/webp"/></label><div class="wide logo-previa" id="empLogoCaja" hidden><img id="empLogo" alt="Logo del negocio"><button type="button" class="sec" onclick="quitarLogo()">Quitar logo</button></div><label>Servidor SMTP<input id="smtpHost" placeholder="smtp.hostinger.com"/></label><label>Puerto<input id="smtpPort" value="587"/></label><label>Usuario<input id="smtpUser"/></label><label>Contraseña<input id="smtpPass" type="password" placeholder="Vacía para no cambiarla"/></label><label>Remitente<input id="smtpFrom" placeholder="facturas@tudominio.com"/></label><label class="check wide"><input type="checkbox" id="empItbisIncl"/> Los precios del catálogo ya incluyen el ITBIS (lo normal en colmado y tienda)</label><button onclick="guardarEmpresa()">Guardar</button></div>`],
     porpagar: ["Por pagar", "Compras que todavía no se marcaron como pagadas al suplidor.",
       `<div id="pagarTabla"></div>`],
     resultado: ["Resultado", "Estado de resultados del libro: las ventas son ingreso, las compras y los gastos restan. El ITBIS y la propina quedan como deudas, no como ingreso.",
@@ -7359,14 +7799,27 @@ async function cargarKardex(){
     tabla(["Fecha","Movimiento","Tipo","Cantidad","Saldo","Bodega"], (d.items||[]).map(x => [String(x.fecha||"").slice(0,16), escDash(x.descripcion), x.tipo_codigo, x.cantidad, x.balance, escDash(x.bodega)]), "Este producto no tiene movimientos.");
 }
 async function cargarHistorial(){
+  const admin = window._rol === "admin";
+  const nota = document.getElementById("histNota");
+  const estadoCaja = document.getElementById("histEstadoCaja");
+  const desdeCaja = document.getElementById("histDesdeCaja");
+  const hastaCaja = document.getElementById("histHastaCaja");
+  if (nota) nota.hidden = admin;
+  if (estadoCaja) estadoCaja.style.display = admin ? "" : "none";
+  if (desdeCaja) desdeCaja.style.display = admin ? "" : "none";
+  if (hastaCaja) hastaCaja.style.display = admin ? "" : "none";
   const est = document.getElementById("histEstado");
-  const d = await api("/api/historial?estado=" + encodeURIComponent(est ? est.value : "emitidas"));
+  let url = "/api/historial?estado=" + encodeURIComponent(admin && est ? est.value : "emitidas");
+  if (admin && histDesde && histDesde.value && histHasta && histHasta.value) {
+    url += "&desde=" + encodeURIComponent(histDesde.value) + "&hasta=" + encodeURIComponent(histHasta.value);
+  }
+  const d = await api(url);
   histTabla.innerHTML = tabla(["Número","Fecha","Cliente","Total","Estado","Usuario",""], d.items.map(f => {
     const acciones = `<div class="acciones"><button class="sec" onclick="verDocumento(${f.id})">Ver</button><button class="sec" onclick="reimprimirFactura(${f.id})">Imprimir</button><details class="mas"><summary aria-label="Más acciones">Más</summary><div class="menu"><button type="button" onclick="bajarFactura(${f.id})">Descargar PDF</button><button type="button" onclick="enviarFactura(${f.id}, '${String(f.email||"").replaceAll("'","")}')">Enviar por correo</button><button type="button" onclick="repetirFactura(${f.id})">Repetir venta</button>` +
       (f.estado==="emitida" ? `<button type="button" onclick="irDevolver('${String(f.numero).replaceAll("'","")}')">Devolver</button><button type="button" class="peligro" onclick="pedirAnulacion(${f.id}, '${String(f.numero).replaceAll("'","")}')">Anular factura</button>` : "") + "</div></details></div>";
     const fecha = String(f.fecha||"");
     return [escDash(f.numero), fecha.slice(0,10)+"<br>"+fecha.slice(11,16), escDash(f.cliente), money(f.total), f.estado, escDash(f.usuario || "—"), acciones];
-  }));
+  }), admin ? "No hay facturas en este período." : "No hay facturas emitidas hoy.");
 }
 async function bajarFactura(id){
   try {
@@ -7998,6 +8451,7 @@ const CSS_TICKET = `
   .cols3 { display:grid; grid-template-columns:1fr 9ch 10ch; column-gap:1ch; }
   .d { text-align:right; }
   .regla { white-space:nowrap; overflow:hidden; letter-spacing:0; }
+  .logo-ticket { display:block; height:18mm; width:auto; max-width:100%; margin:0 auto 2mm; object-fit:contain; background:#fff; }
   .qr { display:flex; justify-content:center; margin-top:1.5mm; }
   .qr svg { width:28mm; height:28mm; }
 `;
@@ -8010,6 +8464,7 @@ async function escribirTicket(marco, html, medidas, paraImprimir){
   doc.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${titulo}</title><style id="pagina">@page{size:${p.papel}mm 400mm;margin:0}</style><style>${CSS_TICKET}</style></head><body style="--papel:${p.papel}mm;--util:${p.util}mm;--letra:${p.letra}mm;--izq:${izq};width:${p.papel}mm">${html}</body></html>`);
   doc.close();
   if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+  await Promise.all([...doc.images].map(img => img.complete ? null : new Promise(r => { img.onload = img.onerror = r; })));
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   const alto = Math.ceil(doc.body.getBoundingClientRect().height * 25.4 / 96) + 2;
   doc.getElementById("pagina").textContent = `@page{size:${p.papel}mm ${alto}mm;margin:0}`;
@@ -8060,10 +8515,44 @@ function notaTicket(data){
 function numTicket(n){
   return Number(n || 0).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2});
 }
+function urlLogo(logo){
+  const url = String(logo || "");
+  if (!url) return "";
+  if (/^https?:/i.test(url) || url.startsWith("data:")) return url;
+  return location.origin + url;
+}
+function aplicarLogo(url){
+  document.querySelectorAll(".mono").forEach(el => {
+    if (!el.dataset.letras) el.dataset.letras = (el.textContent || "").trim() || "MD";
+    if (!url) { el.textContent = el.dataset.letras; return; }
+    el.innerHTML = `<img alt="" src="${String(url).replaceAll('"', "")}">`;
+  });
+}
+function aplicarEmpresa(e){
+  if (!e) return;
+  const antes = (window._empresa || {}).logo || "";
+  window._empresa = {
+    nombre: e.nombre || "",
+    direccion: e.direccion || "",
+    telefono: e.telefono || "",
+    rnc: e.rnc || "",
+    logo: e.logo || ""
+  };
+  if ((window._empresa.logo || "") !== antes) aplicarLogo(window._empresa.logo || "");
+}
+function observarEmpresa(){
+  if (window._obsEmpresa) return;
+  const fuente = new EventSource("/api/empresa/aviso");
+  window._obsEmpresa = fuente;
+  fuente.onmessage = ev => {
+    try { aplicarEmpresa(JSON.parse(ev.data)); } catch (err) {}
+  };
+}
 function cabezaTicket(emp){
   const dir = String(emp.direccion || "").split(/\\n|,/).map(s => s.trim()).filter(Boolean)
     .map(s => `<span>${escDash(s)}</span>`).join("");
-  return `<header class="centro"><strong class="local">${escDash(emp.nombre || "Ticket")}</strong>`
+  const logo = emp.logo ? `<img class="logo-ticket" src="${urlLogo(emp.logo).replaceAll('"', "")}" alt="">` : "";
+  return `<header class="centro">${logo}<strong class="local">${escDash(emp.nombre || "Ticket")}</strong>`
     + dir
     + (emp.telefono ? `<span>Tel. ${escDash(emp.telefono)}</span>` : "")
     + (emp.rnc ? `<span>RNC ${escDash(emp.rnc)}</span>` : "")
@@ -8176,24 +8665,79 @@ async function guardarCliente(){
   } catch(e){ errorModal(e); }
 }
 function usarRolMesero(){
-  const es = usuRol.value === "mesero";
-  usuMods.style.display = es ? "none" : "";
-  usuNotaMesero.hidden = !es;
+  const rol = usuRol.value;
+  const especial = rol === "mesero" || rol === "admin";
+  usuMods.style.display = especial ? "none" : "";
+  usuNotaMesero.hidden = rol !== "mesero";
+  usuNotaAdmin.hidden = rol !== "admin";
+}
+function permisoMarcado(lista, mod, fn){
+  if (!lista) return mod === "mostrador";
+  if (lista.includes(mod)) return true;
+  return !!(fn && lista.includes(mod + ":" + fn));
 }
 function formUsuario(marcar){
-  const mods = (window._modulosLista || []).map(m => `<label><input type="checkbox" class="mod" value="${m}" ${marcar ? (marcar.includes(m) ? "checked" : "") : (m==="mostrador" ? "checked" : "")}/> ${m}</label>`).join("");
-  return `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Obligatoria al crear"/></label><label>Rol<select id="usuRol" onchange="usarRolMesero()"><option>empleado</option><option>mesero</option><option>user</option><option>admin</option></select></label><p class="hint" id="usuNotaMesero" hidden>El mesero solo toma pedidos en la tablet. No abre caja ni hace cuadre. Lo que pide lo factura la cajera con el código, en la caja que esté abierta.</p><div class="wide" id="usuMods">${mods}</div><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div>`;
+  let grupo = "";
+  const mods = (window._arbolPermisos || []).map(item => {
+    const titulo = item.grupo !== grupo ? (grupo = item.grupo, `<p class="permiso-grupo">${item.grupo}</p>`) : "";
+    const hijos = item.hijos || [];
+    if (!hijos.length) {
+      const on = permisoMarcado(marcar, item.id, "");
+      return `${titulo}<label class="check"><input type="checkbox" class="mod" value="${item.id}" ${on ? "checked" : ""}/> ${item.nombre}</label>`;
+    }
+    const filas = hijos.map(h => {
+      const on = permisoMarcado(marcar, item.id, h.id);
+      return `<label class="check"><input type="checkbox" class="fn" value="${h.id}" ${on ? "checked" : ""} onchange="syncPermiso(this)"/> ${h.nombre}</label>`;
+    }).join("");
+    return `${titulo}<div class="permiso-mod" data-perm-mod="${item.id}"><label class="check"><input type="checkbox" class="mod" onchange="togglePermiso(this)"/> ${item.nombre}</label><div class="permiso-hijos">${filas}</div></div>`;
+  }).join("");
+  return `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Obligatoria al crear"/></label><label>Rol<select id="usuRol" onchange="usarRolMesero()"><option>empleado</option><option>mesero</option><option>user</option><option>admin</option></select></label><p class="hint" id="usuNotaMesero" hidden>El mesero solo toma pedidos en la tablet. No abre caja ni hace cuadre. Lo que pide lo factura la cajera con el código, en la caja que esté abierta.</p><p class="hint" id="usuNotaAdmin" hidden>El administrador entra a todas las pantallas. No hace falta marcarlas.</p><div class="wide permisos" id="usuMods">${mods}</div><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div>`;
+}
+function syncPermiso(input){
+  const caja = input.closest(".permiso-mod");
+  if (!caja) return;
+  const hijos = [...caja.querySelectorAll(".fn")];
+  const padre = caja.querySelector(".mod");
+  const n = hijos.filter(h => h.checked).length;
+  padre.checked = n === hijos.length && n > 0;
+  padre.indeterminate = n > 0 && n < hijos.length;
+}
+function togglePermiso(input){
+  const caja = input.closest(".permiso-mod");
+  if (!caja) return;
+  caja.querySelectorAll(".fn").forEach(h => { h.checked = input.checked; });
+  input.indeterminate = false;
+}
+function pintarPermisos(){
+  document.querySelectorAll("#usuMods .permiso-mod").forEach(caja => {
+    const hijo = caja.querySelector(".fn");
+    if (hijo) syncPermiso(hijo);
+  });
+}
+function permisosDelFormulario(){
+  const out = [];
+  document.querySelectorAll("#usuMods .permiso-mod").forEach(caja => {
+    const mod = caja.dataset.permMod;
+    const hijos = [...caja.querySelectorAll(".fn")];
+    const on = hijos.filter(h => h.checked);
+    if (!on.length) return;
+    if (on.length === hijos.length) out.push(mod);
+    else on.forEach(h => out.push(mod + ":" + h.value));
+  });
+  document.querySelectorAll("#usuMods > label.check .mod:checked").forEach(x => out.push(x.value));
+  return out;
 }
 function nuevoUsuario(){
   window._usuEdit = false;
   abrirModal("Crear usuario", formUsuario(null));
+  pintarPermisos();
 }
 async function cargarUsuarios(){
   const d = await api("/api/usuarios");
   window._usus = d.items || [];
-  window._modulosLista = d.modulos || [];
-  usuTabla.innerHTML = tabla(["Usuario","Rol","Módulos",""], window._usus.map((u, i) => [
-    escDash(u.username), u.role, escDash((u.modulos||[]).join(", ")),
+  window._arbolPermisos = d.arbol || [];
+  usuTabla.innerHTML = tabla(["Usuario","Rol","Pantallas",""], window._usus.map((u, i) => [
+    escDash(u.username), u.role, escDash(u.resumen || "Sin pantallas"),
     `<button class="sec" onclick="editarUsuario(${i})">Editar</button>`
   ]));
 }
@@ -8208,10 +8752,11 @@ function editarUsuario(i){
   usuPass.placeholder = "Vacía para no cambiarla";
   usuRol.value = u.role;
   usarRolMesero();
+  pintarPermisos();
   btnUsu.textContent = "Guardar cambios";
 }
 async function guardarUsuario(){
-  const modulos = [...document.querySelectorAll("#modal .mod:checked")].map(x => x.value);
+  const modulos = usuRol.value === "mesero" || usuRol.value === "admin" ? [] : permisosDelFormulario();
   try {
     const editando = window._usuEdit;
     const url = editando ? "/api/usuarios/editar" : "/api/usuarios";
@@ -8347,8 +8892,31 @@ async function guardarMetodo(){
     await cargarMetodos();
   } catch(e){ errorModal(e); }
 }
+function mostrarLogo(url){
+  const caja = document.getElementById("empLogoCaja");
+  const img = document.getElementById("empLogo");
+  if (!caja || !img) return;
+  if (!url) { caja.hidden = true; img.removeAttribute("src"); return; }
+  img.src = url;
+  caja.hidden = false;
+}
+function quitarLogo(){
+  window._quitarLogo = true;
+  if (empLogoFile) empLogoFile.value = "";
+  mostrarLogo("");
+}
+async function leerLogo(file){
+  if (file.size > 2000000) throw new Error("El logo pesa demasiado (máximo 2 MB)");
+  return await new Promise((resolver, rechazar) => {
+    const lector = new FileReader();
+    lector.onload = () => resolver(String(lector.result || ""));
+    lector.onerror = () => rechazar(new Error("No se pudo leer el logo"));
+    lector.readAsDataURL(file);
+  });
+}
 async function cargarEmpresa(){
   const d = await api("/api/empresa");
+  window._quitarLogo = false;
   empNom.value = d.nombre || "";
   empDir.value = d.direccion || "";
   empTel.value = d.telefono || "";
@@ -8359,16 +8927,36 @@ async function cargarEmpresa(){
   smtpFrom.value = d.smtp_from || "";
   smtpPass.value = "";
   empItbisIncl.checked = !!d.precios_incluyen_itbis;
+  if (empLogoFile) empLogoFile.value = "";
+  mostrarLogo(d.logo || "");
+  if (empLogoFile) empLogoFile.onchange = () => {
+    const file = empLogoFile.files && empLogoFile.files[0];
+    window._quitarLogo = false;
+    if (!file) return;
+    leerLogo(file).then(mostrarLogo).catch(e => {
+      empLogoFile.value = "";
+      formMsg.style.color = "var(--danger)";
+      formMsg.textContent = e.message;
+    });
+  };
 }
 async function guardarEmpresa(){
   try {
-    await api("/api/empresa", {method:"POST", body: JSON.stringify({
+    const file = empLogoFile && empLogoFile.files && empLogoFile.files[0];
+    const logo = file ? await leerLogo(file) : "";
+    const r = await api("/api/empresa", {method:"POST", body: JSON.stringify({
       nombre: empNom.value, direccion: empDir.value, telefono: empTel.value, rnc: empRnc.value,
       smtp_host: smtpHost.value, smtp_port: smtpPort.value, smtp_user: smtpUser.value,
       smtp_password: smtpPass.value, smtp_from: smtpFrom.value,
-      precios_incluyen_itbis: empItbisIncl.checked
+      precios_incluyen_itbis: empItbisIncl.checked,
+      logo_base64: logo,
+      quitar_logo: !!window._quitarLogo && !logo
     })});
     window._itbisIncluido = empItbisIncl.checked;
+    window._quitarLogo = false;
+    aplicarEmpresa(r);
+    mostrarLogo(r.logo || "");
+    if (empLogoFile) empLogoFile.value = "";
     pintar();
     formMsg.style.color = "var(--ok)";
     formMsg.textContent = "Datos de empresa guardados.";
@@ -8433,7 +9021,7 @@ async function cobrar(){
       id_local: idLocal(),
       propina: !!(document.getElementById("propina10") && document.getElementById("propina10").checked),
       autorizacion: (document.getElementById("authTarjeta") || {}).value || "",
-      usar_puntos: (document.getElementById("usarPuntos") && document.getElementById("usarPuntos").checked && window._cliVenta) ? Number(window._cliVenta.puntos || 0) : 0
+      usar_puntos: 0
     };
     let data;
     try {
@@ -8445,27 +9033,26 @@ async function cobrar(){
     boton.classList.remove("cobrando");
     imprimirRecibo(data);
     repintarPlaca(data);
-    cart.length = 0; desc.value = 0;
-    document.getElementById("aCredito").checked = false;
-    obsVenta.value = "";
-    pintar();
+    const pendienteId = window._esperaId;
+    const conduceId = window._conduceId;
+    limpiarFacturaPantalla();
     msg.style.color = "var(--ok)";
     msg.textContent = data.provisional
       ? `Sin conexión: la venta quedó guardada en este equipo (${money(data.total)}, cambio ${money(data.cambio)}). Se factura al volver la conexión.`
       : data.pendiente > 0
       ? `${data.numero} fiado a ${data.cliente}: queda ${money(data.pendiente)}, vence ${data.vencimiento}.`
       : data.numero + (data.ncf? " · "+data.ncf : "") + " · " + money(data.total) + " · cambio " + money(data.cambio);
+    if (pendienteId) {
+      try { await api("/api/espera/" + pendienteId, {method:"DELETE"}); } catch (err) {}
+    }
+    await cargarEsperas();
     if (data.provisional) return;
     if (hayEfectivo) await pulsarCajon();
-    if (window._conduceId && data.id) {
-      try { await api("/api/conduces/" + window._conduceId + "/facturado", {method:"POST", body: JSON.stringify({factura_id: data.id})}); } catch (err) {}
-      window._conduceId = null;
-      const cajaCodigo = document.getElementById("codConduce");
-      if (cajaCodigo) cajaCodigo.value = "";
+    if (conduceId && data.id) {
+      try { await api("/api/conduces/" + conduceId + "/facturado", {method:"POST", body: JSON.stringify({factura_id: data.id})}); } catch (err) {}
       await cargarColaConduces();
     }
     await cargar();
-    if (cliVenta.value) actualizarClienteVenta();
   } catch(e){
     boton.classList.remove("cobrando");
     pintar();
@@ -8569,9 +9156,165 @@ async function cargarMetodos(){
 function popupCliente(){
   abrirModal("Agregar cliente", `<div class="form"><label>Nombre<input id="cliNuevo" placeholder="Alta rápida"/></label><label>Documento<input id="cliNuevoDoc" placeholder="RNC o cédula"/></label><label>Correo<input id="cliNuevoMail" placeholder="cliente@correo.com"/></label><button onclick="crearClienteTicket()">Agregar</button></div>`);
 }
-function popupApartar(){
-  if(!cart.length){ msg.style.color="var(--danger)"; msg.textContent = "El ticket está vacío."; return; }
-  abrirModal("Apartar ticket", `<div class="form"><label class="wide">Nombre<input id="esperaNom" placeholder="Mesa 1"/></label><button onclick="apartar()">Apartar</button></div>`);
+function etiquetaFactura(){
+  const opt = cliVenta && cliVenta.selectedOptions && cliVenta.selectedOptions[0];
+  if (opt && opt.value) return opt.textContent.trim().slice(0, 40);
+  if (window._etiquetaFactura) return window._etiquetaFactura;
+  const obs = (obsVenta.value || "").trim();
+  if (obs) return obs.slice(0, 40);
+  const ahora = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return "Factura " + p(ahora.getHours()) + ":" + p(ahora.getMinutes());
+}
+function nombreFacturaActiva(){
+  const opt = cliVenta && cliVenta.selectedOptions && cliVenta.selectedOptions[0];
+  if (opt && opt.value) return opt.textContent.trim();
+  if (window._etiquetaFactura) return window._etiquetaFactura;
+  const obs = (obsVenta.value || "").trim();
+  if (obs) return obs;
+  if (cart.length) return "En curso";
+  return "Nueva";
+}
+function estadoFactura(){
+  const t = totalTicket();
+  return {
+    etiqueta: etiquetaFactura(),
+    items: cart.map(l => Object.assign({}, l, {opciones: (l.opciones || []).map(o => Object.assign({}, o))})),
+    total: t.aCobrar,
+    cliente_id: cliVenta.value ? Number(cliVenta.value) : null,
+    descuento: Number(desc.value || 0),
+    comprobante: tipoComp.value,
+    observaciones: obsVenta.value || "",
+    propina: !!(document.getElementById("propina10") && document.getElementById("propina10").checked),
+    a_credito: !!(document.getElementById("aCredito") && document.getElementById("aCredito").checked),
+    pagos: pagosActuales().filter(p => p.monto > 0).map(p => ({codigo: p.codigo, monto: p.monto})),
+    conduce_id: window._conduceId || null,
+    conduce_codigo: (document.getElementById("codConduce") || {}).value || "",
+    conduce_mesa: window._conduceMesa || "",
+    conduce_usuario: window._conduceUsuario || "",
+    auth: (document.getElementById("authTarjeta") || {}).value || ""
+  };
+}
+function dibujarFacturas(){
+  const caja = document.getElementById("facturasAbiertas");
+  if (!caja || typeof tot === "undefined" || !tot) return;
+  const seguro = s => escDash(s).replaceAll('"', "&quot;");
+  const otras = (window._pendientes || []).filter(x => Number(x.id) !== Number(window._esperaId || 0));
+  const nombre = nombreFacturaActiva();
+  const total = cart.length ? " · " + tot.textContent : "";
+  caja.innerHTML = `<button type="button" class="sec on" title="${seguro(nombre)}">${escDash(nombre)}${total}</button>`
+    + otras.map(x => `<button type="button" class="sec" title="${seguro(x.etiqueta)}" onclick="cambiarFactura(${Number(x.id)})">${escDash(x.etiqueta)} · ${money(x.total)}</button>`).join("")
+    + `<button type="button" class="sec" onclick="nuevaFactura()">Nueva</button>`;
+}
+function limpiarFacturaPantalla(){
+  cart.length = 0;
+  desc.value = 0;
+  const propina = document.getElementById("propina10");
+  if (propina) propina.checked = false;
+  const credito = document.getElementById("aCredito");
+  if (credito) credito.checked = false;
+  obsVenta.value = "";
+  const auth = document.getElementById("authTarjeta");
+  if (auth) auth.value = "";
+  if (cliVenta) cliVenta.value = "";
+  const info = document.getElementById("infoCliente");
+  if (info) info.hidden = true;
+  window._conduceId = null;
+  window._conduceMesa = "";
+  window._conduceUsuario = "";
+  const caja = document.getElementById("codConduce");
+  if (caja) caja.value = "";
+  document.querySelectorAll(".pago").forEach(el => { el.value = 0; el.dataset.auto = "1"; });
+  window._esperaId = null;
+  window._etiquetaFactura = "";
+  pintar();
+}
+async function guardarFacturaActual(){
+  if (!cart.length) {
+    if (window._esperaId) {
+      const id = window._esperaId;
+      window._esperaId = null;
+      window._etiquetaFactura = "";
+      await api("/api/espera/" + id, {method:"DELETE"});
+    }
+    return false;
+  }
+  const cuerpo = estadoFactura();
+  if (window._esperaId) {
+    await api("/api/espera/" + window._esperaId, {method:"PUT", body: JSON.stringify(cuerpo)});
+  } else {
+    const r = await api("/api/espera", {method:"POST", body: JSON.stringify(cuerpo)});
+    window._esperaId = r.id;
+  }
+  window._etiquetaFactura = cuerpo.etiqueta;
+  return true;
+}
+async function nuevaFactura(){
+  if (window._cambiandoFactura) return;
+  if (!cart.length && !window._esperaId) {
+    msg.style.color = "var(--warning)";
+    msg.textContent = "Esta factura está vacía. Arma el ticket o abre una pendiente.";
+    return;
+  }
+  window._cambiandoFactura = true;
+  try {
+    const guardada = await guardarFacturaActual();
+    limpiarFacturaPantalla();
+    await cargarEsperas();
+    msg.style.color = "var(--ok)";
+    msg.textContent = guardada ? "La factura quedó pendiente. Puedes armar otra." : "Factura pendiente quitada.";
+  } catch(e) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = e.message;
+  } finally {
+    window._cambiandoFactura = false;
+  }
+}
+async function cambiarFactura(id){
+  if (window._cambiandoFactura) return;
+  if (Number(id) === Number(window._esperaId || 0)) return;
+  window._cambiandoFactura = true;
+  try {
+    await guardarFacturaActual();
+    const d = await api("/api/espera/" + id);
+    await aplicarFacturaGuardada(d);
+    await cargarEsperas();
+    msg.style.color = "var(--ok)";
+    msg.textContent = "Factura en pantalla: " + (d.etiqueta || "pendiente") + ". Las demás siguen pendientes.";
+  } catch(e) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = e.message;
+  } finally {
+    window._cambiandoFactura = false;
+  }
+}
+async function aplicarFacturaGuardada(d){
+  cart.length = 0;
+  (d.items || []).forEach(it => cart.push(it));
+  desc.value = d.descuento || 0;
+  const propina = document.getElementById("propina10");
+  if (propina) propina.checked = !!d.propina;
+  const credito = document.getElementById("aCredito");
+  if (credito) credito.checked = !!d.a_credito;
+  if (tipoComp) tipoComp.value = d.comprobante || "consumidor_final";
+  obsVenta.value = d.observaciones || "";
+  const auth = document.getElementById("authTarjeta");
+  if (auth) auth.value = d.auth || "";
+  window._conduceId = d.conduce_id || null;
+  window._conduceMesa = d.conduce_mesa || "";
+  window._conduceUsuario = d.conduce_usuario || "";
+  const caja = document.getElementById("codConduce");
+  if (caja) caja.value = d.conduce_codigo || "";
+  document.querySelectorAll(".pago").forEach(el => {
+    const hit = (d.pagos || []).find(p => p.codigo === el.dataset.codigo);
+    el.value = hit ? hit.monto : 0;
+    el.dataset.auto = hit ? "0" : "1";
+  });
+  window._esperaId = d.id;
+  window._etiquetaFactura = d.etiqueta || "";
+  if (cliVenta) cliVenta.value = d.cliente_id ? String(d.cliente_id) : "";
+  if (cliVenta && cliVenta.value) await actualizarClienteVenta();
+  else pintar();
 }
 async function crearClienteTicket(){
   try {
@@ -8581,22 +9324,6 @@ async function crearClienteTicket(){
     cerrarModal();
     msg.style.color = "var(--ok)";
     msg.textContent = "Cliente agregado al ticket.";
-  } catch(e){ errorModal(e); }
-}
-async function apartar(){
-  if(!cart.length) return;
-  const etiqueta = (esperaNom.value || "").trim();
-  if(!etiqueta){ errorModal({message:"Escribe un nombre para el apartado."}); return; }
-  try {
-    await api("/api/espera", {method:"POST", body: JSON.stringify({
-      etiqueta, items: cart, total: Number(String(tot.textContent).replace(/[^0-9.]/g,"")) || 0,
-      cliente_id: cliVenta.value ? Number(cliVenta.value) : null
-    })});
-    cart.length = 0; pintar();
-    cerrarModal();
-    msg.style.color = "var(--ok)";
-    msg.textContent = "Ticket apartado: " + etiqueta;
-    await cargarEsperas();
   } catch(e){ errorModal(e); }
 }
 async function verConduce(codigo){
@@ -8611,10 +9338,10 @@ async function verConduce(codigo){
   try {
     const d = await api("/api/conduces/codigo/" + encodeURIComponent(clave));
     if (d.estado !== "pendiente") throw new Error("Ese código ya se facturó" + (d.factura ? ": " + d.factura : "") + ".");
-    if (cart.length && window._conduceId !== d.id) {
-      msg.style.color = "var(--danger)";
-      msg.textContent = "Este ticket ya tiene productos. Déjalo en cero antes de traer " + d.codigo + " · " + d.mesa + ".";
-      return;
+    const dejoPendiente = cart.length && window._conduceId !== d.id;
+    if (dejoPendiente) {
+      await guardarFacturaActual();
+      limpiarFacturaPantalla();
     }
     cart.length = 0;
     (d.lineas || []).forEach(l => cart.push({
@@ -8623,12 +9350,15 @@ async function verConduce(codigo){
       opciones: (l.extras || []).map(e => ({id:e.id, nombre:e.nombre, precio:Number(e.precio || 0), on:true}))
     }));
     window._conduceId = d.id;
+    window._conduceMesa = d.mesa || "";
+    window._conduceUsuario = d.usuario || "";
     if (document.getElementById("lista")) lista.value = "1";
     obsVenta.value = d.codigo + " · " + d.mesa + (d.usuario ? " · " + d.usuario : "");
     if (caja) caja.value = d.codigo;
     pintar();
+    await cargarEsperas();
     msg.style.color = "var(--ok)";
-    msg.textContent = d.codigo + " de " + (d.usuario || "el mesero") + " · " + d.mesa + ". Cobra en esta caja para facturar.";
+    msg.textContent = d.codigo + " de " + (d.usuario || "el mesero") + " · " + d.mesa + (dejoPendiente ? ". La factura anterior quedó pendiente." : ". Cobra en esta caja para facturar.");
     cargarColaConduces();
   } catch(e) {
     msg.style.color = "var(--danger)";
@@ -8642,7 +9372,7 @@ function nombreCortoCaja(usuario){
 }
 async function cargarColaConduces(){
   const root = document.getElementById("colaConduces");
-  if (!root || !permisos.includes("mostrador")) return;
+  if (!root || !tiene("mostrador", "venta")) return;
   try {
     const d = await api("/api/conduces?cola=1");
     const items = d.items || [];
@@ -8663,16 +9393,11 @@ async function cargarColaConduces(){
 async function cargarEsperas(){
   try {
     const d = await api("/api/espera");
-    esperas.innerHTML = d.items.length ? "<h4>Apartados</h4>" + d.items.map(x => `<button class="sec" onclick="tomarEspera(${x.id})">${x.etiqueta} · ${money(x.total)}</button>`).join("") : "";
-  } catch(e) { esperas.innerHTML = ""; }
-}
-async function tomarEspera(id){
-  const d = await api("/api/espera/"+id+"/tomar", {method:"POST"});
-  cart.length = 0;
-  (d.items||[]).forEach(it => cart.push(it));
-  if(d.cliente_id) cliVenta.value = String(d.cliente_id);
-  pintar();
-  await cargarEsperas();
+    window._pendientes = d.items || [];
+  } catch(e) {
+    window._pendientes = window._pendientes || [];
+  }
+  dibujarFacturas();
 }
 async function guardarCotizacion(){
   if(!cart.length) return;
@@ -8794,8 +9519,10 @@ TABLET_HTML = """<!DOCTYPE html>
   .marca { display:flex; align-items:center; gap:10px; min-width:0; }
   .logo {
     width:42px; height:42px; border-radius:14px; background:var(--accent); color:var(--on-accent);
-    display:grid; place-items:center; font-weight:800; flex:none;
+    display:grid; place-items:center; font-weight:800; flex:none; overflow:hidden;
   }
+  .logo:has(img) { background:#fff; }
+  .logo img { width:100%; height:100%; object-fit:contain; display:block; }
   .marca b { display:block; font-size:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .marca small, .pedido-head small { color:var(--muted); font-weight:700; }
   .mesa-box {
@@ -8955,11 +9682,6 @@ TABLET_HTML = """<!DOCTYPE html>
     .cuerpo { grid-template-columns:minmax(0,1fr) 360px; }
     #grid { grid-template-columns:repeat(3, minmax(0,1fr)); }
   }
-  @media print {
-    body * { visibility:hidden; }
-    #slip, #slip * { visibility:visible; }
-    #slip { display:block; position:absolute; left:0; top:0; width:80mm; color:#111; background:#fff; padding:12px; }
-  }
 </style>
 </head>
 <body>
@@ -9031,6 +9753,12 @@ TABLET_HTML = """<!DOCTYPE html>
 <script>
 const cart = [];
 const borradores = {};
+function ponerLogo(url){
+  if (!url) return;
+  document.querySelectorAll(".logo").forEach(el => {
+    el.innerHTML = `<img alt="" src="${String(url).replaceAll('"', "")}">`;
+  });
+}
 let catalogo = [];
 let categorias = [];
 let combos = [];
@@ -9074,10 +9802,13 @@ async function entrar(){
     let estado = {};
     try { estado = await api("/api/estado"); } catch (err) {}
     window._itbisIncluido = !!estado.itbis_incluido;
+    window._usuario = s.usuario || user.value;
+    window._impresora = estado.impresora || {};
     document.getElementById("login").style.display = "none";
     document.getElementById("app").classList.add("on");
-    quien.textContent = (s.usuario || user.value) + (estado.caja ? " · caja de " + (estado.caja.usuario || "la cajera") : " · sin caja abierta");
-    if (estado.empresa && estado.empresa.nombre) marca.textContent = estado.empresa.nombre;
+    quien.textContent = window._usuario + (estado.caja ? " · caja de " + (estado.caja.usuario || "la cajera") : " · sin caja abierta");
+    guardarEmpresaTablet(estado.empresa);
+    observarEmpresaTablet();
     await cargar();
     await pendientes();
     pintar();
@@ -9276,13 +10007,145 @@ async function generar(){
     window._oficial = d;
     window._tocado = false;
     mesa.value = mesaCorta(d.mesa);
-    slip.innerHTML = `<h2>CONDUCE ${esc(d.codigo)}</h2><p>${esc(d.mesa)}<br>${esc(d.usuario || "")}</p><table>${(d.lineas||[]).map(l => `<tr><td>${l.cantidad} ${esc(l.nombre)}</td><td>${money(l.total)}</td></tr>`).join("")}</table><p><b>Total ${money(d.total)}</b></p><p>Presenta este código en la caja.</p>`;
     pintar();
     abrirPedido();
     await pendientes();
   } catch(e){ msg.textContent = e.message; abrirPedido(); }
 }
-function imprimirConduce(){ window.print(); }
+function guardarEmpresaTablet(e){
+  window._empresa = e || {};
+  if (e && e.nombre) marca.textContent = e.nombre;
+  if (e && e.logo) ponerLogo(e.logo);
+}
+function observarEmpresaTablet(){
+  if (window._obsEmpresa) return;
+  const fuente = new EventSource("/api/empresa/aviso");
+  window._obsEmpresa = fuente;
+  fuente.onmessage = ev => {
+    try { guardarEmpresaTablet(JSON.parse(ev.data)); } catch (err) {}
+  };
+}
+function medidasConduce(cfg){
+  cfg = cfg || {};
+  const papel = Number(cfg.papel) === 58 ? 58 : 80;
+  const crudo = papel === 58 ? Number(cfg.caracteres_58 || 32) : Number(cfg.caracteres_80 || 42);
+  const piso = papel === 58 ? 20 : 24;
+  const tope = papel === 58 ? 42 : 64;
+  const caracteres = Math.max(piso, Math.min(tope, Math.round(crudo) || (papel === 58 ? 32 : 42)));
+  const margen = Math.max(0, Math.min(8, Math.round(Number(cfg.margen || 0)) || 0));
+  const util = Math.max(28, (papel === 58 ? 48 : 72) - margen);
+  return {
+    papel, util, caracteres, margen,
+    letra: Math.round(util / caracteres / 0.6 * 1000) / 1000,
+    nombre: String(cfg.nombre || "").trim()
+  };
+}
+function numConduce(n){
+  return Number(n || 0).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function fechaConduce(valor){
+  const m = String(valor || "").match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})/);
+  if (m) return m[3] + "/" + m[2] + "/" + m[1] + " " + m[4] + ":" + m[5];
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return p(d.getDate()) + "/" + p(d.getMonth() + 1) + "/" + d.getFullYear() + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function filaConduce(izq, der, clase){
+  const claseFila = clase ? " " + clase : "";
+  const texto = String(der == null ? "" : der).replace(/<[^>]*>/g, "");
+  if (texto.length > 22) {
+    return `<div class="fila${claseFila}"><span class="nom">${izq}</span></div><div class="renglon der">${der}</div>`;
+  }
+  return `<div class="fila${claseFila}"><span class="nom">${izq}</span><span class="din">${der}</span></div>`;
+}
+function cabezaConduce(emp){
+  const dir = String(emp.direccion || "").split(/\\n|,/).map(s => s.trim()).filter(Boolean)
+    .map(s => `<span>${esc(s)}</span>`).join("");
+  const logo = emp.logo ? `<img class="logo-ticket" src="${esc(String(emp.logo).startsWith("http") || String(emp.logo).startsWith("data:") ? emp.logo : location.origin + emp.logo)}" alt="">` : "";
+  return `<header class="centro">${logo}<strong class="local">${esc(emp.nombre || "Conduce")}</strong>`
+    + dir
+    + (emp.telefono ? `<span>Tel. ${esc(emp.telefono)}</span>` : "")
+    + (emp.rnc ? `<span>RNC ${esc(emp.rnc)}</span>` : "")
+    + `</header>`;
+}
+function lineasConduce(data){
+  return (data.lineas || []).map(l => {
+    const cant = Number(l.cantidad);
+    const cantTxt = Number.isInteger(cant) ? String(cant) : cant.toFixed(2);
+    const precio = l.precio != null ? numConduce(l.precio) : "";
+    const detalle = precio ? cantTxt + " x " + precio : cantTxt;
+    return `<div class="bloque"><div class="renglon">${esc(l.nombre)}</div>${filaConduce(detalle, numConduce(l.total))}</div>`;
+  }).join("");
+}
+function htmlConduce(d){
+  const emp = window._empresa || {};
+  const mesaTxt = mesaCorta(d.mesa || "");
+  const atendio = d.usuario || window._usuario || "";
+  return `<div class="bau">${cabezaConduce(emp)}<hr class="corte"><span class="titulo">CONDUCE</span><hr class="corte">`
+    + (mesaTxt ? `<span class="mesa">MESA ${esc(mesaTxt)}</span>` : "")
+    + filaConduce("Fecha", fechaConduce(d.fecha))
+    + filaConduce("Conduce", esc(d.codigo || ""))
+    + `<hr class="corte">${filaConduce("DESCRIPCION", "IMPORTE", "ley")}${lineasConduce(d)}<hr class="corte">`
+    + filaConduce("Sub Total", numConduce(d.subtotal))
+    + filaConduce("ITBIS 18%", numConduce(d.itbis))
+    + filaConduce("TOTAL", "RD$ " + numConduce(d.total), "total")
+    + (atendio ? `<hr class="corte"><p class="centro atendio">Le atendió: ${esc(String(atendio).toUpperCase())}</p>` : "")
+    + `<hr class="corte"><p class="centro pie">GRACIAS POR SU VISITA</p></div>`;
+}
+const CSS_CONDUCE = `
+  html, body { margin:0; padding:0; background:#fff; color:#000; }
+  @media print { html, body { width: var(--papel, 80mm) !important; margin: 0 !important; } }
+  .bau { box-sizing:border-box; width:var(--util); margin:0 auto 0 var(--izq, auto); padding:3mm 0 7mm; color:#000;
+    font-family:"Courier New", Courier, "Liberation Mono", monospace; font-size:var(--letra); line-height:1.28; font-weight:700; }
+  .bau p { margin:0; }
+  .centro { display:block; text-align:center; }
+  .local { display:block; font-size:1.3em; letter-spacing:.02em; text-transform:uppercase; }
+  header span, .sub, .pie { display:block; }
+  .corte { border:0; border-top:.3mm dashed #000; margin:1.6mm 0; }
+  .fila { display:table; width:100%; table-layout:auto; }
+  .nom { display:table-cell; text-align:left; vertical-align:baseline; overflow-wrap:break-word; }
+  .din { display:table-cell; width:1%; text-align:right; white-space:nowrap; vertical-align:baseline; padding-left:3mm; }
+  .bloque { margin:0 0 1.4mm; }
+  .sub, .ley, .cols { font-size:.92em; }
+  .total { font-size:1.2em; }
+  .renglon { display:block; overflow-wrap:break-word; }
+  .der { text-align:right; }
+  .atendio { margin-top:1.6mm; }
+  .titulo { display:block; text-align:center; letter-spacing:.06em; margin:1.6mm 0 .6mm; }
+  .mesa { display:block; text-align:center; font-size:1.4em; letter-spacing:.08em; margin:1mm 0; }
+  .logo-ticket { display:block; height:18mm; width:auto; max-width:100%; margin:0 auto 2mm; object-fit:contain; background:#fff; }
+`;
+async function escribirConduce(marco, html, medidas){
+  const p = medidas;
+  const doc = marco.contentDocument;
+  const izq = p.margen ? p.margen + "mm" : "auto";
+  doc.open();
+  doc.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Conduce</title><style id="pagina">@page{size:${p.papel}mm 400mm;margin:0}</style><style>${CSS_CONDUCE}</style></head><body style="--papel:${p.papel}mm;--util:${p.util}mm;--letra:${p.letra}mm;--izq:${izq};width:${p.papel}mm">${html}</body></html>`);
+  doc.close();
+  if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+  await Promise.all([...doc.images].map(img => img.complete ? null : new Promise(r => { img.onload = img.onerror = r; })));
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const alto = Math.ceil(doc.body.getBoundingClientRect().height * 25.4 / 96) + 2;
+  doc.getElementById("pagina").textContent = `@page{size:${p.papel}mm ${alto}mm;margin:0}`;
+  marco.style.height = Math.max(alto, 20) + "mm";
+  marco.contentWindow.focus();
+  marco.contentWindow.print();
+}
+async function imprimirConduce(){
+  const d = window._oficial;
+  if (!d) return;
+  const p = medidasConduce(window._impresora || {});
+  const viejo = document.getElementById("marcoConduce");
+  if (viejo) viejo.remove();
+  const marco = document.createElement("iframe");
+  marco.id = "marcoConduce";
+  marco.title = "Conduce";
+  marco.setAttribute("aria-hidden", "true");
+  marco.tabIndex = -1;
+  marco.style.cssText = `position:fixed;left:-300mm;top:0;width:${p.papel}mm;height:20mm;border:0;opacity:0;pointer-events:none`;
+  document.body.appendChild(marco);
+  await escribirConduce(marco, htmlConduce(d), p);
+}
 function aplicarConduce(d){
   window._id = d.id;
   window._codigo = d.codigo;
@@ -9294,7 +10157,6 @@ function aplicarConduce(d){
     id:l.id, nombre: (l.extras && l.extras.length) ? String(l.nombre).split(" · ")[0] : l.nombre, precio:l.precio, base: Number(l.precio_base ?? l.precio), cantidad:l.cantidad, combo:!!l.combo, itbis:l.itbis!==false, nota:l.nota || "",
     opciones: (l.extras || []).map(e => ({id:e.id, nombre:e.nombre, precio:Number(e.precio || 0), on:true}))
   }));
-  slip.innerHTML = `<h2>CONDUCE ${esc(d.codigo)}</h2><p>${esc(d.mesa)}<br>${esc(d.usuario || "")}</p><table>${(d.lineas||[]).map(l => `<tr><td>${l.cantidad} ${esc(l.nombre)}</td><td>${money(l.total)}</td></tr>`).join("")}</table><p><b>Total ${money(d.total)}</b></p><p>Presenta este código en la caja.</p>`;
   msg.textContent = "";
   document.getElementById("pedirMesa").classList.remove("on");
   pintar();
@@ -9472,13 +10334,19 @@ mesa.addEventListener("input", () => {
   tituloMesa.textContent = mesa.value.trim() ? "Mesa " + mesa.value.trim() : "Sin mesa";
 });
 q.addEventListener("input", () => { clearTimeout(buscarTimer); buscarTimer = setTimeout(cargar, 280); });
+const sondaLogo = new Image();
+sondaLogo.onload = () => ponerLogo("/api/empresa/logo");
+sondaLogo.src = "/api/empresa/logo";
 api("/api/estado").then(async estado => {
   if (estado.rol !== "mesero" && estado.rol !== "admin") return;
   window._itbisIncluido = !!estado.itbis_incluido;
+  window._usuario = estado.usuario || "";
+  window._impresora = estado.impresora || {};
   document.getElementById("login").style.display = "none";
   document.getElementById("app").classList.add("on");
-  quien.textContent = (estado.usuario || "") + (estado.caja ? " · caja de " + (estado.caja.usuario || "la cajera") : " · sin caja abierta");
-  if (estado.empresa && estado.empresa.nombre) marca.textContent = estado.empresa.nombre;
+  quien.textContent = window._usuario + (estado.caja ? " · caja de " + (estado.caja.usuario || "la cajera") : " · sin caja abierta");
+  guardarEmpresaTablet(estado.empresa);
+  observarEmpresaTablet();
   await cargar();
   await pendientes();
   pintar();

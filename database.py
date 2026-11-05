@@ -609,6 +609,42 @@ class Database:
         conn.close()
         return new_id
 
+    def actualizar_venta_espera(
+        self,
+        espera_id: int,
+        etiqueta: str,
+        usuario: str | None,
+        cliente_id: int | None,
+        tipo_comprobante: str,
+        descuento_global: float,
+        items_json: str,
+        total: float,
+    ) -> bool:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE ventas_espera
+            SET etiqueta=?, usuario=?, cliente_id=?, tipo_comprobante=?,
+                descuento_global=?, items_json=?, total=?
+            WHERE id=?
+            """,
+            (
+                etiqueta.strip(),
+                (usuario or "").strip() or None,
+                cliente_id,
+                (tipo_comprobante or "").strip() or "Consumidor final",
+                round(float(descuento_global or 0), 2),
+                items_json,
+                round(float(total or 0), 2),
+                int(espera_id),
+            ),
+        )
+        ok = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+        return ok
+
     def _migrate_conduces(self, cursor):
         """Pedidos de la tablet. El código se cobra después en la caja principal."""
         cursor.execute(
@@ -758,17 +794,26 @@ class Database:
             )
             """
         )
-        cursor.execute("SELECT COUNT(*) FROM metodos_pago")
-        if cursor.fetchone()[0] == 0:
-            for cod, nom, caja in (
-                ("efectivo", "Efectivo", 1),
-                ("tarjeta", "Tarjeta", 0),
-                ("transferencia", "Transferencia", 0),
-            ):
-                cursor.execute(
-                    "INSERT INTO metodos_pago (codigo, nombre, afecta_caja, activo) VALUES (?,?,?,1)",
-                    (cod, nom, caja),
-                )
+        for cod, nom, caja in (
+            ("efectivo", "Efectivo", 1),
+            ("tarjeta", "Tarjeta", 0),
+            ("transferencia", "Transferencia", 0),
+        ):
+            cursor.execute(
+                """
+                INSERT INTO metodos_pago (codigo, nombre, afecta_caja, activo)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(codigo) DO NOTHING
+                """,
+                (cod, nom, caja),
+            )
+        cursor.execute(
+            """
+            UPDATE metodos_pago
+            SET activo = 0
+            WHERE codigo NOT IN ('efectivo', 'tarjeta', 'transferencia')
+            """
+        )
 
         cursor.execute(
             """
@@ -853,6 +898,9 @@ class Database:
         return rows
 
     def guardar_metodo_pago(self, codigo: str, nombre: str, afecta_caja: bool, activo: bool = True):
+        codigo = (codigo or "").strip().lower()
+        if codigo not in ("efectivo", "tarjeta", "transferencia"):
+            raise ValueError("Solo se usan efectivo, tarjeta y transferencia")
         conn = self.get_connection()
         cur = conn.cursor()
         cur.execute(
@@ -864,7 +912,7 @@ class Database:
                 afecta_caja = excluded.afecta_caja,
                 activo = excluded.activo
             """,
-            (codigo.strip().lower(), nombre.strip(), 1 if afecta_caja else 0, 1 if activo else 0),
+            (codigo, nombre.strip(), 1 if afecta_caja else 0, 1 if activo else 0),
         )
         conn.commit()
         conn.close()

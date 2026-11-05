@@ -359,11 +359,7 @@ def build_factura_comprobante_pdf(db: Database, factura_id: int) -> bytes | None
         else ("ANULADO" if st == "anulada" else "DOCUMENTO DE VENTA")
     )
 
-    hdr = (
-        f"<b><font size=14>{emp.get('nombre') or 'Empresa'}</font></b><br/>"
-        f"<font size=9>{(emp.get('direccion') or '').replace(chr(10), '<br/>')}</font><br/>"
-        f"<font size=9>RNC {emp.get('rnc') or '—'}</font>"
-    )
+    hdr = _cabecera_empresa(emp)
     meta = (
         f"<b>Nº:</b> {numero or '—'}<br/>"
         f"<b>NCF:</b> {ncf or '—'}<br/>"
@@ -465,6 +461,21 @@ def _rd(valor) -> str:
     return f"RD$ {float(valor or 0):,.2f}"
 
 
+def _cabecera_empresa(emp: dict, tamano: int = 14) -> str:
+    """Nombre, dirección, teléfono y RNC tal como están guardados al generar el PDF."""
+    nombre = _xml(emp.get("nombre") or "Empresa")
+    direccion = _xml(emp.get("direccion") or "").replace("\n", "<br/>")
+    telefono = _xml(emp.get("telefono") or "")
+    rnc = _xml(emp.get("rnc") or "—")
+    lineas = [f"<b><font size={int(tamano)}>{nombre}</font></b>"]
+    if direccion:
+        lineas.append(f"<font size=9>{direccion}</font>")
+    if telefono:
+        lineas.append(f"<font size=9>Tel. {telefono}</font>")
+    lineas.append(f"<font size=9>RNC {rnc}</font>")
+    return "<br/>".join(lineas)
+
+
 def _xml(texto) -> str:
     from xml.sax.saxutils import escape
 
@@ -528,11 +539,8 @@ def build_cuadre_caja_pdf(datos: dict, empresa: dict) -> bytes:
         contado = _rd(datos.get("contado"))
         diferencia_txt = _rd(diferencia)
 
-    nombre = _xml(empresa.get("nombre") or "Empresa")
-    direccion = _xml(empresa.get("direccion") or "").replace("\n", "<br/>")
-    rnc = _xml(empresa.get("rnc") or "—")
     titulo = "CUADRE DE CAJA" if cerrado else "PRE-CUADRE DE CAJA"
-    hdr = f"<b><font size=14>{nombre}</font></b><br/><font size=9>{direccion}</font><br/><font size=9>RNC {rnc}</font>"
+    hdr = _cabecera_empresa(empresa)
     meta = (
         f"<b>{titulo}</b><br/>"
         f"Cuadre nº {datos.get('id')}<br/>"

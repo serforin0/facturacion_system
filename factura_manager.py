@@ -677,59 +677,31 @@ class FacturaManager:
             font=("Arial", 13, "bold"),
             text_color="#fde68a",
         )
-        ctk.CTkLabel(pago, text="Otro", font=("Arial", 11)).grid(
-            row=5, column=0, sticky="w", padx=8, pady=2
-        )
-        extras = [
-            (c, n, int(a or 0))
-            for c, n, a, _act in self.db.listar_metodos_pago()
-            if c not in ("efectivo", "tarjeta", "transferencia")
-        ]
-        self._extras_pago = {n: (c, af) for c, n, af in extras}
-        nombres_extra = ["—"] + list(self._extras_pago)
-        self.combo_pago_otro = ctk.CTkComboBox(
-            pago,
-            values=nombres_extra,
-            width=120,
-            command=lambda _v: self._elegir_metodo_extra(),
-        )
-        self.combo_pago_otro.set("—")
-        self.combo_pago_otro.grid(row=5, column=1, sticky="ew", padx=(8, 2), pady=2)
-        self.entry_pago_otro = ctk.CTkEntry(pago, height=28, width=80)
-        self.entry_pago_otro.grid(row=5, column=2, sticky="ew", padx=(2, 8), pady=2)
-        self.entry_pago_otro.bind("<KeyRelease>", self._on_pago_manual)
         ctk.CTkCheckBox(
             pago,
             text="10% de ley",
             variable=self.var_propina,
             command=self._recalcular_totales_y_refrescar,
             font=("Arial", 11),
-        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=2)
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=2)
         ctk.CTkLabel(pago, text="Autorización", font=("Arial", 11)).grid(
-            row=7, column=0, sticky="w", padx=8, pady=2
+            row=6, column=0, sticky="w", padx=8, pady=2
         )
         self.entry_auth = ctk.CTkEntry(pago, height=28, placeholder_text="La del voucher")
-        self.entry_auth.grid(row=7, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
+        self.entry_auth.grid(row=6, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
         ctk.CTkLabel(pago, text="Saldo a favor", font=("Arial", 11)).grid(
-            row=8, column=0, sticky="w", padx=8, pady=2
+            row=7, column=0, sticky="w", padx=8, pady=2
         )
         self.entry_pago_saldo = ctk.CTkEntry(pago, height=28)
-        self.entry_pago_saldo.grid(row=8, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
+        self.entry_pago_saldo.grid(row=7, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
         self.entry_pago_saldo.insert(0, "0.00")
         self.entry_pago_saldo.bind("<KeyRelease>", self._on_pago_manual)
-        ctk.CTkCheckBox(
-            pago,
-            text="Usar puntos",
-            variable=self.var_puntos,
-            command=self._recalcular_totales_y_refrescar,
-            font=("Arial", 11),
-        ).grid(row=9, column=0, sticky="w", padx=8, pady=2)
         self.lbl_cliente_saldo = ctk.CTkLabel(
             pago, text="", font=("Arial", 11), anchor="w", text_color="#94a3b8"
         )
-        self.lbl_cliente_saldo.grid(row=9, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+        self.lbl_cliente_saldo.grid(row=8, column=0, columnspan=3, sticky="w", padx=8, pady=2)
         self.lbl_cambio_panel.grid(
-            row=10, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6)
+            row=9, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6)
         )
 
         espera_row = ctk.CTkFrame(right_frame, fg_color="transparent")

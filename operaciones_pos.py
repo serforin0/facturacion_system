@@ -275,6 +275,8 @@ class MetodosPagoFrame(ctk.CTkFrame):
         for i in self.tree.get_children():
             self.tree.delete(i)
         for cod, nom, caja, activo in self.db.listar_metodos_pago(solo_activos=False):
+            if cod not in ("efectivo", "tarjeta", "transferencia"):
+                continue
             self.tree.insert(
                 "",
                 "end",
@@ -288,7 +290,11 @@ class MetodosPagoFrame(ctk.CTkFrame):
         if len(cod) < 2 or len(nom) < 2:
             messagebox.showwarning("Método", "Código y nombre son obligatorios.", parent=self)
             return
-        self.db.guardar_metodo_pago(cod, nom, self.var_caja.get(), True)
+        try:
+            self.db.guardar_metodo_pago(cod, nom, self.var_caja.get(), True)
+        except ValueError as exc:
+            messagebox.showwarning("Método", str(exc), parent=self)
+            return
         self._cargar()
 
     def _toggle(self):
