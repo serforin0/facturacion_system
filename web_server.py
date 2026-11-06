@@ -5507,7 +5507,9 @@ HTML = """<!DOCTYPE html>
   .topbar { height:64px; flex-shrink:0; display:flex; align-items:center; gap:14px; padding:0 22px; border-bottom:1px solid var(--rule); position:sticky; top:0; z-index:20; background:var(--ground); }
   .rotulo { margin:0; display:inline-flex; align-items:center; height:40px; padding:0 16px; border-radius:var(--radius-inner); background:var(--g); color:var(--g-ink); font-size:19px; font-weight:800; font-stretch:125%; text-transform:uppercase; line-height:1; white-space:nowrap; transition: background-color 200ms ease, color 200ms ease; }
   .topbar-der { margin-left:auto; display:flex; align-items:center; gap:12px; min-width:0; }
-  #top { color:var(--muted); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #top { color:var(--muted); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  #top .estado-corto { display:none; }
+  .tema-barra, .salir-barra { white-space:nowrap; flex:none; }
   #top .estado { display:inline-flex; align-items:center; gap:6px; }
   #top .estado::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--faint); }
   #top .estado.abierta::before { background:var(--positive); }
@@ -5810,7 +5812,11 @@ HTML = """<!DOCTYPE html>
     .barra-ticket button { background:var(--r-venta-ink); color:var(--r-venta); height:44px; }
     body.con-barra .work { padding-bottom:88px; }
     #btnMenu { display:inline-flex; align-items:center; }
+    .tema-barra, .salir-barra { display:none; }
+    #top .quien, #top .estado:not(.estado-corto) { display:none; }
+    #top .estado-corto { display:inline-flex; }
     .salir-menu { display:block; margin:12px 10px 0; width:calc(100% - 20px); }
+    .topbar-der { flex:1; }
     .side { position:fixed; inset:0 auto 0 0; z-index:40; width:min(300px, 86vw); max-height:none; transform: translateX(-100%); transition: transform 300ms var(--ease-drawer), visibility 0s linear 300ms; visibility:hidden; box-shadow:0 0 48px rgba(0,0,0,.5); /* taste-skill-ignore: hoja de menú flotante */ }
     body.menu-abierto .side { transform:none; visibility:visible; transition: transform 340ms var(--ease-drawer); }
     .velo { position:fixed; inset:0; z-index:35; background:rgba(5,5,4,.6); opacity:0; visibility:hidden; pointer-events:none; transition: opacity 200ms ease, visibility 0s linear 200ms; }
@@ -6257,7 +6263,8 @@ async function refrescar(){
   const turno = e.caja
     ? esc(e.caja.nombre) + " · " + esc(e.caja.usuario || e.usuario) + " · " + esc(String(e.caja.apertura || "").slice(0, 16)) + " · caja chica " + money(e.caja.fondo)
     : "Caja cerrada";
-  document.getElementById("top").innerHTML = `<span class="quien">${esc(e.usuario)} · ${esc(e.rol)} · </span><span class="estado${e.caja ? " abierta" : ""}">${turno}</span>`;
+  const corto = e.caja ? esc(e.caja.nombre) + " abierta" : "Caja cerrada";
+  document.getElementById("top").innerHTML = `<span class="quien">${esc(e.usuario)} · ${esc(e.rol)} · </span><span class="estado${e.caja ? " abierta" : ""}">${turno}</span><span class="estado estado-corto${e.caja ? " abierta" : ""}">${corto}</span>`;
   aplicarPermisos(e.permisos);
   window._empresa = e.empresa || {};
   aplicarLogo(window._empresa.logo || "");
