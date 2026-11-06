@@ -1,0 +1,4 @@
+# Entorno para correr la suite. El ejecutable sigue saliendo solo de requirements.txt.
+-r requirements.txt
+pytest>=8
+httpx>=0.27

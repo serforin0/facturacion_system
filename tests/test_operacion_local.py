@@ -1,4 +1,8 @@
+import pytest
+
 from operacion_local import (
+    asiento_simple,
+    asiento_venta,
     autorizacion_ok,
     aviso_stock,
     limpiar_nota,
@@ -41,8 +45,19 @@ def test_puntos_y_rebaja():
     assert rebaja_puntos(10, 40) == (10, 10.0)
 
 
+def test_el_asiento_simple_cuadra_y_rechaza_cero():
+    assert asiento_simple("1.1", "4.1", 10) == [("1.1", 10.0, 0), ("4.1", 0, 10.0)]
+    with pytest.raises(ValueError):
+        asiento_simple("1.1", "4.1", 0)
+
+
+def test_un_asiento_de_venta_descuadrado_no_pasa():
+    with pytest.raises(ValueError):
+        asiento_venta(caja=10, banco=0, saldo=0, fiado=0, ventas=100, itbis=0, propina=0)
+
+
 def test_el_extra_suma_al_precio_y_el_asiento_cuadra():
-    from operacion_local import asiento_venta, precio_con_extras
+    from operacion_local import precio_con_extras
 
     precio, texto = precio_con_extras(100, [{"nombre": "Extra queso", "precio": 40}])
     assert precio == 140

@@ -9,3 +9,5 @@ uvicorn
 lxml>=5.0
 cryptography>=42
 qrcode>=7.4
+
+# Pruebas (no entran al ejecutable): pip install -r requirements-dev.txt

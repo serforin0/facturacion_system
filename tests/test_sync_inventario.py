@@ -119,6 +119,15 @@ def test_agrega_sin_borrar_y_no_descuenta_el_historial(tmp_path):
     ce.close()
 
 
+def test_las_diferencias_ignoran_lo_que_ya_cuadra_y_lo_que_solo_esta_en_un_lado():
+    cruce = diferencias(
+        {"A": 5, "B": 2, "C": 1},
+        {"A": 5, "B": 4},
+        {"B": "Ron"},
+    )
+    assert cruce == [{"codigo": "B", "nombre": "Ron", "escritorio": 2.0, "web": 4.0}]
+
+
 if __name__ == "__main__":
     import tempfile
     from pathlib import Path

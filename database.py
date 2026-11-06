@@ -2,7 +2,7 @@ import sqlite3
 import os
 from datetime import datetime
 
-from app_paths import is_frozen, data_directory
+from app_paths import data_directory
 from operacion_local import asiento_simple
 
 
@@ -21,10 +21,12 @@ def _tipo_codigo_default(tipo_movimiento: str) -> str:
 
 class Database:
     def __init__(self, db_name="bar_inventory.db"):
-        if is_frozen():
-            self.db_name = os.path.join(data_directory(), db_name)
-        else:
+        # Una ruta relativa siempre cae junto a la app. Si dependiera de la
+        # carpeta actual, arrancar el servidor desde otro sitio crearía una base vacía.
+        if os.path.isabs(db_name):
             self.db_name = db_name
+        else:
+            self.db_name = os.path.join(data_directory(), db_name)
         self.init_database()
     
     def get_connection(self):

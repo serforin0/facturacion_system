@@ -5699,6 +5699,7 @@ HTML = """<!DOCTYPE html>
   #usuMods input[type="checkbox"] { width:16px; height:16px; min-width:16px; max-width:16px; margin:0; padding:0; flex:0 0 16px; accent-color:var(--g, var(--r-admin)); }
   .form > button { width:auto; justify-self:start; min-width:140px; }
   .tabla-marco { max-width:100%; overflow-x:auto; }
+  .oculto-visual { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
   table { width:100%; border-collapse:collapse; margin-top:16px; }
   th, td { text-align:left; padding:11px 8px; border-bottom:1px solid var(--rule); vertical-align:top; }
   th { color:var(--faint); font-weight:500; font-size:12px; border-bottom-color:var(--control); }
@@ -6079,9 +6080,16 @@ function cerrarModal(){
 }
 const reducido = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 function animar(el, frames, opciones){
-  if (!el || !el.animate) return null;
-  if (reducido()) frames = frames.map(f => ({opacity: f.opacity === undefined ? 1 : f.opacity}));
-  return el.animate(frames, Object.assign({easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "backwards"}, opciones));
+  if (!el || !el.animate || reducido()) return null;
+  // Sin opacidad: un fill "backwards" dejaba botones y tablas en opacity 0
+  // durante el retraso, invisibles y fuera del lector de pantalla.
+  const visibles = frames.map(f => {
+    const g = Object.assign({}, f);
+    delete g.opacity;
+    return g;
+  }).filter(f => Object.keys(f).length);
+  if (visibles.length < 2) return null;
+  return el.animate(visibles, Object.assign({easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "backwards"}, opciones));
 }
 function aviso(texto, tipo){
   if (!texto) return;
@@ -6832,7 +6840,7 @@ function tabla(headers, filas, vacio){
   const vacia = c => c === undefined || c === null || String(c).trim() === "" || String(c).trim() === "—";
   const numerica = headers.map((_, j) => filas.some(f => esNum(f[j])) && filas.every(f => vacia(f[j]) || esNum(f[j])));
   const cl = j => numerica[j] ? ' class="num"' : "";
-  return `<div class="tabla-marco"><table><thead><tr>${headers.map((h, j)=>`<th${cl(j)}>${h}</th>`).join("")}</tr></thead><tbody>${
+  return `<div class="tabla-marco"><table><thead><tr>${headers.map((h, j)=>`<th scope="col"${cl(j)}>${h}</th>`).join("")}</tr></thead><tbody>${
     filas.map(f=>`<tr>${f.map((c, j)=>`<td${cl(j)}>${c}</td>`).join("")}</tr>`).join("")
   }</tbody></table></div>`;
 }
@@ -7814,7 +7822,7 @@ async function cargarHistorial(){
     url += "&desde=" + encodeURIComponent(histDesde.value) + "&hasta=" + encodeURIComponent(histHasta.value);
   }
   const d = await api(url);
-  histTabla.innerHTML = tabla(["Número","Fecha","Cliente","Total","Estado","Usuario",""], d.items.map(f => {
+  histTabla.innerHTML = tabla(["Número","Fecha","Cliente","Total","Estado","Usuario", '<span class="oculto-visual">Acciones</span>'], d.items.map(f => {
     const acciones = `<div class="acciones"><button class="sec" onclick="verDocumento(${f.id})">Ver</button><button class="sec" onclick="reimprimirFactura(${f.id})">Imprimir</button><details class="mas"><summary aria-label="Más acciones">Más</summary><div class="menu"><button type="button" onclick="bajarFactura(${f.id})">Descargar PDF</button><button type="button" onclick="enviarFactura(${f.id}, '${String(f.email||"").replaceAll("'","")}')">Enviar por correo</button><button type="button" onclick="repetirFactura(${f.id})">Repetir venta</button>` +
       (f.estado==="emitida" ? `<button type="button" onclick="irDevolver('${String(f.numero).replaceAll("'","")}')">Devolver</button><button type="button" class="peligro" onclick="pedirAnulacion(${f.id}, '${String(f.numero).replaceAll("'","")}')">Anular factura</button>` : "") + "</div></details></div>";
     const fecha = String(f.fecha||"");
@@ -9898,9 +9906,14 @@ function pintarGrid(){
   }).join("") || "<p class='nota'>No hay productos en esta categoría.</p>";
 }
 function animarLinea(el, frames, ms){
-  if (!el || !el.animate) return;
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  el.animate(frames, {duration: ms, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "backwards"});
+  if (!el || !el.animate || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const visibles = frames.map(f => {
+    const g = Object.assign({}, f);
+    delete g.opacity;
+    return g;
+  }).filter(f => Object.keys(f).length);
+  if (visibles.length < 2) return;
+  el.animate(visibles, {duration: ms, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "backwards"});
 }
 function sumar(id, combo, delta){
   if (!mesa.value.trim()) { preguntarMesa(); return; }
