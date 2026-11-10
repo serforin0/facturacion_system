@@ -6213,20 +6213,70 @@ function campoDeTexto(el){
   const t = (el.type || "text").toLowerCase();
   return t === "text" || t === "search" || t === "number" || t === "email" || t === "tel" || t === "password";
 }
-document.addEventListener("keydown", function(ev){
+let lectorProd = { buf: "", t: 0, propio: false, campo: null };
+function resetLectorProd(){ lectorProd = { buf: "", t: 0, propio: false, campo: null }; }
+function lecturaEnProducto(ev){
   const cod = document.getElementById("invCod");
-  if (!cod || !modal.classList.contains("on")) return;
-  if (ev.key === "Enter" && ev.target === cod) {
-    ev.preventDefault();
-    ev.stopPropagation();
+  if (!cod || !modal.classList.contains("on")) { resetLectorProd(); return; }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return;
+  const ahora = performance.now();
+  if (ev.key === "Enter" || ev.key === "Tab") {
+    const codigo = lectorProd.buf;
+    const rapido = codigo.length >= 4 && (ahora - lectorProd.t) < 120;
+    const propio = lectorProd.propio;
+    const campo = lectorProd.campo;
+    const enCodigo = ev.target === cod;
+    resetLectorProd();
+    if (enCodigo || rapido || propio) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (rapido && campo && campo !== cod && campoDeTexto(campo)) {
+        const valor = campo.value || "";
+        if (valor.endsWith(codigo)) {
+          campo.value = valor.slice(0, -codigo.length);
+          campo.dispatchEvent(new Event("input", {bubbles: true}));
+        }
+      }
+      if (rapido) cod.value = codigo;
+      cod.focus();
+    }
     return;
   }
-  if (campoDeTexto(ev.target)) return;
-  if (ev.key.length !== 1 || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (ev.key.length !== 1) { resetLectorProd(); return; }
+  const sigue = lectorProd.buf && (ahora - lectorProd.t) <= 45;
+  if (!sigue) { lectorProd.buf = ""; lectorProd.propio = false; lectorProd.campo = ev.target; }
+  lectorProd.buf += ev.key;
+  lectorProd.t = ahora;
+  if (!lectorProd.campo) lectorProd.campo = ev.target;
+  if (ev.target === cod) {
+    if (sigue && lectorProd.buf.length >= 4) {
+      ev.preventDefault();
+      lectorProd.propio = true;
+      cod.value = lectorProd.buf;
+    }
+    return;
+  }
+  const escribe = campoDeTexto(ev.target) && !lectorProd.propio;
+  if (escribe) {
+    if (lectorProd.buf.length < 6) return;
+    ev.preventDefault();
+    const puesto = lectorProd.buf.slice(0, -1);
+    const valor = ev.target.value || "";
+    if (puesto && valor.endsWith(puesto)) {
+      ev.target.value = valor.slice(0, -puesto.length);
+      ev.target.dispatchEvent(new Event("input", {bubbles: true}));
+    }
+    lectorProd.propio = true;
+    cod.value = lectorProd.buf;
+    cod.focus();
+    return;
+  }
   ev.preventDefault();
+  lectorProd.propio = true;
   cod.focus();
-  cod.value += ev.key;
-}, true);
+  cod.value = lectorProd.buf;
+}
+document.addEventListener("keydown", lecturaEnProducto, true);
 let lector = { buf: "", t: 0, propio: false };
 function resetLector(){ lector = { buf: "", t: 0, propio: false }; }
 function enfocarBusqueda(){
@@ -7736,13 +7786,18 @@ function formProducto(){
       <p class="hint">JPG, PNG o WEBP. Se reduce sola para que cargue rápido en el mostrador.</p>
     </div>
   </div>
-  <div class="form"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invOriginal" type="number" step="0.01"/></label><label>Precio mínimo de venta<input id="invPrecio" type="number" step="0.01" oninput="recalcularPreciosMayor()"/></label><label>Al ${x.p2}%<input id="invP2" type="number" step="0.01"/></label><label>Al ${x.p3}%<input id="invP3" type="number" step="0.01"/></label><label>Al ${x.p4}%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código de barras<input id="invCod" autocomplete="off" spellcheck="false" placeholder="Escanea o escribe"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div>`;
+  <div class="form"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invOriginal" type="number" step="0.01"/></label><label>Precio mínimo de venta<input id="invPrecio" type="number" step="0.01" oninput="recalcularPreciosMayor()"/></label><label>Al ${x.p2}%<input id="invP2" type="number" step="0.01"/></label><label>Al ${x.p3}%<input id="invP3" type="number" step="0.01"/></label><label>Al ${x.p4}%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código de barras<input id="invCod" autocomplete="off" spellcheck="false" placeholder="Escanea o escribe"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" type="button" onclick="guardarProducto()">Crear producto</button></div>`;
 }
 function nuevoProducto(){
   window._prodId = null;
   window._foto = {nueva: null, quitar: false, actual: ""};
   abrirModal("Crear producto", formProducto());
-  setTimeout(() => { const c = document.getElementById("invCod"); if (c && !window._prodId) c.focus(); }, 40);
+  const enfocarCodigo = () => {
+    const c = document.getElementById("invCod");
+    if (c && !window._prodId) c.focus();
+  };
+  enfocarCodigo();
+  setTimeout(enfocarCodigo, 40);
 }
 function pintarFotoProducto(){
   const f = window._foto || {};
