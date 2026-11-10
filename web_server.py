@@ -373,7 +373,8 @@ SQL_PRODUCTOS = """
            IFNULL(precio_2, 0), IFNULL(precio_3, 0), IFNULL(precio_4, 0),
            IFNULL(facturar_nivel_precio, 1),
            categoria_id,
-           IFNULL(stock_minimo, 0)
+           IFNULL(stock_minimo, 0),
+           IFNULL(codigo_producto, '')
     FROM productos
 """
 
@@ -859,13 +860,28 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
     categorias = [{"id": i, "nombre": n} for i, n in cur.fetchall()]
     sql = SQL_PRODUCTOS + " WHERE IFNULL(activo,1)=1"
     params: list = []
-    if categoria:
+    texto = q.strip()
+    if categoria and not texto:
         sql += " AND categoria_id=?"
         params.append(categoria)
-    if q.strip():
-        sql += " AND (nombre LIKE ? OR IFNULL(codigo_barras,'') LIKE ?)"
-        params.extend([f"%{q.strip()}%", f"%{q.strip()}%"])
-    sql += " ORDER BY nombre COLLATE NOCASE LIMIT 400"
+    elif categoria and texto:
+        # Un código exacto se factura aunque el filtro de categoría sea otro.
+        sql += """ AND (
+            categoria_id=?
+            OR LOWER(TRIM(IFNULL(codigo_barras,''))) = LOWER(?)
+            OR LOWER(TRIM(IFNULL(codigo_producto,''))) = LOWER(?)
+        )"""
+        params.extend([categoria, texto, texto])
+    if texto:
+        sql += " AND (nombre LIKE ? OR IFNULL(codigo_barras,'') LIKE ? OR IFNULL(codigo_producto,'') LIKE ?)"
+        params.extend([f"%{texto}%", f"%{texto}%", f"%{texto}%"])
+        sql += """ ORDER BY CASE
+            WHEN LOWER(TRIM(IFNULL(codigo_barras,''))) = LOWER(?)
+              OR LOWER(TRIM(IFNULL(codigo_producto,''))) = LOWER(?) THEN 0
+            ELSE 1 END, nombre COLLATE NOCASE LIMIT 400"""
+        params.extend([texto, texto])
+    else:
+        sql += " ORDER BY nombre COLLATE NOCASE LIMIT 400"
     cur.execute(sql, params)
     filas_producto = cur.fetchall()
 
@@ -893,7 +909,8 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
                 "precio_3": _nivel(base_precio, row[13], d3),
                 "precio_4": _nivel(base_precio, row[14], d4),
                 "stock": row[5],
-                "codigo": row[6] or "",
+                "codigo": (row[6] or "").strip(),
+                "codigo_producto": (row[18] or "").strip(),
                 "itbis": bool(int(row[8] or 1)),
                 "imagen": _imagen_de(row[1], row[7]),
                 "minimo": float(row[17] or 0),
@@ -6189,6 +6206,97 @@ function okModal(texto){
   if (document.getElementById("formMsg")) { formMsg.style.color = "var(--ok)"; formMsg.textContent = texto; }
 }
 document.addEventListener("keydown", function(ev){ if(ev.key==="Escape") cerrarModal(); });
+function campoDeTexto(el){
+  if (!el) return false;
+  if (el.tagName === "TEXTAREA") return true;
+  if (el.tagName !== "INPUT") return false;
+  const t = (el.type || "text").toLowerCase();
+  return t === "text" || t === "search" || t === "number" || t === "email" || t === "tel" || t === "password";
+}
+document.addEventListener("keydown", function(ev){
+  const cod = document.getElementById("invCod");
+  if (!cod || !modal.classList.contains("on")) return;
+  if (ev.key === "Enter" && ev.target === cod) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    return;
+  }
+  if (campoDeTexto(ev.target)) return;
+  if (ev.key.length !== 1 || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  ev.preventDefault();
+  cod.focus();
+  cod.value += ev.key;
+}, true);
+let lector = { buf: "", t: 0, propio: false };
+function resetLector(){ lector = { buf: "", t: 0, propio: false }; }
+function enfocarBusqueda(){
+  const venta = document.getElementById("view-venta");
+  const caja = document.getElementById("q");
+  if (!caja || !venta || venta.style.display === "none" || modal.classList.contains("on")) return;
+  const activo = document.activeElement;
+  if (activo && activo !== document.body && (campoDeTexto(activo) || activo.tagName === "SELECT")) return;
+  caja.focus();
+}
+function lecturaDeLector(ev){
+  const venta = document.getElementById("view-venta");
+  if (!venta || venta.style.display === "none" || modal.classList.contains("on")) { resetLector(); return; }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return;
+  const caja = document.getElementById("q");
+  if (!caja) return;
+  const ahora = performance.now();
+  if (ev.key === "Enter" || ev.key === "Tab") {
+    const codigo = lector.buf;
+    const rapido = codigo.length >= 4 && (ahora - lector.t) < 120;
+    const propio = lector.propio;
+    const veniaDeBusqueda = ev.target === caja;
+    resetLector();
+    if (!rapido || (veniaDeBusqueda && !propio)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    caja.value = codigo;
+    clearTimeout(window._qT);
+    cargar();
+    caja.focus();
+    return;
+  }
+  if (ev.key.length !== 1) { resetLector(); return; }
+  const sigue = lector.buf && (ahora - lector.t) <= 45;
+  if (!sigue) { lector.buf = ""; lector.propio = false; }
+  lector.buf += ev.key;
+  lector.t = ahora;
+  const escribe = ev.target !== caja && campoDeTexto(ev.target) && !lector.propio;
+  if (escribe) {
+    if (lector.buf.length < 6) return;
+    ev.preventDefault();
+    const puesto = lector.buf.slice(0, -1);
+    const valor = ev.target.value || "";
+    if (puesto && valor.endsWith(puesto)) {
+      ev.target.value = valor.slice(0, -puesto.length);
+      ev.target.dispatchEvent(new Event("input", {bubbles: true}));
+    }
+    lector.propio = true;
+    caja.value = lector.buf;
+    caja.focus();
+    return;
+  }
+  const suelto = ev.target !== caja && !campoDeTexto(ev.target);
+  if (lector.propio || (suelto && lector.buf.length >= 4) || (ev.target === caja && sigue && lector.buf.length >= 4)) {
+    ev.preventDefault();
+    lector.propio = true;
+    caja.focus();
+    caja.value = lector.buf;
+    return;
+  }
+  if (suelto) {
+    ev.preventDefault();
+    caja.focus();
+    const inicio = caja.selectionStart == null ? caja.value.length : caja.selectionStart;
+    const fin = caja.selectionEnd == null ? caja.value.length : caja.selectionEnd;
+    caja.setRangeText(ev.key, inicio, fin, "end");
+    caja.dispatchEvent(new Event("input", {bubbles: true}));
+  }
+}
+document.addEventListener("keydown", lecturaDeLector, true);
 async function api(url, opt){
   const r = await fetch(url, Object.assign({headers:{"Content-Type":"application/json"}}, opt||{}));
   const data = await r.json().catch(()=>({}));
@@ -6205,6 +6313,7 @@ async function entrar(){
     if (s.rol === "mesero") { location.href = "/tablet"; return; }
     login.style.display="none"; app.style.display="block";
     await refrescar(); await cargar();
+    enfocarBusqueda();
   } catch(e){ loginMsg.textContent = e.message; }
 }
 async function sesionInicial(){
@@ -6223,6 +6332,7 @@ async function sesionInicial(){
   try {
     await refrescar();
     await cargar();
+    enfocarBusqueda();
   } catch(e) {}
   sincronizarVentas();
 }
@@ -6505,13 +6615,17 @@ async function cargar(){
   if (data.descuentos) etiquetasLista(data.descuentos);
   cat.innerHTML = '<option value="">Todas</option>' + data.categorias.map(c=>`<option value="${c.id}">${c.nombre}</option>`).join("");
   if (window._cat) cat.value = window._cat;
-  const qv = q.value.trim().toLowerCase();
+  const escrito = q.value.trim();
+  const qv = escrito.toLowerCase();
   if (!navigator.onLine && qv) {
     data.productos = data.productos.filter(p => String(p.nombre).toLowerCase().includes(qv) || String(p.codigo || "").toLowerCase().includes(qv));
     data.combos = (data.combos || []).filter(c => String(c.nombre).toLowerCase().includes(qv));
   }
   const tarjetas = data.productos.concat(data.combos || []);
-  const exacto = data.productos.find(p => (p.codigo || "").toLowerCase() === qv && qv);
+  const exacto = data.productos.find(p => {
+    const codes = [p.codigo, p.codigo_producto].map(s => String(s || "").trim().toLowerCase());
+    return qv && codes.includes(qv);
+  });
   grid.innerHTML = tarjetas.map(p=>{
     const nivel = Number(lista.value);
     const precio = p.combo ? p.precio : ([p.precio, p.precio_2, p.precio_3, p.precio_4][nivel-1] || p.precio);
@@ -6533,8 +6647,10 @@ async function cargar(){
     const precio = [exacto.precio, exacto.precio_2, exacto.precio_3, exacto.precio_4][nivel-1] || exacto.precio;
     q.value = "";
     add(exacto, precio);
+    if (window._caja) aviso(exacto.nombre + " agregado.", "ok");
     return cargar();
   }
+  if (/^\\d{4,}$/.test(escrito)) aviso("No hay producto con el código " + escrito + ".", "error");
 }
 cat.onchange = ()=>{ window._cat = cat.value; window._animarGrid = true; cargar(); };
 lista.onchange = cargar;
@@ -6684,6 +6800,7 @@ function add(p, precio){
   }
   window._lineaTocada = {indice: cart.indexOf(hit || cart[cart.length - 1]), nueva: !hit};
   pintar();
+  enfocarBusqueda();
 }
 function pagosActuales(){
   return [...document.querySelectorAll(".pago")].map(el => ({
@@ -6877,7 +6994,7 @@ async function ver(nombre){
     formHint.textContent = "";
     formBody.innerHTML = "<div class='esqueleto' aria-label='Cargando'><span></span><span></span><span></span><span></span></div>";
     await pintarForm(nombre);
-  }
+  } else enfocarBusqueda();
 }
 function pintarRotulo(boton){
   const r = document.getElementById("rotulo");
@@ -7619,12 +7736,13 @@ function formProducto(){
       <p class="hint">JPG, PNG o WEBP. Se reduce sola para que cargue rápido en el mostrador.</p>
     </div>
   </div>
-  <div class="form"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invOriginal" type="number" step="0.01"/></label><label>Precio mínimo de venta<input id="invPrecio" type="number" step="0.01" oninput="recalcularPreciosMayor()"/></label><label>Al ${x.p2}%<input id="invP2" type="number" step="0.01"/></label><label>Al ${x.p3}%<input id="invP3" type="number" step="0.01"/></label><label>Al ${x.p4}%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código<input id="invCod"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div>`;
+  <div class="form"><label>Nombre<input id="invNom"/></label><label>Precio original<input id="invOriginal" type="number" step="0.01"/></label><label>Precio mínimo de venta<input id="invPrecio" type="number" step="0.01" oninput="recalcularPreciosMayor()"/></label><label>Al ${x.p2}%<input id="invP2" type="number" step="0.01"/></label><label>Al ${x.p3}%<input id="invP3" type="number" step="0.01"/></label><label>Al ${x.p4}%<input id="invP4" type="number" step="0.01"/></label><label>Stock<input id="invStock" type="number" step="0.01" value="0"/></label><label>Código de barras<input id="invCod" autocomplete="off" spellcheck="false" placeholder="Escanea o escribe"/></label><label>Bodega<input id="invBod" value="Principal"/></label><label>Categoría<input id="invCat"/></label><button id="btnProd" onclick="guardarProducto()">Crear producto</button></div>`;
 }
 function nuevoProducto(){
   window._prodId = null;
   window._foto = {nueva: null, quitar: false, actual: ""};
   abrirModal("Crear producto", formProducto());
+  setTimeout(() => { const c = document.getElementById("invCod"); if (c && !window._prodId) c.focus(); }, 40);
 }
 function pintarFotoProducto(){
   const f = window._foto || {};

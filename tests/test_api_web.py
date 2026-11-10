@@ -47,6 +47,9 @@ def test_las_paginas_del_mostrador_responden(api):
     assert "delete g.opacity" in html
     assert 'scope="col"' in html
     assert "oculto-visual\">Acciones" in html
+    assert 'id="invCod"' in html
+    assert "Escanea o escribe" in html
+    assert "function lecturaDeLector" in html
 
 
 def test_sin_sesion_no_hay_estado_ni_venta(api):
@@ -68,6 +71,12 @@ def test_el_admin_abre_caja_vende_y_el_historial_lo_ve(api):
     catalogo = api.get("/api/catalogo", params={"q": "Agua de prueba"})
     assert catalogo.status_code == 200
     assert any(p["id"] == pid for p in catalogo.json()["productos"])
+
+    pid_barra = _producto(api, codigo="7501234567890", precio=50, stock=3)
+    por_codigo = api.get("/api/catalogo", params={"q": "7501234567890", "categoria": 99999})
+    assert por_codigo.status_code == 200
+    barras = por_codigo.json()["productos"]
+    assert any(p["id"] == pid_barra and p["codigo"] == "7501234567890" for p in barras)
 
     vacia = api.post("/api/vender", json={"items": [{"id": pid, "cantidad": 1}], "efectivo": 118})
     assert vacia.status_code == 400
