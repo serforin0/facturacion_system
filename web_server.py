@@ -3907,6 +3907,12 @@ class SyncLineaIn(BaseModel):
     total: float = 0
 
 
+class SyncPagoIn(BaseModel):
+    tipo: str = "efectivo"
+    monto: float = 0
+    referencia: str = ""
+
+
 class SyncVentaIn(BaseModel):
     numero: str
     fecha: str = ""
@@ -3915,6 +3921,8 @@ class SyncVentaIn(BaseModel):
     total: float = 0
     usuario: str = ""
     lineas: list[SyncLineaIn] = []
+    pagos: list[SyncPagoIn] = []
+    en_vivo: bool = False
 
 
 class SyncProductoIn(BaseModel):
@@ -3940,6 +3948,7 @@ class SyncIn(BaseModel):
     codigos: list[str] = []
     numeros: list[str] = []
     stocks: list[SyncStockIn] = []
+    solo: bool = False
 
 
 @app.post("/api/sync/inventario")
@@ -3987,6 +3996,24 @@ def guardar_precios_mayor(request: Request, body: DescuentosMayorIn):
     conn.commit()
     conn.close()
     return {"ok": True, "p2": d2, "p3": d3, "p4": d4, "productos": cambiados}
+
+
+@app.post("/api/sync/venta")
+def sync_venta_viva(request: Request, body: SyncIn):
+    """Una factura del escritorio: baja el inventario y entra al cuadre abierto."""
+    usuario = _exigir_alguno(request, ("inventario", "mostrador", "mostrador:venta"))
+    from sincronizar_inventario import responder
+
+    datos = body.model_dump()
+    for venta in datos.get("ventas") or []:
+        venta["en_vivo"] = True
+    datos["solo"] = True
+    base = db()
+    conn = base.get_connection()
+    try:
+        return responder(conn, str(Path(__file__).resolve().parent), datos, usuario)
+    finally:
+        conn.close()
 
 
 @app.post("/api/etiquetas")
@@ -6783,6 +6810,15 @@ function descartarVenta(id){
 window.addEventListener("online", () => { pintarBarraRed(); sincronizarVentas(); });
 window.addEventListener("offline", pintarBarraRed);
 setInterval(() => { if (navigator.onLine) sincronizarVentas(); }, 30000);
+setInterval(() => {
+  const vista = window._vistaActual;
+  if (vista !== "inventario" && vista !== "caja" && vista !== "cerrar") return;
+  if (window._prodId || window._turnoId || window._cierreEdit) return;
+  const activo = document.activeElement;
+  if (activo && (activo.tagName === "INPUT" || activo.tagName === "TEXTAREA" || activo.tagName === "SELECT")) return;
+  if (vista === "inventario") cargarInventario();
+  else cargarPanelCaja(vista);
+}, 8000);
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 async function cargarTerminalesVenta(){
   try {

@@ -4024,6 +4024,12 @@ class FacturaManager:
             conn.commit()
             conn.close()
 
+            try:
+                from sincronizar_inventario import publicar_en_segundo_plano
+                publicar_en_segundo_plano(self.db, numero)
+            except Exception:
+                pass
+
             ecf_aviso = None
             if encf:
                 try:

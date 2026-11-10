@@ -241,3 +241,41 @@ def test_la_venta_al_por_mayor_baja_el_stock_del_almacen(api):
     assert item["cliente"] == "Colmado Pérez"
     assert item["lineas"][0]["cantidad"] == 4
     assert item["lineas"][0]["nombre"] == "Agua de prueba"
+
+
+def test_el_empleado_publica_la_venta_y_el_cuadre_la_recibe(api):
+    _entrar(api, "empleado", "empreado07!")
+    pid = _producto(api, "SYNC-1", precio=25, stock=10)
+    resp = api.post("/api/sync/venta", json={
+        "ventas": [{
+            "numero": "F-ESC-1",
+            "fecha": "2026-11-10 11:00:00",
+            "subtotal": 50,
+            "itbis": 0,
+            "total": 50,
+            "usuario": "empleado",
+            "lineas": [{
+                "codigo": "SYNC-1",
+                "nombre": "Agua de prueba",
+                "cantidad": 2,
+                "precio": 25,
+                "total": 50,
+            }],
+            "pagos": [{"tipo": "efectivo", "monto": 50}],
+        }],
+    })
+    assert resp.status_code == 200, resp.text
+    conn = api.base.get_connection()
+    stock = conn.execute("SELECT stock FROM productos WHERE id=?", (pid,)).fetchone()[0]
+    cuadre = conn.execute(
+        """
+        SELECT SUM(p.monto)
+        FROM pagos_factura p
+        JOIN facturas f ON f.id = p.factura_id
+        JOIN cierres_caja c ON c.id = p.cierre_id
+        WHERE f.numero='F-ESC-1' AND c.fecha_cierre IS NULL
+        """
+    ).fetchone()[0]
+    conn.close()
+    assert float(stock) == 8
+    assert float(cuadre) == 50

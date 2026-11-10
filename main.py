@@ -284,6 +284,8 @@ class BarSystemApp:
         self.current_user = username
         self.current_role = role
         self._clave_sesion = password or ""
+        from sincronizar_inventario import recordar_sesion
+        recordar_sesion(username, password or "", self.db)
 
         self.root.unbind("<Return>")
         self.login_frame.destroy()

@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -126,12 +127,19 @@ def responder(conn, base_dir: str, cuerpo: dict, usuario: str) -> dict:
         fila = cur.fetchone()
         producto["imagen"] = _leer_imagen(base_dir, fila[0] if fila else "")
     ventas = [venta for venta in leer_ventas(cur) if venta["numero"] not in numeros]
+    if cuerpo.get("solo"):
+        return {"resumen": resumen, "productos": [], "ventas": []}
     return {"resumen": resumen, "productos": productos, "ventas": ventas}
 
 
-def leer_ventas(cur) -> list[dict]:
+def leer_ventas(cur, numero: str = "") -> list[dict]:
+    filtro = ""
+    params: tuple = ()
+    if (numero or "").strip():
+        filtro = " AND f.numero = ?"
+        params = ((numero or "").strip(),)
     cur.execute(
-        """
+        f"""
         SELECT f.numero, IFNULL(f.fecha,''), IFNULL(f.subtotal,0), IFNULL(f.impuesto_total,0),
                IFNULL(f.total,0), IFNULL(f.usuario,''),
                TRIM(IFNULL(NULLIF(TRIM(p.codigo_producto), ''), IFNULL(p.codigo_barras, ''))),
@@ -139,9 +147,10 @@ def leer_ventas(cur) -> list[dict]:
         FROM facturas f
         JOIN factura_detalle d ON d.factura_id = f.id
         LEFT JOIN productos p ON p.id = d.producto_id
-        WHERE f.estado = 'emitida' AND TRIM(IFNULL(f.numero,'')) != ''
+        WHERE f.estado = 'emitida' AND TRIM(IFNULL(f.numero,'')) != ''{filtro}
         ORDER BY f.fecha, f.id, d.id
-        """
+        """,
+        params,
     )
     grupos: dict[str, dict] = {}
     orden: list[str] = []
@@ -169,6 +178,25 @@ def leer_ventas(cur) -> list[dict]:
                 "total": float(linea or 0),
             }
         )
+    if orden:
+        marcas = ",".join("?" * len(orden))
+        cur.execute(
+            f"""
+            SELECT f.numero, IFNULL(p.tipo_pago,'efectivo'), IFNULL(p.monto,0), IFNULL(p.referencia,'')
+            FROM pagos_factura p
+            JOIN facturas f ON f.id = p.factura_id
+            WHERE f.numero IN ({marcas}) AND IFNULL(p.es_abono,0) = 0
+            ORDER BY p.id
+            """,
+            orden,
+        )
+        for numero_pago, tipo, monto, referencia in cur.fetchall():
+            venta = grupos.get((numero_pago or "").strip())
+            if not venta:
+                continue
+            venta.setdefault("pagos", []).append(
+                {"tipo": tipo or "efectivo", "monto": float(monto or 0), "referencia": referencia or ""}
+            )
     return [grupos[numero] for numero in orden if not _solo_demostracion(grupos[numero])]
 
 
@@ -309,10 +337,34 @@ def _venta_existe(cur, numero: str) -> bool:
     return cur.fetchone() is not None
 
 
+def _caja_abierta(cur, usuario: str) -> int:
+    cur.execute(
+        """
+        SELECT id FROM cierres_caja
+        WHERE fecha_cierre IS NULL
+        ORDER BY datetime(fecha_apertura) DESC
+        LIMIT 1
+        """
+    )
+    fila = cur.fetchone()
+    if fila:
+        return int(fila[0])
+    cur.execute(
+        """
+        INSERT INTO cierres_caja (
+            nombre_caja, fecha_apertura, usuario_apertura, monto_inicial, estado
+        ) VALUES ('Caja escritorio', ?, ?, 0, 'abierto')
+        """,
+        (_ahora(), usuario or "escritorio"),
+    )
+    return int(cur.lastrowid)
+
+
 def _aplicar_venta(cur, venta: dict, descontar: bool, recien: set[str], usuario_sync: str) -> tuple[bool, int]:
     numero = (venta.get("numero") or "").strip()
     if not numero or numero.upper().startswith("DEMO-") or _venta_existe(cur, numero):
         return False, 0
+    en_vivo = bool(venta.get("en_vivo"))
     cur.execute(
         """
         INSERT INTO facturas (
@@ -327,7 +379,7 @@ def _aplicar_venta(cur, venta: dict, descontar: bool, recien: set[str], usuario_
             float(venta.get("itbis") or 0),
             float(venta.get("total") or 0),
             (venta.get("usuario") or usuario_sync or "sync").strip(),
-            "Sincronizada desde el otro equipo. No entra otra vez a la caja.",
+            "Venta del escritorio. Entra al cuadre." if en_vivo else "Sincronizada desde el otro equipo. No entra otra vez a la caja.",
         ),
     )
     factura_id = int(cur.lastrowid)
@@ -362,6 +414,29 @@ def _aplicar_venta(cur, venta: dict, descontar: bool, recien: set[str], usuario_
                 f"Venta sincronizada {numero}",
             )
             descontadas += 1
+    if en_vivo:
+        cierre_id = _caja_abierta(cur, (venta.get("usuario") or usuario_sync or "escritorio").strip())
+        cur.execute("UPDATE facturas SET cierre_id=? WHERE id=?", (cierre_id, factura_id))
+        pagos = list(venta.get("pagos") or [])
+        if not pagos:
+            pagos = [{"tipo": "efectivo", "monto": float(venta.get("total") or 0), "referencia": ""}]
+        for pago in pagos:
+            cur.execute(
+                """
+                INSERT INTO pagos_factura (
+                    factura_id, tipo_pago, monto, referencia, cierre_id, fecha, usuario, es_abono
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    factura_id,
+                    (pago.get("tipo") or "efectivo").strip() or "efectivo",
+                    round(float(pago.get("monto") or 0), 2),
+                    (pago.get("referencia") or "").strip() or None,
+                    cierre_id,
+                    _momento(venta.get("fecha") or "") or _ahora(),
+                    (venta.get("usuario") or usuario_sync or "escritorio").strip(),
+                ),
+            )
     return True, descontadas
 
 
@@ -396,7 +471,7 @@ def incorporar(conn, base_dir: str, productos: list[dict], ventas: list[dict], s
     lineas_descontadas = 0
     for venta in ventas or []:
         fecha = _momento(venta.get("fecha") or "")
-        descontar = bool(corte) and bool(fecha) and fecha > corte
+        descontar = bool(venta.get("en_vivo")) or (bool(corte) and bool(fecha) and fecha > corte)
         creo, descontadas = _aplicar_venta(cur, venta, descontar, recien, usuario)
         if creo:
             ventas_nuevas += 1
@@ -535,6 +610,138 @@ def sincronizar(db, usuario: str, clave: str, acuerdos: list[dict] | None = None
         "stocks": int(web.get("stocks") or 0) + int(traidos["stocks"]),
         "conflictos": [] if acuerdos else diferencias(propios, ajenos, nombres),
     }
+
+
+_sesion = {"usuario": "", "clave": ""}
+_publicando = threading.Lock()
+
+
+def recordar_sesion(usuario: str, clave: str, db=None) -> None:
+    _sesion["usuario"] = usuario or ""
+    _sesion["clave"] = clave or ""
+    if db is not None and _sesion["usuario"] and _sesion["clave"]:
+        threading.Thread(target=lambda: _drenar(db), daemon=True).start()
+
+
+def _leer_pendientes(cur) -> list[str]:
+    preparar(cur)
+    cur.execute("SELECT valor FROM sync_estado WHERE clave='pendientes'")
+    fila = cur.fetchone()
+    if not fila or not (fila[0] or "").strip():
+        return []
+    try:
+        datos = json.loads(fila[0])
+    except json.JSONDecodeError:
+        return []
+    return [str(numero).strip() for numero in datos if str(numero).strip()]
+
+
+def _guardar_pendientes(cur, numeros: list[str]) -> None:
+    cur.execute(
+        """
+        INSERT INTO sync_estado (clave, valor) VALUES ('pendientes', ?)
+        ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor
+        """,
+        (json.dumps(numeros),),
+    )
+
+
+def _entrar(opener, destino: str, usuario: str, clave: str) -> None:
+    login = json.dumps({"username": usuario, "password": clave}).encode("utf-8")
+    pedido = urllib.request.Request(
+        destino + "/api/login",
+        data=login,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with opener.open(pedido, timeout=20) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise ServidorInalcanzable("Usuario o contraseña rechazados por la web.") from exc
+        raise ServidorInalcanzable(f"No se pudo entrar a la web ({exc.code}).") from exc
+    except urllib.error.URLError as exc:
+        raise ServidorInalcanzable("No se pudo conectar con la web.") from exc
+
+
+def publicar_venta(db, usuario: str, clave: str, numero: str, base_dir: str | None = None) -> None:
+    """Manda una factura recién hecha. La web baja el stock y la suma al cuadre abierto."""
+    base = base_dir or os.path.dirname(os.path.abspath(__file__))
+    destino = url_servidor(db).rstrip("/")
+    jar = CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    _entrar(opener, destino, usuario, clave)
+    conn = db.get_connection()
+    cur = conn.cursor()
+    preparar(cur)
+    conn.commit()
+    halladas = leer_ventas(cur, numero)
+    venta = next((item for item in halladas if item["numero"] == numero), None)
+    if not venta:
+        conn.close()
+        return
+    venta = dict(venta)
+    venta["en_vivo"] = True
+    codigos = {(linea.get("codigo") or "").strip() for linea in venta["lineas"]}
+    codigos.discard("")
+    productos = [p for p in leer_productos(cur, base, False) if p["codigo"] in codigos]
+    conn.close()
+    _post(opener, destino + "/api/sync/venta", {
+        "productos": productos,
+        "ventas": [venta],
+        "codigos": [p["codigo"] for p in productos],
+        "numeros": [numero],
+        "solo": True,
+    })
+
+
+def publicar_en_segundo_plano(db, numero: str) -> None:
+    numero = (numero or "").strip()
+    if not numero:
+        return
+    conn = db.get_connection()
+    cur = conn.cursor()
+    pendientes = _leer_pendientes(cur)
+    if numero not in pendientes:
+        pendientes.append(numero)
+        _guardar_pendientes(cur, pendientes)
+        conn.commit()
+    conn.close()
+    if not _sesion["usuario"] or not _sesion["clave"]:
+        return
+    threading.Thread(target=lambda: _drenar(db), daemon=True).start()
+
+
+def _drenar(db) -> None:
+    if not _publicando.acquire(blocking=False):
+        return
+    try:
+        usuario = _sesion["usuario"]
+        clave = _sesion["clave"]
+        if not usuario or not clave:
+            return
+        conn = db.get_connection()
+        cur = conn.cursor()
+        pendientes = _leer_pendientes(cur)
+        conn.close()
+        hechos: list[str] = []
+        for numero in pendientes:
+            try:
+                publicar_venta(db, usuario, clave, numero)
+            except ServidorInalcanzable:
+                break
+            hechos.append(numero)
+        if not hechos:
+            return
+        conn = db.get_connection()
+        cur = conn.cursor()
+        quedan = [n for n in _leer_pendientes(cur) if n not in set(hechos)]
+        _guardar_pendientes(cur, quedan)
+        conn.commit()
+        conn.close()
+    finally:
+        _publicando.release()
 
 
 def abrir_dialogo(app) -> None:

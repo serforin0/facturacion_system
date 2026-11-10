@@ -119,6 +119,75 @@ def test_agrega_sin_borrar_y_no_descuenta_el_historial(tmp_path):
     ce.close()
 
 
+def test_la_venta_en_vivo_baja_el_stock_y_entra_al_cuadre(tmp_path):
+    web = _base(str(tmp_path / "web.db"))
+    conn = web.get_connection()
+    cur = conn.cursor()
+    _producto(cur, "AGUA", "Agua", 10)
+    conn.commit()
+    incorporar(conn, str(tmp_path), [], [{
+        "numero": "F-VIVA-1",
+        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "subtotal": 100,
+        "itbis": 0,
+        "total": 100,
+        "usuario": "empleado",
+        "en_vivo": True,
+        "lineas": [{"codigo": "AGUA", "nombre": "Agua", "cantidad": 4, "precio": 25, "total": 100}],
+        "pagos": [
+            {"tipo": "efectivo", "monto": 40, "referencia": ""},
+            {"tipo": "tarjeta", "monto": 60, "referencia": "AUTH1"},
+        ],
+    }], usuario="empleado")
+    assert _stock(cur, "AGUA") == 6
+    caja = cur.execute(
+        "SELECT id FROM cierres_caja WHERE fecha_cierre IS NULL"
+    ).fetchone()
+    assert caja is not None
+    pagos = cur.execute(
+        """
+        SELECT p.tipo_pago, p.monto, p.cierre_id
+        FROM pagos_factura p
+        JOIN facturas f ON f.id = p.factura_id
+        WHERE f.numero='F-VIVA-1'
+        ORDER BY p.id
+        """
+    ).fetchall()
+    assert [(p[0], p[1]) for p in pagos] == [("efectivo", 40), ("tarjeta", 60)]
+    assert all(p[2] == caja[0] for p in pagos)
+    factura = cur.execute("SELECT cierre_id FROM facturas WHERE numero='F-VIVA-1'").fetchone()
+    assert factura[0] == caja[0]
+
+    incorporar(conn, str(tmp_path), [], [{
+        "numero": "F-VIVA-1",
+        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total": 100,
+        "en_vivo": True,
+        "lineas": [{"codigo": "AGUA", "nombre": "Agua", "cantidad": 4, "precio": 25, "total": 100}],
+        "pagos": [{"tipo": "efectivo", "monto": 100}],
+    }], usuario="empleado")
+    assert _stock(cur, "AGUA") == 6
+    assert cur.execute(
+        """
+        SELECT COUNT(*) FROM pagos_factura p
+        JOIN facturas f ON f.id = p.factura_id
+        WHERE f.numero='F-VIVA-1'
+        """
+    ).fetchone()[0] == 2
+
+    incorporar(conn, str(tmp_path), [], [{
+        "numero": "F-HIST-1",
+        "fecha": "2020-01-01 10:00:00",
+        "subtotal": 10,
+        "itbis": 0,
+        "total": 10,
+        "lineas": [{"codigo": "AGUA", "nombre": "Agua", "cantidad": 1, "precio": 10, "total": 10}],
+    }], usuario="empleado")
+    assert _stock(cur, "AGUA") == 6
+    assert cur.execute("SELECT cierre_id FROM facturas WHERE numero='F-HIST-1'").fetchone()[0] is None
+    conn.close()
+
+
 def test_las_diferencias_ignoran_lo_que_ya_cuadra_y_lo_que_solo_esta_en_un_lado():
     cruce = diferencias(
         {"A": 5, "B": 2, "C": 1},
