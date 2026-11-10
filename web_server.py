@@ -8909,10 +8909,6 @@ function cuadreDeMuestra(){
     esperado: 1200, contado: 1200, diferencia: 0,
     pagos: [{tipo: "efectivo", monto: 800}, {tipo: "tarjeta", monto: 700}],
     movimientos: [{fecha: "2026-11-04 12:00", tipo: "retiro", monto: 100, motivo: "Pago al suplidor", usuario: "cajera"}],
-    facturas: [
-      {numero: "F-1001", fecha: "2026-11-04 10:15", estado: "emitida", cliente: "Consumidor final", total: 800},
-      {numero: "F-1002", fecha: "2026-11-04 11:40", estado: "emitida", cliente: "Cliente de ejemplo con nombre largo", total: 700}
-    ],
     observaciones: "Cuadrado"
   };
 }
@@ -8925,6 +8921,11 @@ function notaCuadre(d, cerrado){
   const resultado = cerrado ? textoDif(d.diferencia) : "";
   if (!nota || nota.toLowerCase() === String(resultado).toLowerCase()) return "";
   return `<hr class="corte"><p>Nota: ${escDash(nota)}</p>`;
+}
+function resultadoTicket(n){
+  const v = Number(n || 0);
+  if (Math.abs(v) < 0.05) return money(0);
+  return (v > 0 ? "Sobrante " : "Faltante ") + money(Math.abs(v));
 }
 function fechaCortaTicket(valor){
   const m = String(valor || "").match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})/);
@@ -8939,13 +8940,6 @@ function htmlCuadreTicket(d, extra){
     filaTicket(escDash(m.motivo || m.tipo || "—"), money(m.monto))
     + `<p class="sub">${fechaCortaTicket(m.fecha)} · ${escDash(m.tipo || "")} · ${escDash(m.usuario || "")}</p>`
   ).join("");
-  const facs = (d.facturas || []).map(f =>
-    `<div class="bloque">`
-    + filaTicket(escDash(f.numero || "Factura"), money(f.total))
-    + `<p class="sub">${fechaCortaTicket(f.fecha)} · ${escDash(f.estado || "")}</p>`
-    + `<p class="sub">${escDash(f.cliente || "Consumidor final")}</p>`
-    + `</div>`
-  ).join("");
   return `<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${cerrado ? "CUADRE DE CAJA" : "PRE-CUADRE"}</span>`
     + filaTicket("Turno", escDash(d.nombre || "Caja"))
     + filaTicket("Abrió", escDash(d.usuario_apertura || "—"))
@@ -8957,18 +8951,16 @@ function htmlCuadreTicket(d, extra){
     + filaTicket("Venta total", money(d.ventas_total))
     + `<hr class="corte"><span class="titulo">EFECTIVO</span>`
     + filaTicket("Fondo", money(d.fondo))
-    + filaTicket("Ventas en efectivo", money(d.ventas_efectivo))
+    + filaTicket("Efectivo", money(d.ventas_efectivo))
     + filaTicket("Ingresos", money(d.ingresos))
     + filaTicket("Retiros", money(d.retiros))
     + filaTicket("Esperado", money(d.esperado))
     + filaTicket("Contado", cerrado ? money(d.contado) : "Pendiente")
-    + filaTicket("Resultado", cerrado ? textoDif(d.diferencia) : "Pendiente de conteo", "total")
+    + `<div class="resultado">` + filaTicket("Resultado", cerrado ? resultadoTicket(d.diferencia) : "Pendiente de conteo") + `</div>`
     + `<hr class="corte"><span class="titulo">FORMAS DE PAGO</span>`
     + (pagos || `<p class="sub">Sin cobros en este turno.</p>`)
     + `<hr class="corte"><span class="titulo">MOVIMIENTOS</span>`
     + (movs || `<p class="sub">Sin ingresos ni retiros.</p>`)
-    + `<hr class="corte"><span class="titulo">FACTURAS</span>`
-    + (facs || `<p class="sub">Sin facturas en este turno.</p>`)
     + notaCuadre(d, cerrado)
     + `<p class="centro" style="margin-top:6mm">________________</p><p class="centro sub">Cajero</p>`
     + pieTicket()
@@ -9021,6 +9013,8 @@ const CSS_TICKET = `
   .bloque { margin:0 0 1.4mm; }
   .sub, .ley, .cols { font-size:.92em; }
   .total { font-size:1.2em; }
+  .resultado { margin-top:4mm; font-weight:900; }
+  .resultado .nom, .resultado .din, .resultado .renglon { font-weight:900; font-size:1.25em; }
   .renglon { display:block; overflow-wrap:break-word; }
   .der { text-align:right; }
   .atendio { margin-top:1.6mm; }
