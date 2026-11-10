@@ -51,6 +51,7 @@ def test_las_paginas_del_mostrador_responden(api):
     assert "Escanea o escribe" in html
     assert "function lecturaDeLector" in html
     assert "function lecturaEnProducto" in html
+    assert 'id="vendiendo"' in html
 
 
 def test_sin_sesion_no_hay_estado_ni_venta(api):

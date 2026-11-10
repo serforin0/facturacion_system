@@ -5575,6 +5575,20 @@ HTML = """<!DOCTYPE html>
   #lines li button.sec { width:26px; height:26px; padding:0; border-radius:8px; flex:none; display:inline-grid; place-items:center; }
   #lines li .nombre button.sec { width:auto; min-height:28px; height:auto; padding:0 8px; }
   #lines li .num { display:inline-block; min-width:1.4em; text-align:center; }
+  #lines li .mini { width:36px; height:36px; border-radius:8px; flex:none; background:var(--raised) center / cover no-repeat; }
+  .vendiendo { display:grid; grid-template-columns:minmax(96px, 180px) minmax(0, 1fr); gap:16px; align-items:center; margin:0 0 12px; padding:12px; border-radius:16px; background:var(--surface); border:1px solid var(--rule); }
+  .vendiendo[hidden] { display:none; }
+  .vendiendo-foto { height:150px; border-radius:12px; background:var(--raised) center / contain no-repeat; display:grid; place-items:center; color:var(--faint); font-size:13px; font-weight:600; }
+  .vendiendo-foto.con-foto { color:transparent; }
+  .vendiendo small { display:block; color:var(--muted); font-size:12px; font-weight:600; margin-bottom:4px; }
+  .vendiendo b { display:block; font-size:28px; line-height:1.15; }
+  .vendiendo span { display:block; margin-top:6px; font-size:20px; font-weight:700; }
+  @media (max-width: 700px) {
+    .vendiendo { grid-template-columns:96px minmax(0, 1fr); gap:12px; }
+    .vendiendo-foto { height:96px; }
+    .vendiendo b { font-size:20px; }
+    .vendiendo span { font-size:16px; }
+  }
   .desglose { display:grid; margin-top:4px; }
   .desglose div { display:flex; justify-content:space-between; gap:8px; padding:7px 0; border-top:1px solid var(--rule); font-size:13px; color:var(--muted); }
   .desglose b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
@@ -6002,6 +6016,14 @@ HTML = """<!DOCTYPE html>
                 <option value="3">VIP</option>
                 <option value="4">Especial</option>
               </select>
+            </div>
+            <div id="vendiendo" class="vendiendo" hidden>
+              <div class="vendiendo-foto" id="vendiendoFoto">Sin foto</div>
+              <div>
+                <small>En la factura</small>
+                <b id="vendiendoNombre"></b>
+                <span id="vendiendoDetalle"></span>
+              </div>
             </div>
             <div class="grid" id="grid" aria-live="polite"><p class="vacio">Cargando productos…</p></div>
           </div>
@@ -6841,8 +6863,12 @@ function add(p, precio){
   }
   const tieneExtras = (p.extras || []).length > 0;
   const hit = tieneExtras ? null : cart.find(x=>x.id===p.id && !!x.combo===!!p.combo && x.precio===precio && !(x.opciones || []).some(o => o.on));
-  if(hit) hit.cantidad += 1; else cart.push({
+  if(hit) {
+    hit.cantidad += 1;
+    if (!hit.imagen && p.imagen) hit.imagen = p.imagen;
+  } else cart.push({
     id:p.id, nombre:p.nombre, precio, base: precio, cantidad:1, itbis:p.itbis!==false, combo:!!p.combo, nota:"",
+    imagen: p.imagen || "",
     opciones: (p.extras || []).map(e => ({id:e.id, nombre:e.nombre, precio:Number(e.precio || 0), on:false}))
   });
   if (!hit && p.stock != null && Number(p.stock) <= Number(p.minimo || 0)) {
@@ -6892,13 +6918,38 @@ function totalTicket(){
 }
 const ICONO_MENOS = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>';
 const ICONO_MAS = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8h9M8 3.5v9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>';
+function fotoLinea(url){
+  const limpia = String(url || "").replace(/["'\\()]/g, "");
+  return limpia ? ` style="background-image:url('${limpia}')"` : "";
+}
+function mostrarVendiendo(l){
+  const caja = document.getElementById("vendiendo");
+  if (!caja) return;
+  if (!l) { caja.hidden = true; return; }
+  const cambio = caja.hidden || caja.dataset.id !== String(l.id) || caja.dataset.cant !== String(l.cantidad);
+  caja.hidden = false;
+  caja.dataset.id = String(l.id);
+  caja.dataset.cant = String(l.cantidad);
+  const foto = document.getElementById("vendiendoFoto");
+  const url = String(l.imagen || "").replace(/["'\\()]/g, "");
+  foto.style.backgroundImage = url ? `url('${url}')` : "";
+  foto.classList.toggle("con-foto", !!url);
+  foto.textContent = url ? "" : "Sin foto";
+  document.getElementById("vendiendoNombre").textContent = l.nombre || "";
+  document.getElementById("vendiendoDetalle").textContent = l.cantidad + " × " + money(l.precio);
+  if (cambio) animar(caja, [{transform:"translateY(8px)"}, {transform:"none"}], {duration:180});
+}
 function pintar(){
-  lines.innerHTML = cart.map((l,i)=>`<li><span>${window._conduceId ? `<input type="checkbox" ${l.cobrar === false ? "" : "checked"} onchange="marcarCobro(${i}, this.checked)" aria-label="Cobrar esta línea"/>` : ""}<button class="sec" onclick="cambiarCant(${i},-1)" aria-label="Quitar uno">${ICONO_MENOS}</button> <span class="num">${l.cantidad}</span> <button class="sec" onclick="cambiarCant(${i},1)" aria-label="Agregar uno">${ICONO_MAS}</button><span class="nombre">${String(l.nombre).replaceAll("<","&lt;")}${l.nota ? `<small> · ${String(l.nota).replaceAll("<","&lt;")}</small>` : ""} <button class="sec" type="button" onclick="rotarNotaCaja(${i})">Nota</button> ${(l.opciones||[]).map(o => `<button class="sec" type="button" onclick="toggleExtra(${i},${o.id})">${o.on ? "✓ " : ""}${String(o.nombre).replaceAll("<","&lt;")} ${money(o.precio)}</button>`).join(" ")}</span></span><span class="num">${money(l.precio*l.cantidad)}</span></li>`).join("")
+  lines.innerHTML = cart.map((l,i)=>`<li><span>${window._conduceId ? `<input type="checkbox" ${l.cobrar === false ? "" : "checked"} onchange="marcarCobro(${i}, this.checked)" aria-label="Cobrar esta línea"/>` : ""}<span class="mini"${fotoLinea(l.imagen)} role="img" aria-label=""></span><button class="sec" onclick="cambiarCant(${i},-1)" aria-label="Quitar uno">${ICONO_MENOS}</button> <span class="num">${l.cantidad}</span> <button class="sec" onclick="cambiarCant(${i},1)" aria-label="Agregar uno">${ICONO_MAS}</button><span class="nombre">${String(l.nombre).replaceAll("<","&lt;")}${l.nota ? `<small> · ${String(l.nota).replaceAll("<","&lt;")}</small>` : ""} <button class="sec" type="button" onclick="rotarNotaCaja(${i})">Nota</button> ${(l.opciones||[]).map(o => `<button class="sec" type="button" onclick="toggleExtra(${i},${o.id})">${o.on ? "✓ " : ""}${String(o.nombre).replaceAll("<","&lt;")} ${money(o.precio)}</button>`).join(" ")}</span></span><span class="num">${money(l.precio*l.cantidad)}</span></li>`).join("")
     || '<li class="vacio">Toca un producto o escanea un código para empezar.</li>';
   const btnCobrar = document.getElementById("btnCobrar");
   if (btnCobrar && !btnCobrar.classList.contains("cobrando")) btnCobrar.disabled = !cart.length || !window._caja;
   const tocada = window._lineaTocada;
   window._lineaTocada = null;
+  if (tocada && cart[tocada.indice]) window._vendiendo = cart[tocada.indice];
+  if (!cart.length) window._vendiendo = null;
+  else if (window._vendiendo && cart.indexOf(window._vendiendo) < 0) window._vendiendo = cart[cart.length - 1];
+  mostrarVendiendo(window._vendiendo);
   if (tocada && lines.children[tocada.indice]) {
     const li = lines.children[tocada.indice];
     if (tocada.nueva) {
