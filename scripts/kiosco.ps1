@@ -1,11 +1,8 @@
-# Arranca el mostrador a pantalla completa y lo mantiene abierto.
-# Salida de técnico: Ctrl+Mayús+F12 devuelve el escritorio de Windows.
+# Abre SistemaFacturacion.exe a pantalla completa y lo vuelve a abrir si se cierra.
+# El técnico vuelve al escritorio con Ctrl+Mayús+F12.
 $ErrorActionPreference = "Stop"
 $raiz = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$puerto = if ($env:FACTURACION_PUERTO) { [int]$env:FACTURACION_PUERTO } else { 8099 }
-$url = "http://127.0.0.1:$puerto/"
-$marca = "FacturacionKiosco"
-$perfil = Join-Path $env:LOCALAPPDATA $marca
+$marca = "FacturacionEscritorio"
 $log = Join-Path $raiz "kiosco.log"
 
 function Anotar([string]$texto) {
@@ -21,7 +18,6 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class KioscoTeclas {
-    public static volatile bool Salir = false;
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_KEYDOWN = 0x0100;
     private const int WM_SYSKEYDOWN = 0x0104;
@@ -55,129 +51,57 @@ public class KioscoTeclas {
             bool alt = (info.flags & 0x20) != 0 || Pulsada(0x12);
             bool ctrl = Pulsada(0x11);
             bool shift = Pulsada(0x10);
-            if (ctrl && shift && vk == 0x7B) { Salir = true; return (IntPtr)1; }
-            if (vk == 0x5B || vk == 0x5C) return (IntPtr)1;
-            if (vk == 0x7A) return (IntPtr)1;
+            if (ctrl && shift && vk == 0x7B) return CallNextHookEx(_hook, nCode, wParam, lParam);
+            if (vk == 0x5B || vk == 0x5C || vk == 0x7A) return (IntPtr)1;
             if (alt && (vk == 0x09 || vk == 0x73 || vk == 0x1B || vk == 0x20)) return (IntPtr)1;
             if (ctrl && shift && vk == 0x1B) return (IntPtr)1;
-            if (ctrl && (vk == 0x57 || vk == 0x4E || vk == 0x54 || vk == 0x4C)) return (IntPtr)1;
         }
         return CallNextHookEx(_hook, nCode, wParam, lParam);
     }
 }
 "@
 
-function Puerto-Abierto {
-    try {
-        $cliente = New-Object System.Net.Sockets.TcpClient
-        $cliente.Connect("127.0.0.1", $puerto)
-        $cliente.Close()
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-function Resolver-Python {
-    $venv = Join-Path $raiz ".venv\Scripts\python.exe"
-    if (Test-Path $venv) { return $venv }
-    $comando = Get-Command python -ErrorAction SilentlyContinue
-    if ($comando) { return $comando.Source }
-    $py = Get-Command py -ErrorAction SilentlyContinue
-    if ($py) { return $py.Source }
-    throw "No encontré Python en esta computadora."
-}
-
-function Iniciar-Servidor {
-    if (Puerto-Abierto) { return }
-    $python = Resolver-Python
-    Anotar "Abriendo el programa con $python"
-    if ((Split-Path -Leaf $python) -eq "py.exe") {
-        Start-Process -FilePath $python -ArgumentList @("-3", "web_server.py") -WorkingDirectory $raiz -WindowStyle Hidden
-    } else {
-        Start-Process -FilePath $python -ArgumentList @("web_server.py") -WorkingDirectory $raiz -WindowStyle Hidden
-    }
-}
-
-function Esperar-Programa {
-    $limite = (Get-Date).AddSeconds(45)
-    while ((Get-Date) -lt $limite) {
-        if (Puerto-Abierto) { return }
-        [KioscoTeclas]::Esperar(200)
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-    throw "El programa no respondió en el puerto $puerto."
-}
-
-function Resolver-Navegador {
+function Resolver-Exe {
     $candidatos = @(
-        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
-        "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
-        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-        "${env:ProgramFiles}\Microsoft\Edge\Application\msedge.exe"
+        (Join-Path $raiz "SistemaFacturacion.exe"),
+        (Join-Path $raiz "dist\SistemaFacturacion.exe")
     )
     foreach ($ruta in $candidatos) {
-        if ($ruta -and (Test-Path $ruta)) { return $ruta }
+        if (Test-Path $ruta) { return $ruta }
     }
-    throw "No está Chrome ni Edge."
+    return $null
 }
 
-function Argumentos-Navegador([string]$exe) {
-    $args = @(
-        "--kiosk", $url,
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-session-crashed-bubble",
-        "--disable-pinch",
-        "--overscroll-history-navigation=0",
-        "--user-data-dir=$perfil"
-    )
-    if ((Split-Path -Leaf $exe) -like "msedge.exe") {
-        $args = @("--edge-kiosk-type=fullscreen") + $args
-    }
-    return $args
+function Programa-Abierto {
+    return [bool](Get-Process -Name "SistemaFacturacion" -ErrorAction SilentlyContinue)
 }
 
-function Procesos-Kiosco {
-    if (-not $script:navegador) { return @() }
-    $nombre = if ((Split-Path -Leaf $script:navegador) -like "msedge.exe") { "msedge.exe" } else { "chrome.exe" }
-    Get-CimInstance Win32_Process -Filter "Name = '$nombre'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$marca*" }
-}
-
-function Abrir-Pantalla {
-    $lista = Argumentos-Navegador $script:navegador
-    Anotar "Abriendo pantalla $($script:navegador)"
-    Start-Process -FilePath $script:navegador -ArgumentList $lista | Out-Null
-}
-
+$salida = $null
 try {
     Set-Location $raiz
+    $exe = Resolver-Exe
+    if (-not $exe) { throw "No está SistemaFacturacion.exe en esta carpeta." }
+    $carpeta = Split-Path $exe
+    $salida = Join-Path $carpeta "kiosco.salir"
+    if (Test-Path $salida) { Remove-Item $salida -Force }
+    New-Item -ItemType File -Path (Join-Path (Split-Path $exe) "kiosco.flag") -Force | Out-Null
     [KioscoTeclas]::Instalar()
-    $script:navegador = Resolver-Navegador
-    Iniciar-Servidor
-    Esperar-Programa
-    Abrir-Pantalla
+    Anotar "Abriendo $exe"
+    Start-Process -FilePath $exe -ArgumentList @("--kiosco") -WorkingDirectory $carpeta | Out-Null
     $ultimo = Get-Date
-    $ultimoServidor = Get-Date
-    while (-not [KioscoTeclas]::Salir) {
+    while (-not (Test-Path $salida)) {
         [System.Windows.Forms.Application]::DoEvents()
-        if (-not (Puerto-Abierto) -and ((Get-Date) - $ultimoServidor).TotalSeconds -gt 15) {
-            Anotar "El programa se detuvo. Lo vuelvo a abrir."
-            Iniciar-Servidor
-            $ultimoServidor = Get-Date
-        }
-        $vivos = @(Procesos-Kiosco)
-        if ($vivos.Count -eq 0 -and ((Get-Date) - $ultimo).TotalSeconds -gt 4) {
-            Anotar "La pantalla se cerró. La vuelvo a abrir."
-            Abrir-Pantalla
+        if (-not (Programa-Abierto) -and ((Get-Date) - $ultimo).TotalSeconds -gt 4) {
+            if (Test-Path $salida) { break }
+            Anotar "El programa se cerró. Lo vuelvo a abrir."
+            Start-Process -FilePath $exe -ArgumentList @("--kiosco") -WorkingDirectory $carpeta | Out-Null
             $ultimo = Get-Date
         }
         [KioscoTeclas]::Esperar(200)
         [System.Windows.Forms.Application]::DoEvents()
     }
     Anotar "Salida de técnico."
+    Get-Process -Name "SistemaFacturacion" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 } catch {
     Anotar $_.Exception.Message
     [System.Windows.Forms.MessageBox]::Show(
@@ -187,9 +111,7 @@ try {
         [System.Windows.Forms.MessageBoxIcon]::Error
     ) | Out-Null
 } finally {
-    foreach ($proceso in @(Procesos-Kiosco)) {
-        Stop-Process -Id $proceso.ProcessId -Force -ErrorAction SilentlyContinue
-    }
+    if ($salida -and (Test-Path $salida)) { Remove-Item $salida -Force -ErrorAction SilentlyContinue }
     if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) {
         Start-Process explorer.exe
     }

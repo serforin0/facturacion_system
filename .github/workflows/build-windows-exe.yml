@@ -27,9 +27,15 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path "dist/SistemaFacturacion.exe")) { throw "No se generó el ejecutable." }
-          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $stage = "release/paquete"
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "$stage/scripts" | Out-Null
+          Copy-Item "dist/SistemaFacturacion.exe" $stage
+          Copy-Item "instalar_kiosco.bat" $stage
+          Copy-Item "scripts/kiosco.ps1" "$stage/scripts/"
+          Copy-Item "scripts/instalar_kiosco.ps1" "$stage/scripts/"
           $zip = "release/SistemaFacturacion_Windows_run${{ github.run_number }}.zip"
-          Compress-Archive -Path "dist/SistemaFacturacion.exe" -DestinationPath $zip -Force
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
 
       - uses: actions/upload-artifact@v4
         with:

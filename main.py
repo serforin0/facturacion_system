@@ -19,6 +19,7 @@ from users_manager import UsersManager                  # 🔹 Módulo de gesti�
 from historial_facturas_manager import HistorialFacturasManager
 from dashboard_manager import DashboardManager
 from home_dashboard import HomeDashboardManager
+from kiosco_escritorio import activar_kiosco, marcar_salida_tecnico, modo_kiosco
 
 
 class BarSystemApp:
@@ -29,7 +30,11 @@ class BarSystemApp:
 
         # ✅ Ventana principal: SIEMPRE CTk
         self.root = ctk.CTk()
-        self._apply_sensible_window_geometry()
+        self._kiosco = modo_kiosco()
+        if self._kiosco:
+            activar_kiosco(self.root, self._salir_kiosco)
+        else:
+            self._apply_sensible_window_geometry()
         Styles.apply_root_window_bg(self.root, self.db)
 
         # Variables de sesión
@@ -89,6 +94,10 @@ class BarSystemApp:
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 2)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _salir_kiosco(self):
+        marcar_salida_tecnico()
+        self.root.destroy()
 
     # ==========================
     #       PANTALLA LOGIN

@@ -1,4 +1,4 @@
-# Deja el mostrador para que abra solo al entrar a Windows.
+# Deja el programa de escritorio para que abra solo al entrar a Windows.
 $ErrorActionPreference = "Stop"
 $raiz = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $kiosco = Join-Path $raiz "scripts\kiosco.ps1"
@@ -11,9 +11,9 @@ $atajo.TargetPath = "powershell.exe"
 $atajo.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$kiosco`""
 $atajo.WorkingDirectory = $raiz
 $atajo.WindowStyle = 7
-$atajo.Description = "Mostrador de facturación"
+$atajo.Description = "Sistema de facturación"
 $atajo.Save()
-Write-Host "Listo. Al entrar a Windows se abre el mostrador y no se puede cerrar."
+Write-Host "Listo. Al entrar a Windows se abre SistemaFacturacion.exe y no se puede cerrar."
 Write-Host "Para volver al escritorio, el técnico pulsa Ctrl+Mayús+F12."
 
 $respuesta = Read-Host "¿Windows debe entrar solo al encender la computadora? (s/n)"
@@ -40,7 +40,7 @@ if ($respuesta -eq "s" -or $respuesta -eq "S") {
     $clave = $null
 }
 
-$ahora = Read-Host "¿Abrir el mostrador ahora? (s/n)"
+$ahora = Read-Host "¿Abrir el programa de escritorio ahora? (s/n)"
 if ($ahora -eq "s" -or $ahora -eq "S") {
     Start-Process -FilePath "powershell.exe" -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", $kiosco
