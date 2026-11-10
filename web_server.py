@@ -379,7 +379,7 @@ SQL_PRODUCTOS = """
 """
 
 MODULOS = [
-    "mostrador", "inventario", "kardex", "historial", "cotizaciones", "indicadores",
+    "mostrador", "mayor", "inventario", "kardex", "historial", "cotizaciones", "indicadores",
     "clientes", "usuarios", "apariencia", "caja", "reportes", "compras",
     "promociones", "devoluciones", "transferir", "ncf", "seguimiento", "metodos",
     "cobros", "vendedores", "terminales", "pedidos",
@@ -399,6 +399,7 @@ PERMISOS_ARBOL = [
         {"id": "venta", "nombre": "Mostrador"},
         {"id": "cocina", "nombre": "Cocina"},
     ]},
+    {"grupo": "Venta", "id": "mayor", "nombre": "Venta al por mayor", "hijos": []},
     {"grupo": "Venta", "id": "cotizaciones", "nombre": "Cotizaciones", "hijos": []},
     {"grupo": "Venta", "id": "historial", "nombre": "Facturas emitidas", "hijos": []},
     {"grupo": "Venta", "id": "cobros", "nombre": "Cuentas por cobrar", "hijos": []},
@@ -3189,6 +3190,214 @@ def crear_bodega(request: Request, body: BodegaIn):
     return {"ok": True}
 
 
+BODEGA_MAYOR = "Almacén"
+
+
+class ItemMayor(BaseModel):
+    id: int
+    cantidad: float
+    precio: float | None = None
+
+
+class VentaMayorIn(BaseModel):
+    cliente: str = ""
+    nota: str = ""
+    items: list[ItemMayor]
+
+
+def _tablas_mayor(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ventas_mayor (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero TEXT UNIQUE,
+            fecha TEXT,
+            cliente TEXT,
+            usuario TEXT,
+            bodega TEXT,
+            nota TEXT,
+            total REAL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ventas_mayor_detalle (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            venta_id INTEGER NOT NULL,
+            producto_id INTEGER,
+            descripcion TEXT,
+            cantidad REAL,
+            precio REAL,
+            total REAL
+        )
+        """
+    )
+
+
+def _precio_mayor(precio, precio_2) -> float:
+    mayor = float(precio_2 or 0)
+    if mayor > 0:
+        return round(mayor, 2)
+    return round(float(precio or 0), 2)
+
+
+@app.get("/api/mayor/productos")
+def mayor_productos(request: Request, q: str = ""):
+    _exigir(request, "mayor")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    _tablas_mayor(cur)
+    cur.execute("INSERT OR IGNORE INTO bodegas (codigo) VALUES (?)", (BODEGA_MAYOR,))
+    sql = """
+        SELECT p.id, p.nombre, IFNULL(p.precio,0), IFNULL(p.precio_2,0),
+               IFNULL(p.codigo_barras,''), IFNULL(p.codigo_producto,''),
+               IFNULL((SELECT cantidad FROM stock_bodega s
+                       WHERE s.producto_id=p.id AND s.bodega=?), 0)
+        FROM productos p
+        WHERE IFNULL(p.activo,1)=1
+    """
+    params: list = [BODEGA_MAYOR]
+    texto = q.strip()
+    if texto:
+        sql += " AND (p.nombre LIKE ? OR IFNULL(p.codigo_barras,'') LIKE ? OR IFNULL(p.codigo_producto,'') LIKE ?)"
+        params.extend([f"%{texto}%", f"%{texto}%", f"%{texto}%"])
+    sql += " ORDER BY p.nombre COLLATE NOCASE LIMIT 40"
+    cur.execute(sql, params)
+    items = [
+        {
+            "id": i, "nombre": n, "precio": _precio_mayor(precio, p2),
+            "codigo": cb or "", "codigo_producto": cp or "",
+            "stock": float(stock or 0),
+        }
+        for i, n, precio, p2, cb, cp, stock in cur.fetchall()
+    ]
+    conn.commit()
+    conn.close()
+    return {"items": items, "bodega": BODEGA_MAYOR}
+
+
+@app.get("/api/mayor")
+def listar_mayor(request: Request):
+    _exigir(request, "mayor")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    _tablas_mayor(cur)
+    cur.execute(
+        """
+        SELECT id, numero, IFNULL(fecha,''), IFNULL(cliente,''), IFNULL(usuario,''),
+               IFNULL(nota,''), IFNULL(total,0)
+        FROM ventas_mayor ORDER BY id DESC LIMIT 50
+        """
+    )
+    ventas = []
+    for vid, numero, fecha, cliente, usuario, nota, total in cur.fetchall():
+        cur.execute(
+            """
+            SELECT producto_id, IFNULL(descripcion,''), IFNULL(cantidad,0),
+                   IFNULL(precio,0), IFNULL(total,0)
+            FROM ventas_mayor_detalle WHERE venta_id=? ORDER BY id
+            """,
+            (vid,),
+        )
+        lineas = [
+            {"id": pid, "nombre": nom, "cantidad": float(c), "precio": float(p), "total": float(t)}
+            for pid, nom, c, p, t in cur.fetchall()
+        ]
+        ventas.append({
+            "id": vid, "numero": numero, "fecha": fecha, "cliente": cliente,
+            "usuario": usuario, "nota": nota, "total": float(total or 0), "lineas": lineas,
+        })
+    conn.close()
+    return {"items": ventas, "bodega": BODEGA_MAYOR}
+
+
+@app.post("/api/mayor")
+def crear_mayor(request: Request, body: VentaMayorIn):
+    usuario = _exigir(request, "mayor")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="Agrega al menos un producto")
+    cliente = body.cliente.strip() or "Sin cliente"
+    nota = body.nota.strip()[:300]
+    base = db()
+    conn = base.get_connection()
+    cur = conn.cursor()
+    try:
+        _tablas_mayor(cur)
+        cur.execute("INSERT OR IGNORE INTO bodegas (codigo) VALUES (?)", (BODEGA_MAYOR,))
+        lineas = []
+        for item in body.items:
+            qty = round(float(item.cantidad or 0), 2)
+            if qty <= 0:
+                raise HTTPException(status_code=400, detail="La cantidad tiene que ser mayor que cero")
+            cur.execute(
+                "SELECT nombre, IFNULL(precio,0), IFNULL(precio_2,0), IFNULL(activo,1) FROM productos WHERE id=?",
+                (item.id,),
+            )
+            row = cur.fetchone()
+            if not row or not int(row[3] or 0):
+                raise HTTPException(status_code=400, detail="Hay un producto que no está activo")
+            nombre, precio, p2, _activo = row
+            cur.execute(
+                "SELECT IFNULL(cantidad,0) FROM stock_bodega WHERE producto_id=? AND bodega=?",
+                (item.id, BODEGA_MAYOR),
+            )
+            hay = cur.fetchone()
+            disponible = float(hay[0] if hay else 0)
+            if qty > disponible + 0.0001:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"En el almacén de {nombre} hay {disponible:g}. No alcanza para {qty:g}.",
+                )
+            unitario = round(float(item.precio), 2) if item.precio is not None else _precio_mayor(precio, p2)
+            if unitario < 0:
+                raise HTTPException(status_code=400, detail="El precio no puede ser negativo")
+            lineas.append((item.id, nombre, qty, unitario, round(qty * unitario, 2)))
+        base_num = "VM-" + datetime.now().strftime("%Y%m%d%H%M%S")
+        numero = base_num
+        n = 2
+        while True:
+            cur.execute("SELECT 1 FROM ventas_mayor WHERE numero=?", (numero,))
+            if cur.fetchone() is None:
+                break
+            numero = f"{base_num}-{n}"
+            n += 1
+        total = round(sum(linea[4] for linea in lineas), 2)
+        ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute(
+            """
+            INSERT INTO ventas_mayor (numero, fecha, cliente, usuario, bodega, nota, total)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (numero, ahora, cliente, usuario, BODEGA_MAYOR, nota or None, total),
+        )
+        venta_id = cur.lastrowid
+        for pid, nombre, qty, unitario, linea_total in lineas:
+            cur.execute(
+                """
+                INSERT INTO ventas_mayor_detalle
+                    (venta_id, producto_id, descripcion, cantidad, precio, total)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (venta_id, pid, nombre, qty, unitario, linea_total),
+            )
+            cur.execute("UPDATE productos SET stock = stock - ? WHERE id=?", (qty, pid))
+            base.ajustar_stock_bodega(pid, -qty, BODEGA_MAYOR, conn=conn)
+            base.insert_movimiento_kardex(
+                pid, "venta", -qty, ajustar_stock=False, referencia=numero,
+                usuario=usuario, tipo_codigo="MA", bodega_codigo=BODEGA_MAYOR,
+                precio_unitario=unitario, entidad_nombre=cliente,
+                descripcion_mov=f"Venta al por mayor {numero}", conn=conn,
+            )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"ok": True, "id": venta_id, "numero": numero, "total": total, "bodega": BODEGA_MAYOR}
+
+
 _METODOS_COBRO = ("efectivo", "tarjeta", "transferencia")
 
 
@@ -5952,6 +6161,7 @@ HTML = """<!DOCTYPE html>
       <div class="brand"><span class="mono" aria-hidden="true">MD</span><div><b>MD Alliance</b><small>Punto de venta</small></div></div>
       <div class="nav-grupo" data-grupo="venta">Venta</div>
       <button class="nav on" data-view="venta" data-mod="mostrador" data-fn="venta" onclick="ver('venta')">Mostrador</button>
+      <button class="nav" data-view="mayor" data-mod="mayor" onclick="ver('mayor')">Venta al por mayor</button>
       <button class="nav" data-mod="mostrador" data-fn="cocina" type="button" onclick="location.href='/cocina'">Cocina</button>
       <button class="nav" data-view="cotizaciones" data-mod="cotizaciones" onclick="ver('cotizaciones')">Cotizaciones</button>
       <button class="nav" data-view="historial" data-mod="historial" onclick="ver('historial')">Facturas emitidas</button>
@@ -7168,6 +7378,72 @@ async function guardarGasto(){
   document.getElementById("gastoNota").value = "";
   await pintarResultado();
 }
+let mayCart = [];
+function pintarPedidoMayor(){
+  const root = document.getElementById("mayLineas");
+  if (!root) return;
+  if (!mayCart.length) { root.innerHTML = "<p class='hint'>Escanea o busca un producto del almacén.</p>"; return; }
+  root.innerHTML = tabla(["Producto","En almacén","Cantidad","Precio","Total",""], mayCart.map((l, i) => [
+    escDash(l.nombre), String(l.stock),
+    `<input type="number" min="0.01" step="0.01" value="${l.cantidad}" onchange="mayCart[${i}].cantidad=Number(this.value);pintarPedidoMayor()"/>`,
+    `<input type="number" min="0" step="0.01" value="${l.precio}" onchange="mayCart[${i}].precio=Number(this.value);pintarPedidoMayor()"/>`,
+    money(Number(l.precio) * Number(l.cantidad)),
+    `<button class="sec" type="button" onclick="mayCart.splice(${i},1);pintarPedidoMayor()">Quitar</button>`
+  ]));
+}
+function agregarMayor(p){
+  const hit = mayCart.find(x => x.id === p.id);
+  if (hit) hit.cantidad = Math.round((Number(hit.cantidad) + 1) * 100) / 100;
+  else mayCart.push({id: p.id, nombre: p.nombre, precio: Number(p.precio), cantidad: 1, stock: Number(p.stock)});
+  pintarPedidoMayor();
+}
+async function buscarMayor(){
+  const caja = document.getElementById("mayQ");
+  const texto = caja ? caja.value.trim() : "";
+  const d = await api("/api/mayor/productos?q=" + encodeURIComponent(texto));
+  const exacto = (d.items || []).find(p => {
+    const codes = [p.codigo, p.codigo_producto].map(s => String(s || "").trim().toLowerCase());
+    return texto && codes.includes(texto.toLowerCase());
+  });
+  const root = document.getElementById("mayBusca");
+  if (exacto) {
+    agregarMayor(exacto);
+    if (caja) caja.value = "";
+    if (root) root.innerHTML = "";
+    return;
+  }
+  if (!root) return;
+  root.innerHTML = (d.items || []).map(p => `<button class="sec" type="button" style="margin:0 8px 8px 0" onclick='agregarMayor(${JSON.stringify(p).replaceAll("'","&#39;")})'>${escDash(p.nombre)} · ${money(p.precio)} · almacén ${p.stock}</button>`).join("")
+    || "<p class='hint'>Ningún producto coincide.</p>";
+}
+async function guardarMayor(){
+  if (!mayCart.length) { formMsg.style.color = "var(--danger)"; formMsg.textContent = "Agrega un producto del almacén."; return; }
+  try {
+    const r = await api("/api/mayor", {method:"POST", body: JSON.stringify({
+      cliente: (document.getElementById("mayCliente") || {}).value || "",
+      nota: (document.getElementById("mayNota") || {}).value || "",
+      items: mayCart.map(l => ({id: l.id, cantidad: Number(l.cantidad), precio: Number(l.precio)}))
+    })});
+    mayCart = [];
+    formMsg.style.color = "var(--ok)";
+    formMsg.textContent = r.numero + " registrado. Salió del almacén " + money(r.total) + ".";
+    await cargarMayor();
+  } catch(e) { formMsg.style.color = "var(--danger)"; formMsg.textContent = e.message; }
+}
+async function cargarMayor(){
+  pintarPedidoMayor();
+  const root = document.getElementById("mayHist");
+  if (!root) return;
+  try {
+    const d = await api("/api/mayor");
+    root.innerHTML = (d.items || []).length ? (d.items || []).map(v => {
+      const lineas = (v.lineas || []).map(l => escDash(l.nombre) + " × " + l.cantidad).join(" · ");
+      return `<p><b>${escDash(v.numero)}</b> · ${escDash(String(v.fecha || "").slice(0, 16))} · ${escDash(v.cliente)} · ${escDash(v.usuario)} · ${money(v.total)}<br><span class="hint">${lineas}${v.nota ? " · " + escDash(v.nota) : ""}</span></p>`;
+    }).join("") : "<p class='hint'>Todavía no hay ventas al por mayor.</p>";
+  } catch(e) { root.innerHTML = `<p class="hint">${escDash(e.message)}</p>`; }
+  const caja = document.getElementById("mayQ");
+  if (caja && document.activeElement === document.body) caja.focus();
+}
 async function pintarForm(nombre){
   const lista = await productos();
   const opts = opcionesProductos(lista);
@@ -7200,6 +7476,8 @@ async function pintarForm(nombre){
       `<div class="form"><button onclick="armarCombo()">Armar combo</button></div><div id="comboTabla"></div><h3 style="margin:22px 0 8px">Especiales</h3><div class="form"><label>Producto<select id="espProd">${opts}</select></label><label>Tipo<select id="espTipo"><option value="2x1">2x1</option><option value="3x2">3x2</option></select></label><button class="sec" onclick="crearEspecial()">Crear especial</button></div><div id="espTabla"></div>`],
     kardex: ["Kardex", "Movimientos de un producto: ventas, compras, transferencias y devoluciones.",
       `<div class="form"><label>Producto<select id="kxProd" onchange="cargarKardex()">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
+    mayor: ["Venta al por mayor", "La vende el almacén, no la caja. Baja el stock de Almacén y deja el registro de lo que salió. Si el producto está en otra bodega, transfiérelo antes.",
+      `<div class="form"><label class="wide">Buscar en el almacén<input id="mayQ" placeholder="Nombre o código de barras" autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();buscarMayor()}"/></label><button class="sec" type="button" onclick="buscarMayor()">Buscar</button></div><div id="mayBusca"></div><h3 style="margin:18px 0 8px">Pedido del almacén</h3><div id="mayLineas"></div><div class="form"><label>Cliente<input id="mayCliente" placeholder="Quién compra al por mayor"/></label><label class="wide">Nota<input id="mayNota" placeholder="Entrega, conduce, observación"/></label><button type="button" onclick="guardarMayor()">Registrar venta</button></div><h3 style="margin:22px 0 8px">Registro del almacén</h3><div id="mayHist"></div>`],
     historial: ["Facturas emitidas", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
       `<div class="form" id="histFiltros"><label id="histEstadoCaja">Estado<select id="histEstado"><option value="emitidas">Emitidas</option><option value="anuladas">Anuladas</option><option value="todos">Todas</option></select></label><label id="histDesdeCaja">Desde<input id="histDesde" type="date"/></label><label id="histHastaCaja">Hasta<input id="histHasta" type="date"/></label><button class="sec" onclick="cargarHistorial()">Cargar</button><p class="hint wide" id="histNota" hidden>Solo ves las facturas emitidas hoy. El historial completo es del administrador.</p></div><div id="docVista"></div><div id="histTabla"></div>`],
     cotizaciones: ["Cotizaciones", "Abre el presupuesto para verlo o cambiar cantidades, productos y cliente.", ""],
@@ -7246,6 +7524,7 @@ async function pintarForm(nombre){
   if(nombre==="inventario") await cargarInventario();
   if(nombre==="combos") await cargarCombos();
   if(nombre==="historial") await cargarHistorial();
+  if(nombre==="mayor") await cargarMayor();
   if(nombre==="kardex") await cargarKardex();
   if(nombre==="cotizaciones") await cargarCotizaciones();
   if(nombre==="indicadores") await cargarIndicadores();

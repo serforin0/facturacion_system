@@ -54,6 +54,7 @@ def test_las_paginas_del_mostrador_responden(api):
     assert 'id="vendiendo"' in html
     assert "0x1b, 0x70, 0x00, 0x19, 0xfa" in html
     assert "abrirCajon(); ver('caja')" in html
+    assert "Venta al por mayor" in html
 
 
 def test_sin_sesion_no_hay_estado_ni_venta(api):
@@ -178,3 +179,65 @@ def test_inventario_metodos_y_empresa_responden_al_admin(api):
     ecf = api.get("/api/ecf/estado")
     assert ecf.status_code == 200
     assert ecf.json()["activo"] is False
+
+
+def test_la_venta_al_por_mayor_baja_el_stock_del_almacen(api):
+    _entrar(api, "empleado", "empreado07!")
+    assert api.get("/api/mayor").status_code == 403
+    api.post("/api/logout")
+
+    _entrar(api)
+    assert "mayor" in api.get("/api/estado").json()["permisos"]
+    pid = _producto(api, codigo="MAY-1", precio=100, stock=20)
+    conn = api.base.get_connection()
+    conn.execute("UPDATE productos SET precio_2=80 WHERE id=?", (pid,))
+    conn.execute(
+        "INSERT INTO stock_bodega (producto_id, bodega, cantidad) VALUES (?, 'Almacén', 20)",
+        (pid,),
+    )
+    conn.commit()
+    conn.close()
+
+    vacia = api.post("/api/mayor", json={"cliente": "Colmado", "items": []})
+    assert vacia.status_code == 400
+
+    de_mas = api.post("/api/mayor", json={"cliente": "Colmado", "items": [{"id": pid, "cantidad": 50}]})
+    assert de_mas.status_code == 400
+
+    venta = api.post("/api/mayor", json={
+        "cliente": "Colmado Pérez",
+        "nota": "Entrega en la mañana",
+        "items": [{"id": pid, "cantidad": 4}],
+    })
+    assert venta.status_code == 200, venta.text
+    cuerpo = venta.json()
+    assert cuerpo["numero"].startswith("VM-")
+    assert cuerpo["total"] == 320
+    assert cuerpo["bodega"] == "Almacén"
+
+    conn = api.base.get_connection()
+    stock = conn.execute("SELECT stock FROM productos WHERE id=?", (pid,)).fetchone()[0]
+    almacen = conn.execute(
+        "SELECT cantidad FROM stock_bodega WHERE producto_id=? AND bodega='Almacén'",
+        (pid,),
+    ).fetchone()[0]
+    kardex = conn.execute(
+        """
+        SELECT tipo_codigo, bodega_codigo, cantidad
+        FROM movimientos_inventario WHERE producto_id=? ORDER BY id DESC LIMIT 1
+        """,
+        (pid,),
+    ).fetchone()
+    conn.close()
+    assert float(stock) == 16
+    assert float(almacen) == 16
+    assert kardex[0] == "MA"
+    assert kardex[1] == "Almacén"
+    assert float(kardex[2]) == -4
+
+    lista = api.get("/api/mayor")
+    assert lista.status_code == 200
+    item = next(v for v in lista.json()["items"] if v["numero"] == cuerpo["numero"])
+    assert item["cliente"] == "Colmado Pérez"
+    assert item["lineas"][0]["cantidad"] == 4
+    assert item["lineas"][0]["nombre"] == "Agua de prueba"
