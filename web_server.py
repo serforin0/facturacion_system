@@ -10907,3 +10907,14 @@ setInterval(() => {
 </body>
 </html>
 """
+
+
+def main() -> None:
+    import uvicorn
+
+    puerto = int(os.environ.get("FACTURACION_PUERTO", "8099"))
+    uvicorn.run(app, host="127.0.0.1", port=puerto, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()
