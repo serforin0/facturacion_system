@@ -5958,7 +5958,7 @@ HTML = """<!DOCTYPE html>
       <button class="nav" data-view="cobros" data-mod="cobros" onclick="ver('cobros')">Cuentas por cobrar</button>
       <button class="nav" data-view="dev" data-mod="devoluciones" onclick="ver('dev')">Devoluciones</button>
       <div class="nav-grupo" data-grupo="caja">Caja</div>
-      <button class="nav" data-view="caja" data-mod="caja" data-fn="caja" onclick="ver('caja')" id="btnCaja">Abrir caja</button>
+      <button class="nav" data-view="caja" data-mod="caja" data-fn="caja" onclick="abrirCajon(); ver('caja')" id="btnCaja">Abrir caja</button>
       <button class="nav" data-view="ingreso" data-mod="caja" data-fn="ingreso" onclick="ver('ingreso')">Ingreso de efectivo</button>
       <button class="nav" data-view="retiro" data-mod="caja" data-fn="retiro" onclick="ver('retiro')">Retiro de efectivo</button>
       <button class="nav" data-view="cerrar" data-mod="caja" data-fn="cerrar" onclick="ver('cerrar')">Cuadre y cierre</button>
@@ -6750,9 +6750,12 @@ async function abrirCajaDesdeVenta(){
     return;
   }
   try {
+    const puerto = pedirPuertoCajon();
     await api("/api/caja/abrir", {method:"POST", body: JSON.stringify({nombre: nombre ? nombre.value : "Caja 1", fondo: Number(fondo.value)})});
     msg.style.color = "var(--ok)";
     msg.textContent = "Caja abierta. Ya se puede vender.";
+    try { if (puerto) await puerto; } catch (err) {}
+    await pulsarCajon();
     await refrescar();
   } catch(e) {
     msg.style.color = "var(--danger)";
@@ -6827,33 +6830,48 @@ async function dejarEnMesa(){
     msg.textContent = e.message;
   }
 }
+function pedirPuertoCajon(){
+  if (!navigator.serial || window._puertoCajon) return Promise.resolve(window._puertoCajon || null);
+  if (window._pidiendoCajon) return window._pidiendoCajon;
+  window._pidiendoCajon = navigator.serial.getPorts().then(lista => lista[0] || navigator.serial.requestPort()).then(puerto => {
+    window._puertoCajon = puerto;
+    return puerto;
+  }).finally(() => { window._pidiendoCajon = null; });
+  return window._pidiendoCajon;
+}
 async function asegurarPuertoCajon(){
-  if (!navigator.serial) return;
-  if (window._puertoCajon) return;
-  try {
-    const previos = await navigator.serial.getPorts();
-    window._puertoCajon = previos[0] || await navigator.serial.requestPort();
-  } catch (e) {}
+  try { await pedirPuertoCajon(); } catch (e) {}
 }
 async function pulsarCajon(){
   const puerto = window._puertoCajon;
-  if (!puerto) return;
+  if (!puerto) return false;
+  let writer;
   try {
-    await puerto.open({baudRate: 9600});
-    const writer = puerto.writable.getWriter();
-    await writer.write(new Uint8Array([0x1b, 0x70, 0x00, 0x19, 0xfa]));
-    writer.releaseLock();
-    await puerto.close();
-  } catch (e) {}
+    if (!puerto.writable) await puerto.open({baudRate: 9600});
+    writer = puerto.writable.getWriter();
+    // Pulso ESC/POS genérico: pin 2 y pin 5, 50 ms. Lo usan Epson y la 2connet POS80.
+    await writer.write(new Uint8Array([0x1b, 0x70, 0x00, 0x19, 0xfa, 0x1b, 0x70, 0x01, 0x19, 0xfa]));
+    return true;
+  } catch (e) {
+    try { if (puerto.writable) await puerto.close(); } catch (err) {}
+    return false;
+  } finally {
+    try { if (writer) writer.releaseLock(); } catch (err) {}
+  }
 }
 async function abrirCajon(){
   if (!navigator.serial) {
-    aviso("Chrome puede abrir el cajón si la impresora está conectada por USB.", "error");
+    aviso("Chrome puede abrir la caja si la impresora está conectada por USB.", "error");
     return;
   }
-  await asegurarPuertoCajon();
-  if (!window._puertoCajon) return;
-  await pulsarCajon();
+  try {
+    await pedirPuertoCajon();
+    const ok = await pulsarCajon();
+    if (!ok) aviso("No se pudo abrir la caja. Revisa la impresora y el cable del cajón.", "error");
+  } catch (e) {
+    if (e && e.name === "NotFoundError") return;
+    aviso("Elige la impresora de la caja para abrir el cajón.", "error");
+  }
 }
 function add(p, precio){
   if (!window._caja) {
@@ -7477,6 +7495,8 @@ async function guardarCaja(){
     errorModal({message:"Indica la caja chica. Si abres sin efectivo, escribe 0."});
     return;
   }
+  const abriendo = !window._turnoId;
+  const puerto = abriendo ? pedirPuertoCajon() : null;
   try {
     const editando = window._turnoId;
     const body = {nombre: cajaNombre.value, fondo: Number(cajaFondo.value)};
@@ -7486,6 +7506,10 @@ async function guardarCaja(){
       await api("/api/caja/abrir", {method:"POST", body: JSON.stringify(body)});
     }
     window._turnoId = null;
+    if (abriendo) {
+      try { if (puerto) await puerto; } catch (err) {}
+      await pulsarCajon();
+    }
     okModal(editando ? "Turno actualizado." : "Turno abierto.");
     await refrescar();
     await cargarPanelCaja("caja");
