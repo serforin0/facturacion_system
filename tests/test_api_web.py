@@ -50,6 +50,8 @@ def test_las_paginas_del_mostrador_responden(api):
     assert 'id="invCod"' in html
     assert "Escanea o escribe" in html
     assert "function lecturaDeLector" in html
+    assert 'id="btnAbrirCobro"' in html
+    assert "function abrirCobro" in html
     assert "function lecturaEnProducto" in html
     assert 'id="vendiendo"' in html
     assert "0x1b, 0x70, 0x00, 0x19, 0xfa" in html
@@ -241,6 +243,46 @@ def test_la_venta_al_por_mayor_baja_el_stock_del_almacen(api):
     assert item["cliente"] == "Colmado Pérez"
     assert item["lineas"][0]["cantidad"] == 4
     assert item["lineas"][0]["nombre"] == "Agua de prueba"
+
+
+def test_la_transferencia_se_cobra_solo_con_el_monto(api):
+    _entrar(api)
+    abierta = api.post("/api/caja/abrir", json={"nombre": "Caja", "fondo": 0})
+    assert abierta.status_code == 200
+    pid = _producto(api, codigo="TRF-1", precio=40, stock=5)
+    exacta = api.post("/api/vender", json={
+        "items": [{"id": pid, "cantidad": 1}],
+        "pagos": [{"codigo": "transferencia", "monto": 47.20}],
+    })
+    assert exacta.status_code == 200, exacta.text
+    cuerpo = exacta.json()
+    assert cuerpo["total"] == 47.20
+    assert cuerpo["cambio"] == 0
+    assert cuerpo["pagos"] == [{"codigo": "transferencia", "nombre": "Transferencia", "monto": 47.20, "referencia": ""}]
+
+    pid2 = _producto(api, codigo="TRF-2", precio=100, stock=5)
+    conn = api.base.get_connection()
+    conn.execute("UPDATE productos SET precio_2=40 WHERE id=?", (pid2,))
+    conn.commit()
+    conn.close()
+    de_mas = api.post("/api/vender", json={
+        "items": [{"id": pid2, "cantidad": 1, "nivel": 2}],
+        "pagos": [{"codigo": "transferencia", "monto": 118}],
+    })
+    assert de_mas.status_code == 200, de_mas.text
+    cobrada = de_mas.json()
+    assert cobrada["total"] == 47.20
+    assert cobrada["cambio"] == 0
+    assert cobrada["pagos"][0]["codigo"] == "transferencia"
+    assert cobrada["pagos"][0]["monto"] == 47.20
+
+    tarjeta = api.post("/api/vender", json={
+        "items": [{"id": pid2, "cantidad": 1, "nivel": 2}],
+        "pagos": [{"codigo": "tarjeta", "monto": 60}],
+        "autorizacion": "AB12",
+    })
+    assert tarjeta.status_code == 400
+    assert "no entran a caja" in tarjeta.json()["detail"]
 
 
 def test_el_empleado_publica_la_venta_y_el_cuadre_la_recibe(api):

@@ -1227,9 +1227,21 @@ class FacturaManager:
                 )
                 return None
         total = self._a_cobrar()
+        es_cred = self._condicion_es_credito_plazo()
+        if not es_cred:
+            otros_exactos = tar + otro + saldo
+            if otros_exactos > total + 0.02:
+                messagebox.showerror(
+                    "Cobro",
+                    "Tarjeta y otros métodos no pueden superar el total. "
+                    "El cambio se calcula solo sobre el efectivo.",
+                )
+                return None
+            cupo = round(max(0.0, total - otros_exactos), 2)
+            if trf > cupo:
+                trf = cupo
         exactos = tar + trf + otro + saldo
         total_pagos = ef + exactos
-        es_cred = self._condicion_es_credito_plazo()
         if es_cred:
             if total_pagos > total + 0.02:
                 messagebox.showerror(
@@ -1239,13 +1251,6 @@ class FacturaManager:
                 return None
             ef_guardar = ef
         else:
-            if exactos > total + 0.02:
-                messagebox.showerror(
-                    "Cobro",
-                    "Tarjeta, transferencia y otros métodos no pueden superar el total. "
-                    "El cambio se calcula solo sobre el efectivo.",
-                )
-                return None
             if total_pagos < total - 0.01:
                 messagebox.showerror(
                     "Pago insuficiente",

@@ -1214,10 +1214,29 @@ def vender(request: Request, body: VentaIn):
             disponible = base.saldo_favor_cliente(body.cliente_id, conn=conn)
             if usar_saldo > disponible + 0.009:
                 raise HTTPException(status_code=400, detail=f"El cliente solo tiene {disponible:.2f} de saldo a favor")
+        # La transferencia se cobra con el monto, como el efectivo: el cliente enseña
+        # el comprobante. Si escriben de más, se guarda solo el total de la factura.
+        otros_fuera = round(
+            sum(monto for codigo, monto in entradas if codigo not in afectan and codigo != "transferencia"),
+            2,
+        )
+        if otros_fuera > a_cobrar + 0.02:
+            raise HTTPException(status_code=400, detail="Los pagos que no entran a caja no pueden superar el total")
+        cupo_transfer = round(max(0.0, a_cobrar - otros_fuera), 2)
+        transferido = round(sum(monto for codigo, monto in entradas if codigo == "transferencia"), 2)
+        if transferido > cupo_transfer + 0.009:
+            sobra = round(transferido - cupo_transfer, 2)
+            ajustadas = []
+            for codigo, monto in entradas:
+                if codigo == "transferencia" and sobra > 0:
+                    quita = min(monto, sobra)
+                    monto = round(monto - quita, 2)
+                    sobra = round(sobra - quita, 2)
+                if monto > 0.009:
+                    ajustadas.append((codigo, round(monto, 2)))
+            entradas = ajustadas
         fuera = round(sum(monto for codigo, monto in entradas if codigo not in afectan), 2)
         entregado_caja = round(sum(monto for codigo, monto in entradas if codigo in afectan), 2)
-        if fuera > a_cobrar + 0.02:
-            raise HTTPException(status_code=400, detail="Los pagos que no entran a caja no pueden superar el total")
         por_cubrir_caja = round(max(0.0, a_cobrar - fuera), 2)
         ef_guardar = round(min(entregado_caja, por_cubrir_caja), 2)
         cambio = round(max(0.0, entregado_caja - por_cubrir_caja), 2)
@@ -5797,14 +5816,34 @@ HTML = """<!DOCTYPE html>
   .bajo { outline:0; }
 
   /* Ticket */
-  .rail { width:340px; flex-shrink:0; background:var(--surface); border-radius:var(--radius-card); padding:18px 16px; position:sticky; top:calc(64px + var(--gap)); max-height:calc(100vh - 64px - var(--gap) * 2); overflow-y:auto; display:flex; flex-direction:column; }
+  .rail { width:400px; flex-shrink:0; background:var(--surface); border-radius:var(--radius-card); padding:0; position:sticky; top:calc(64px + var(--gap)); max-height:calc(100vh - 64px - var(--gap) * 2); overflow:hidden; display:flex; flex-direction:column; }
   .rail > * { flex-shrink:0; }
-  .rail h3 { margin:0 0 4px; font-size:16px; font-weight:600; }
+  .rail h3 { margin:0; font-size:18px; font-weight:700; }
+  .factura-cabeza { padding:16px 16px 0; }
+  .factura-datos { display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; padding:12px 16px 0; }
+  .factura-datos .ancho, .factura-cliente { grid-column:1 / -1; }
+  .factura-datos label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); min-width:0; }
+  .factura-datos select, .factura-datos input { width:100%; font-size:13px; }
+  .factura-cliente { display:flex; align-items:flex-end; gap:8px; }
+  .factura-cliente label { flex:1; }
+  .factura-cliente button { height:40px; flex:none; }
+  .factura-mesero { display:flex; gap:8px; }
+  .factura-mesero input { flex:1; }
+  .factura-cuerpo { flex:1 1 auto; min-height:180px; overflow:auto; padding:8px 16px 4px; }
+  .factura-pie { padding:10px 16px 14px; border-top:1px solid var(--rule); }
+  .factura-vender { display:flex; align-items:stretch; background:var(--raised); border-radius:12px; overflow:hidden; }
+  .factura-vender #btnAbrirCobro { flex:1; width:auto; margin:0; height:56px; border-radius:12px 0 0 12px; font-size:16px; }
+  .factura-vender .placa-total { margin:0; border-radius:0; min-width:138px; display:flex; align-items:center; justify-content:flex-end; padding:8px 14px; }
+  .factura-vender #tot { font-size:22px; margin:0; }
+  .factura-meta { display:flex; justify-content:space-between; align-items:center; margin-top:8px; font-size:13px; color:var(--muted); }
+  .factura-meta button.texto { background:transparent; color:var(--r-caja); height:auto; padding:0; font-weight:600; }
+  @media (hover:hover) and (pointer:fine) { .factura-meta button.texto:hover { background:transparent; color:var(--text); } }
   ul { list-style:none; padding:0; margin:0; max-height:280px; overflow:auto; }
   li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 0; border-bottom:1px solid var(--rule); }
-  #lines { overflow-x:hidden; }
+  #lines { overflow-x:hidden; max-height:none; overflow-y:visible; }
   #lines li:last-child { border-bottom:0; }
-  #lines li.vacio { display:block; border:0; padding:18px 0; text-align:center; font-size:13px; color:var(--faint); }
+  #lines li.vacio { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; min-height:240px; border:0; padding:28px 24px; text-align:center; font-size:14px; line-height:1.45; color:var(--faint); }
+  #lines li.vacio .cesta { width:46px; height:46px; color:var(--faint); opacity:.7; }
   #lines li > span:first-child { display:flex; align-items:center; gap:6px; min-width:0; flex:1; line-height:1.3; }
   #lines li .nombre { min-width:0; overflow-wrap:anywhere; margin-left:2px; }
   #lines li > span:last-child { white-space:nowrap; font-weight:600; }
@@ -5812,6 +5851,7 @@ HTML = """<!DOCTYPE html>
   #lines li .nombre button.sec { width:auto; min-height:28px; height:auto; padding:0 8px; }
   #lines li .num { display:inline-block; min-width:1.4em; text-align:center; }
   #lines li .mini { width:36px; height:36px; border-radius:8px; flex:none; background:var(--raised) center / cover no-repeat; }
+  #lines li .unitario { display:block; color:var(--faint); font-size:12px; font-weight:500; }
   .vendiendo { display:grid; grid-template-columns:minmax(96px, 180px) minmax(0, 1fr); gap:16px; align-items:center; margin:0 0 12px; padding:12px; border-radius:16px; background:var(--surface); border:1px solid var(--rule); }
   .vendiendo[hidden] { display:none; }
   .vendiendo-foto { height:150px; border-radius:12px; background:var(--raised) center / contain no-repeat; display:grid; place-items:center; color:var(--faint); font-size:13px; font-weight:600; }
@@ -5838,11 +5878,13 @@ HTML = """<!DOCTYPE html>
   .pagos { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:8px; }
   .pagos .ancho { grid-column:1 / -1; }
   .pagos label, .campo { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); min-width:0; }
+  .pagos label[hidden] { display:none; }
   .pagos select, .pagos input { font-size:13px; min-width:0; width:100%; }
   .campo-cab { display:flex; justify-content:space-between; align-items:center; gap:8px; }
   button.mini { height:24px; padding:0 10px; font-size:12px; }
   #pagosDyn { display:contents; }
   .info-cliente { font-size:12px; color:var(--muted); display:flex; flex-wrap:wrap; gap:4px 12px; }
+  .info-cliente[hidden] { display:none; }
   .info-cliente b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
   .info-cliente .alerta { color:var(--negative); }
   label.check, .form label.check { flex-direction:row; align-items:center; gap:8px; font-size:13px; color:var(--text); cursor:pointer; }
@@ -5918,7 +5960,11 @@ HTML = """<!DOCTYPE html>
   .form input[type=file] { padding:9px 10px; font-size:12px; }
   #view-form h3 { margin:22px 0 4px; font-size:15px; }
   #cambio { margin:2px 0; color:var(--muted); }
-  #btnCobrar { height:52px; font-size:17px; font-weight:700; position:relative; }
+  #cobro .modal-card { width:min(520px, 100%); }
+  .cobro-total { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin:0 0 14px; }
+  .cobro-total small { color:var(--muted); font-size:12px; font-weight:700; }
+  .cobro-total b { font-size:28px; line-height:1; }
+  #btnAbrirCobro, #btnCobrar { height:52px; font-size:17px; font-weight:700; position:relative; }
   #btnCobrar.cobrando { color:transparent; }
   #btnCobrar.cobrando::after { content:"Cobrando…"; position:absolute; inset:0; display:grid; place-items:center; color:var(--ground); }
   .opciones { font-size:12px; color:var(--faint); }
@@ -5928,7 +5974,8 @@ HTML = """<!DOCTYPE html>
   .muestra-impresion { background:#d6d3d1; border-radius:16px; padding:16px 8px; overflow:auto; }
   .muestra-impresion iframe { display:block; margin:0 auto; background:#fff; border:0; box-shadow:0 8px 24px rgba(0,0,0,.22); }
   .ticket-acciones { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
-  .ticket-acciones button { width:100%; }
+  .ticket-acciones button, .ticket-acciones a.sec { width:100%; }
+  .ticket-acciones a.sec { display:grid; place-items:center; height:36px; border-radius:999px; text-decoration:none; }
   #facturasAbiertas { display:flex; gap:6px; overflow-x:auto; margin:0 0 12px; padding-bottom:2px; }
   #facturasAbiertas button { flex:none; height:34px; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0 12px; }
   #facturasAbiertas button.on { background:var(--r-venta); color:var(--r-venta-ink); }
@@ -6052,6 +6099,7 @@ HTML = """<!DOCTYPE html>
   /* Ventana modal */
   .modal { display:none; position:fixed; inset:0; z-index:50; background:var(--modal-fondo); align-items:flex-start; justify-content:center; padding:56px 16px 24px; overflow:auto; opacity:0; transition: opacity 160ms ease, display 160ms allow-discrete; }
   .modal.on { display:flex; opacity:1; transition: opacity 220ms var(--ease-out), display 220ms allow-discrete; }
+  #modal { z-index:60; }
   @starting-style { .modal.on { opacity:0; } }
   .modal-card { width:min(760px, 100%); background:var(--surface); border-radius:var(--radius-card); padding:22px 22px 10px; box-shadow:0 24px 48px rgba(0,0,0,.45); /* taste-skill-ignore: diálogo flotante */ transform: translateY(8px) scale(0.97); opacity:0; transition: transform 160ms ease, opacity 140ms ease; }
   .modal.on .modal-card { transform:none; opacity:1; transition: transform 260ms var(--ease-out), opacity 200ms var(--ease-out); }
@@ -6245,14 +6293,8 @@ HTML = """<!DOCTYPE html>
               <div id="sinCajaForm"></div>
             </div>
             <div class="toolbar">
-              <input id="q" type="search" placeholder="Buscar por nombre o escanear código" aria-label="Buscar producto" autocomplete="off"/>
+              <input id="q" type="search" placeholder="Buscar productos" aria-label="Buscar producto" autocomplete="off"/>
               <select id="cat" aria-label="Categoría"></select>
-              <select id="lista" aria-label="Lista de precios">
-                <option value="1">Mínimo de venta</option>
-                <option value="2">Mayorista</option>
-                <option value="3">VIP</option>
-                <option value="4">Especial</option>
-              </select>
             </div>
             <div id="vendiendo" class="vendiendo" hidden>
               <div class="vendiendo-foto" id="vendiendoFoto">Sin foto</div>
@@ -6271,61 +6313,91 @@ HTML = """<!DOCTYPE html>
             <div class="msg" id="formMsg" role="status"></div>
           </section>
         </section>
-        <aside class="rail" aria-label="Ticket">
-          <h3>Ticket</h3>
-          <div id="facturasAbiertas" aria-label="Facturas abiertas"></div>
-          <div class="campo ancho">
-            <label for="codConduce">Código del mesero</label>
-            <div style="display:flex;gap:8px">
-              <input id="codConduce" placeholder="C0042" autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter'){event.preventDefault();verConduce()}"/>
-              <button class="sec" type="button" onclick="verConduce()">Traer pedido</button>
-            </div>
-            <div id="colaConduces" aria-live="polite"></div>
+        <aside class="rail" aria-label="Factura de venta">
+          <div class="factura-cabeza">
+            <h3>Factura de venta</h3>
+            <div id="facturasAbiertas" aria-label="Facturas abiertas"></div>
           </div>
-          <ul id="lines"><li class="vacio">Toca un producto, escanea un código o trae el pedido del mesero.</li></ul>
-          <div class="desglose" id="desglose"></div>
-          <div class="placa-total" id="placaTotal">
-            <small>Total a cobrar</small>
-            <p id="tot">RD$ 0.00</p>
-            <div class="placa-cobrado" id="placaCobrado" aria-hidden="true"><small></small><b></b></div>
-          </div>
-          <div class="pagos">
-            <div class="campo ancho">
-              <div class="campo-cab"><label for="cliVenta">Cliente</label><button class="sec mini" type="button" onclick="popupCliente()">Nuevo cliente</button></div>
-              <select id="cliVenta" onchange="actualizarClienteVenta()"><option value="">Consumidor final</option></select>
-              <div class="info-cliente" id="infoCliente" hidden></div>
+          <div class="factura-datos">
+            <label>Lista de precio<select id="lista" aria-label="Lista de precios">
+              <option value="1">Mínimo de venta</option>
+              <option value="2">Mayorista</option>
+              <option value="3">VIP</option>
+              <option value="4">Especial</option>
+            </select></label>
+            <label>Comprobante<select id="tipoComp" aria-label="Comprobante"><option value="consumidor_final">Consumidor final</option><option value="credito_fiscal">Crédito fiscal</option></select></label>
+            <div class="factura-cliente">
+              <label>Cliente<select id="cliVenta" onchange="actualizarClienteVenta()"><option value="">Consumidor final</option></select></label>
+              <button class="sec" type="button" onclick="popupCliente()">Nuevo</button>
             </div>
-            <label>Comprobante<select id="tipoComp"><option value="consumidor_final">Consumidor final</option><option value="credito_fiscal">Crédito fiscal</option></select></label>
-            <label>Descuento (RD$)<input id="desc" type="number" step="0.01" min="0" value="0" oninput="pintar()"/></label>
-            <label class="check ancho"><input type="checkbox" id="propina10" onchange="pintar()"/> 10% de ley</label>
-            <label>Autorización de la terminal<input id="authTarjeta" autocomplete="off" spellcheck="false" placeholder="La del voucher, mínimo 4"/></label>
-            <div id="pagosDyn"></div>
-            <label class="check ancho" id="filaCredito"><input type="checkbox" id="aCredito" onchange="pintar()"/> Venta a crédito (fiado)</label>
-            <p id="cambio" class="ancho">Cambio: RD$ 0.00</p>
-            <button id="btnCobrar" class="ancho" onclick="cobrar()" disabled>Cobrar</button>
-            <details class="opciones ancho">
-              <summary>Más opciones: terminal, vendedor, notas e impresión</summary>
-              <label id="filaTerminal" hidden>Terminal<select id="termVenta" onchange="elegirTerminal(true)"><option value="">Sin terminal</option></select></label>
-              <label id="filaVendedor" hidden>Vendedor<select id="vendVenta"><option value="">Sin vendedor</option></select></label>
-              <label>Observaciones<input id="obsVenta" maxlength="500" placeholder="Ej.: entregar en la casa, pagó con cheque"/></label>
-              <label>Papel de la impresora<select id="anchoTicket"><option value="80">80 mm (supermercado)</option><option value="58">58 mm (portátil)</option></select></label>
-              <button type="button" class="sec" onclick="imprimirPrueba()">Probar impresora</button>
+            <div class="info-cliente ancho" id="infoCliente" hidden></div>
+            <div class="factura-mesero ancho">
+              <input id="codConduce" placeholder="Código del mesero" aria-label="Código del mesero" autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter'){event.preventDefault();verConduce()}"/>
+              <button class="sec" type="button" onclick="verConduce()">Traer</button>
+            </div>
+            <div id="colaConduces" class="ancho" aria-live="polite"></div>
+          </div>
+          <div class="factura-cuerpo">
+            <ul id="lines"><li class="vacio"><svg class="cesta" viewBox="0 0 48 48" aria-hidden="true"><path d="M14 18h20l-2 16H16l-2-16z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M19 18v-2.5a5 5 0 0 1 10 0V18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Aquí verás los productos que elijas en tu próxima venta</span></li></ul>
+            <div class="desglose" id="desglose"></div>
+          </div>
+          <div class="factura-pie">
+            <div class="factura-vender">
+              <button id="btnAbrirCobro" type="button" onclick="abrirCobro()" disabled>Cobrar</button>
+              <div class="placa-total" id="placaTotal">
+                <p id="tot">RD$ 0.00</p>
+                <div class="placa-cobrado" id="placaCobrado" aria-hidden="true"><small></small><b></b></div>
+              </div>
+            </div>
+            <div class="factura-meta">
+              <span id="facturaCuenta">0 productos</span>
+              <button type="button" class="texto" onclick="nuevaFactura()">Cancelar</button>
+            </div>
+            <details class="opciones">
+              <summary>Más acciones</summary>
+              <div class="ticket-acciones">
+                <button class="sec" type="button" onclick="imprimirPrecuenta()">Pre-cuenta</button>
+                <button class="sec" type="button" onclick="nuevaFactura()">Nueva factura</button>
+                <button class="sec" onclick="guardarCotizacion()">Cotizar</button>
+                <button class="sec" type="button" onclick="dejarEnMesa()">Dejar el resto en la mesa</button>
+                <button class="sec" type="button" onclick="abrirCajon()">Abrir cajón</button>
+                <a class="sec" href="/pantalla" target="_blank">Pantalla del cliente</a>
+              </div>
             </details>
+            <div class="msg" id="msg" role="status"></div>
           </div>
-          <div class="ticket-acciones">
-            <button class="sec" type="button" onclick="imprimirPrecuenta()">Pre-cuenta</button>
-            <button class="sec" type="button" onclick="nuevaFactura()">Nueva factura</button>
-            <button class="sec" onclick="guardarCotizacion()">Cotizar</button>
-            <button class="sec" type="button" onclick="dejarEnMesa()">Dejar el resto en la mesa</button>
-            <button class="sec" type="button" onclick="abrirCajon()">Abrir cajón</button>
-            <a class="sec" href="/pantalla" target="_blank" style="display:grid;place-items:center;height:36px;border-radius:999px;text-decoration:none">Pantalla del cliente</a>
-          </div>
-          <div class="msg" id="msg" role="status"></div>
         </aside>
       </div>
     </div>
   </div>
 </main>
+<div id="cobro" class="modal" onclick="if(event.target===this)cerrarCobro()">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cobroTitulo">
+    <div class="modal-head">
+      <h3 id="cobroTitulo">Cobrar</h3>
+      <button class="sec" type="button" onclick="cerrarCobro()">Cerrar</button>
+    </div>
+    <p class="cobro-total"><small>Total a cobrar</small><b id="cobroTot">RD$ 0.00</b></p>
+    <div class="pagos">
+      <label class="ancho">Descuento (RD$)<input id="desc" type="number" step="0.01" min="0" value="0" oninput="pintar()"/></label>
+      <label class="check ancho"><input type="checkbox" id="propina10" onchange="pintar()"/> 10% de ley</label>
+      <label id="filaAuth" hidden>Autorización de la terminal<input id="authTarjeta" autocomplete="off" spellcheck="false" placeholder="La del voucher, mínimo 4"/></label>
+      <div id="pagosDyn"></div>
+      <label class="check ancho" id="filaCredito"><input type="checkbox" id="aCredito" onchange="pintar()"/> Venta a crédito (fiado)</label>
+      <p id="cambio" class="ancho">Cambio: RD$ 0.00</p>
+      <div class="msg ancho" id="cobroMsg" role="status"></div>
+      <button id="btnCobrar" class="ancho" type="button" onclick="cobrar()" disabled>Cobrar</button>
+      <details class="opciones ancho">
+        <summary>Más opciones: terminal, vendedor, notas e impresión</summary>
+        <label id="filaTerminal" hidden>Terminal<select id="termVenta" onchange="elegirTerminal(true)"><option value="">Sin terminal</option></select></label>
+        <label id="filaVendedor" hidden>Vendedor<select id="vendVenta"><option value="">Sin vendedor</option></select></label>
+        <label>Observaciones<input id="obsVenta" maxlength="500" placeholder="Ej.: entregar en la casa, pagó con cheque"/></label>
+        <label>Papel de la impresora<select id="anchoTicket"><option value="80">80 mm (supermercado)</option><option value="58">58 mm (portátil)</option></select></label>
+        <button type="button" class="sec" onclick="imprimirPrueba()">Probar impresora</button>
+      </details>
+    </div>
+  </div>
+</div>
 <div id="modal" class="modal" onclick="if(event.target===this)cerrarModal()">
   <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitulo">
     <div class="modal-head">
@@ -6538,28 +6610,51 @@ function lecturaEnProducto(ev){
 document.addEventListener("keydown", lecturaEnProducto, true);
 let lector = { buf: "", t: 0, propio: false };
 function resetLector(){ lector = { buf: "", t: 0, propio: false }; }
+function cobroAbierto(){
+  const caja = document.getElementById("cobro");
+  return !!(caja && caja.classList.contains("on"));
+}
+function abrirCobro(){
+  if (!window._caja) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Abre la caja antes de vender.";
+    return;
+  }
+  if (!cart.length) return;
+  const avisoCobro = document.getElementById("cobroMsg");
+  if (avisoCobro) avisoCobro.textContent = "";
+  pintar();
+  document.getElementById("cobro").classList.add("on");
+  const efectivo = document.querySelector('.pago[data-codigo="efectivo"]');
+  if (efectivo) setTimeout(() => efectivo.focus(), 40);
+}
+function cerrarCobro(){
+  const caja = document.getElementById("cobro");
+  if (caja) caja.classList.remove("on");
+}
 function enfocarBusqueda(){
   const venta = document.getElementById("view-venta");
   const caja = document.getElementById("q");
-  if (!caja || !venta || venta.style.display === "none" || modal.classList.contains("on")) return;
+  if (!caja || !venta || venta.style.display === "none" || modal.classList.contains("on") || cobroAbierto()) return;
   const activo = document.activeElement;
   if (activo && activo !== document.body && (campoDeTexto(activo) || activo.tagName === "SELECT")) return;
   caja.focus();
 }
 function lecturaDeLector(ev){
   const venta = document.getElementById("view-venta");
-  if (!venta || venta.style.display === "none" || modal.classList.contains("on")) { resetLector(); return; }
+  if (!venta || venta.style.display === "none" || modal.classList.contains("on") || cobroAbierto()) { resetLector(); return; }
   if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return;
   const caja = document.getElementById("q");
   if (!caja) return;
   const ahora = performance.now();
   if (ev.key === "Enter" || ev.key === "Tab") {
-    const codigo = lector.buf;
-    const rapido = codigo.length >= 4 && (ahora - lector.t) < 120;
-    const propio = lector.propio;
-    const veniaDeBusqueda = ev.target === caja;
+    const reciente = lector.buf.length >= 4 && (ahora - lector.t) < 120;
+    const escrito = ev.target === caja ? caja.value.trim() : "";
+    const codigo = (lector.propio || reciente) && lector.buf.length >= 4
+      ? (escrito.length > lector.buf.length && escrito.endsWith(lector.buf) ? escrito : lector.buf)
+      : "";
     resetLector();
-    if (!rapido || (veniaDeBusqueda && !propio)) return;
+    if (codigo.length < 4) return;
     ev.preventDefault();
     ev.stopPropagation();
     caja.value = codigo;
@@ -6573,37 +6668,21 @@ function lecturaDeLector(ev){
   if (!sigue) { lector.buf = ""; lector.propio = false; }
   lector.buf += ev.key;
   lector.t = ahora;
-  const escribe = ev.target !== caja && campoDeTexto(ev.target) && !lector.propio;
-  if (escribe) {
-    if (lector.buf.length < 6) return;
-    ev.preventDefault();
+  const rafaga = sigue && lector.buf.length >= 2;
+  if (!rafaga && ev.target === caja) return;
+  if (!rafaga && campoDeTexto(ev.target)) return;
+  ev.preventDefault();
+  if (ev.target !== caja && campoDeTexto(ev.target)) {
     const puesto = lector.buf.slice(0, -1);
     const valor = ev.target.value || "";
     if (puesto && valor.endsWith(puesto)) {
       ev.target.value = valor.slice(0, -puesto.length);
       ev.target.dispatchEvent(new Event("input", {bubbles: true}));
     }
-    lector.propio = true;
-    caja.value = lector.buf;
-    caja.focus();
-    return;
   }
-  const suelto = ev.target !== caja && !campoDeTexto(ev.target);
-  if (lector.propio || (suelto && lector.buf.length >= 4) || (ev.target === caja && sigue && lector.buf.length >= 4)) {
-    ev.preventDefault();
-    lector.propio = true;
-    caja.focus();
-    caja.value = lector.buf;
-    return;
-  }
-  if (suelto) {
-    ev.preventDefault();
-    caja.focus();
-    const inicio = caja.selectionStart == null ? caja.value.length : caja.selectionStart;
-    const fin = caja.selectionEnd == null ? caja.value.length : caja.selectionEnd;
-    caja.setRangeText(ev.key, inicio, fin, "end");
-    caja.dispatchEvent(new Event("input", {bubbles: true}));
-  }
+  lector.propio = true;
+  caja.focus();
+  caja.value = lector.buf;
 }
 document.addEventListener("keydown", lecturaDeLector, true);
 async function api(url, opt){
@@ -6919,6 +6998,29 @@ function nombresLista(){
   const x = window._descuentos || {p2:2, p3:5, p4:10};
   return ["", "Mínimo de venta", "Por mayor "+x.p2+"%", "Por mayor "+x.p3+"%", "Por mayor "+x.p4+"%"];
 }
+function recordarPrecios(listaProductos){
+  window._precios = window._precios || {};
+  (listaProductos || []).forEach(p => {
+    window._precios[(p.combo ? "c" : "p") + p.id] = p;
+  });
+}
+function repreciarTicket(){
+  if (!cart.length || !window._precios) return false;
+  const nivel = Number(lista.value || 1);
+  let cambio = false;
+  cart.forEach(l => {
+    const p = window._precios[(l.combo ? "c" : "p") + l.id];
+    if (!p) return;
+    const base = l.combo ? Number(p.precio) : Number([p.precio, p.precio_2, p.precio_3, p.precio_4][nivel - 1] || p.precio);
+    const suma = (l.opciones || []).filter(o => o.on).reduce((s, o) => s + Number(o.precio || 0), 0);
+    const precio = Math.round((base + suma) * 100) / 100;
+    if (Number(l.precio) !== precio) cambio = true;
+    l.base = base;
+    l.precio = precio;
+    l.itbis = p.itbis !== false;
+  });
+  return cambio;
+}
 async function cargar(){
   grid.setAttribute("aria-busy", "true");
   let data;
@@ -6940,6 +7042,8 @@ async function cargar(){
     data.combos = (data.combos || []).filter(c => String(c.nombre).toLowerCase().includes(qv));
   }
   const tarjetas = data.productos.concat(data.combos || []);
+  recordarPrecios(tarjetas);
+  if (repreciarTicket()) pintar();
   const exacto = data.productos.find(p => {
     const codes = [p.codigo, p.codigo_producto].map(s => String(s || "").trim().toLowerCase());
     return qv && codes.includes(qv);
@@ -7204,10 +7308,13 @@ function mostrarVendiendo(l){
   if (cambio) animar(caja, [{transform:"translateY(8px)"}, {transform:"none"}], {duration:180});
 }
 function pintar(){
-  lines.innerHTML = cart.map((l,i)=>`<li><span>${window._conduceId ? `<input type="checkbox" ${l.cobrar === false ? "" : "checked"} onchange="marcarCobro(${i}, this.checked)" aria-label="Cobrar esta línea"/>` : ""}<span class="mini"${fotoLinea(l.imagen)} role="img" aria-label=""></span><button class="sec" onclick="cambiarCant(${i},-1)" aria-label="Quitar uno">${ICONO_MENOS}</button> <span class="num">${l.cantidad}</span> <button class="sec" onclick="cambiarCant(${i},1)" aria-label="Agregar uno">${ICONO_MAS}</button><span class="nombre">${String(l.nombre).replaceAll("<","&lt;")}${l.nota ? `<small> · ${String(l.nota).replaceAll("<","&lt;")}</small>` : ""} <button class="sec" type="button" onclick="rotarNotaCaja(${i})">Nota</button> ${(l.opciones||[]).map(o => `<button class="sec" type="button" onclick="toggleExtra(${i},${o.id})">${o.on ? "✓ " : ""}${String(o.nombre).replaceAll("<","&lt;")} ${money(o.precio)}</button>`).join(" ")}</span></span><span class="num">${money(l.precio*l.cantidad)}</span></li>`).join("")
-    || '<li class="vacio">Toca un producto o escanea un código para empezar.</li>';
+  lines.innerHTML = cart.map((l,i)=>`<li><span>${window._conduceId ? `<input type="checkbox" ${l.cobrar === false ? "" : "checked"} onchange="marcarCobro(${i}, this.checked)" aria-label="Cobrar esta línea"/>` : ""}<span class="mini"${fotoLinea(l.imagen)} role="img" aria-label=""></span><button class="sec" onclick="cambiarCant(${i},-1)" aria-label="Quitar uno">${ICONO_MENOS}</button> <span class="num">${l.cantidad}</span> <button class="sec" onclick="cambiarCant(${i},1)" aria-label="Agregar uno">${ICONO_MAS}</button><span class="nombre">${String(l.nombre).replaceAll("<","&lt;")}<small class="unitario">${l.cantidad} × ${money(l.precio)}</small>${l.nota ? `<small> · ${String(l.nota).replaceAll("<","&lt;")}</small>` : ""} <button class="sec" type="button" onclick="rotarNotaCaja(${i})">Nota</button> ${(l.opciones||[]).map(o => `<button class="sec" type="button" onclick="toggleExtra(${i},${o.id})">${o.on ? "✓ " : ""}${String(o.nombre).replaceAll("<","&lt;")} ${money(o.precio)}</button>`).join(" ")}</span></span><span class="num">${money(l.precio*l.cantidad)}</span></li>`).join("")
+    || '<li class="vacio"><svg class="cesta" viewBox="0 0 48 48" aria-hidden="true"><path d="M14 18h20l-2 16H16l-2-16z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M19 18v-2.5a5 5 0 0 1 10 0V18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Aquí verás los productos que elijas en tu próxima venta</span></li>';
+  const puedeCobrar = cart.length > 0 && !!window._caja;
+  const btnAbrir = document.getElementById("btnAbrirCobro");
+  if (btnAbrir) btnAbrir.disabled = !puedeCobrar;
   const btnCobrar = document.getElementById("btnCobrar");
-  if (btnCobrar && !btnCobrar.classList.contains("cobrando")) btnCobrar.disabled = !cart.length || !window._caja;
+  if (btnCobrar && !btnCobrar.classList.contains("cobrando")) btnCobrar.disabled = !puedeCobrar;
   const tocada = window._lineaTocada;
   window._lineaTocada = null;
   if (tocada && cart[tocada.indice]) window._vendiendo = cart[tocada.indice];
@@ -7232,18 +7339,25 @@ function pintar(){
     : "";
   tot.textContent = money(t.aCobrar);
   tot.classList.toggle("largo", tot.textContent.length > 12);
+  const cobroTot = document.getElementById("cobroTot");
+  if (cobroTot) cobroTot.textContent = tot.textContent;
   const unidades = cart.reduce((s, l) => s + Number(l.cantidad || 0), 0);
+  const cuenta = document.getElementById("facturaCuenta");
+  if (cuenta) cuenta.textContent = unidades + (unidades === 1 ? " producto" : " productos");
   document.getElementById("barraResumen").textContent = `${unidades} ${unidades === 1 ? "artículo" : "artículos"} · ${money(t.aCobrar)}`;
   actualizarBarraTicket();
   publicarPantalla(t);
   const pagos = pagosActuales();
   const cajaPago = pagos.find(p => p.caja);
-  const autoCaja = cajaPago && (cajaPago.el.dataset.auto === "1" || !cajaPago.monto);
-  if (cajaPago && autoCaja && pagos.every(p => p === cajaPago || !p.monto)) {
-    cajaPago.el.value = t.aCobrar ? t.aCobrar.toFixed(2) : "0";
+  if (cajaPago && cajaPago.el.dataset.auto !== "0" && (cajaPago.el.dataset.auto === "1" || !cajaPago.monto)) {
+    const otros = pagos.filter(p => p !== cajaPago).reduce((s, p) => s + p.monto, 0);
+    const resto = Math.max(0, Math.round((t.aCobrar - otros) * 100) / 100);
+    cajaPago.el.value = resto ? resto.toFixed(2) : "0";
     cajaPago.el.dataset.auto = "1";
-    cajaPago.monto = t.aCobrar;
+    cajaPago.monto = resto;
   }
+  const filaAuth = document.getElementById("filaAuth");
+  if (filaAuth) filaAuth.hidden = !pagos.some(p => p.codigo === "tarjeta" && p.monto > 0.009);
   const fuera = pagos.filter(p => !p.caja).reduce((s,p)=>s+p.monto,0);
   const enCaja = pagos.filter(p => p.caja).reduce((s,p)=>s+p.monto,0);
   const falta = Math.max(0, t.aCobrar - fuera - enCaja);
@@ -7302,8 +7416,8 @@ if ("IntersectionObserver" in window) {
   }).observe(document.getElementById("placaTotal"));
 }
 function irAlTicket(){
-  document.getElementById("btnCobrar").scrollIntoView({behavior: reducido() ? "auto" : "smooth", block: "center"});
-  setTimeout(() => document.getElementById("btnCobrar").focus({preventScroll: true}), reducido() ? 0 : 400);
+  document.getElementById("btnAbrirCobro").scrollIntoView({behavior: reducido() ? "auto" : "smooth", block: "center"});
+  setTimeout(() => document.getElementById("btnAbrirCobro").focus({preventScroll: true}), reducido() ? 0 : 400);
 }
 function cambiarCant(i, delta){
   cart[i].cantidad += delta;
@@ -9557,19 +9671,25 @@ function repintarPlaca(data){
     {clipPath:"inset(0 0 0 100%)"}
   ], {duration:2600, easing:"cubic-bezier(0.77, 0, 0.175, 1)"});
 }
+function avisoCobro(texto, ok){
+  const destino = cobroAbierto() ? document.getElementById("cobroMsg") : msg;
+  if (!destino) return;
+  destino.style.color = ok ? "var(--ok)" : "var(--danger)";
+  destino.textContent = texto;
+}
 async function cobrar(){
   if (!window._caja) {
-    msg.style.color = "var(--danger)";
-    msg.textContent = "Abre la caja antes de vender.";
+    avisoCobro("Abre la caja antes de vender.");
     return;
   }
+  const avisoPago = document.getElementById("cobroMsg");
+  if (avisoPago) avisoPago.textContent = "";
   msg.textContent = "";
   const pagos = pagosActuales();
   const tarjeta = pagos.find(p => p.codigo === "tarjeta" && p.monto > 0);
   const auth = ((document.getElementById("authTarjeta") || {}).value || "").replace(/[^a-z0-9]/gi, "");
   if (tarjeta && auth.length < 4) {
-    msg.style.color = "var(--danger)";
-    msg.textContent = "Cobra " + money(tarjeta.monto) + " en la terminal del banco y escribe la autorización del voucher.";
+    avisoCobro("Cobra " + money(tarjeta.monto) + " en la terminal del banco y escribe la autorización del voucher.");
     return;
   }
   const hayEfectivo = pagos.some(p => p.caja && p.monto > 0);
@@ -9603,6 +9723,7 @@ async function cobrar(){
       data = guardarVentaSinConexion(payload);
     }
     boton.classList.remove("cobrando");
+    cerrarCobro();
     imprimirRecibo(data);
     repintarPlaca(data);
     const pendienteId = window._esperaId;
@@ -9628,7 +9749,7 @@ async function cobrar(){
   } catch(e){
     boton.classList.remove("cobrando");
     pintar();
-    msg.style.color="var(--danger)"; msg.textContent = e.message;
+    avisoCobro(e.message);
   }
 }
 q.addEventListener("keydown", ev=>{ if(ev.key==="Enter") { clearTimeout(window._qT); cargar(); } });
