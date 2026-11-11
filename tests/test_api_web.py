@@ -50,8 +50,12 @@ def test_las_paginas_del_mostrador_responden(api):
     assert 'id="invCod"' in html
     assert "Escanea o escribe" in html
     assert "function lecturaDeLector" in html
+    assert 'data-view="libro-mayor"' in html
+    assert "Ventas al por mayor" in html
     assert 'id="btnAbrirCobro"' in html
     assert "function abrirCobro" in html
+    assert "function sinExistencia" in html
+    assert "no tiene stock" in html
     assert "function lecturaEnProducto" in html
     assert 'id="vendiendo"' in html
     assert "0x1b, 0x70, 0x00, 0x19, 0xfa" in html
@@ -161,6 +165,25 @@ def test_el_mesero_no_abre_caja_y_el_cajero_si_crea_cliente(api):
     assert corto.status_code == 400
 
 
+def test_el_inventario_sube_lo_que_no_tiene_stock(api):
+    _entrar(api)
+    conn = api.base.get_connection()
+    cur = conn.cursor()
+    insertar_producto(cur, "CON-1", "Con existencia", stock=4)
+    insertar_producto(cur, "SIN-1", "Agotado de prueba", stock=0)
+    conn.commit()
+    conn.close()
+    datos = api.get("/api/inventario").json()
+    nombres = [item["nombre"] for item in datos["items"]]
+    assert nombres.index("Agotado de prueba") < nombres.index("Con existencia")
+    assert "Agotado de prueba" in datos["sin_stock"]
+    estado = api.get("/api/estado").json()
+    assert "Agotado de prueba" in estado["sin_stock"]
+    indicadores = api.get("/api/indicadores").json()
+    assert indicadores["sin_stock"] >= 1
+    assert "Agotado de prueba" in indicadores["faltantes"]
+
+
 def test_inventario_metodos_y_empresa_responden_al_admin(api):
     _entrar(api)
     _producto(api, "WEB-INV", precio=50, stock=3)
@@ -216,6 +239,15 @@ def test_la_venta_al_por_mayor_baja_el_stock_del_almacen(api):
     assert cuerpo["numero"].startswith("VM-")
     assert cuerpo["total"] == 320
     assert cuerpo["bodega"] == "Almacén"
+    libro = api.get("/api/mayor", params={"q": "Colmado Pérez"})
+    assert libro.status_code == 200
+    assert libro.json()["cantidad"] == 1
+    assert libro.json()["items"][0]["numero"] == cuerpo["numero"]
+    assert libro.json()["total"] == 320
+    fuera = api.get("/api/mayor", params={"desde": "2000-01-01", "hasta": "2000-01-02"})
+    assert fuera.json()["cantidad"] == 0
+    local = api.get("/api/historial")
+    assert all(not str(f["numero"]).startswith("VM-") for f in local.json()["items"])
 
     conn = api.base.get_connection()
     stock = conn.execute("SELECT stock FROM productos WHERE id=?", (pid,)).fetchone()[0]

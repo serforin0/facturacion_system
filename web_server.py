@@ -363,6 +363,17 @@ def _descuento_promo(cur, producto_id: int, cantidad: float, precio: float, brut
     return 0.0
 
 
+def _nombres_sin_stock(cur) -> list[str]:
+    cur.execute(
+        """
+        SELECT nombre FROM productos
+        WHERE IFNULL(activo, 1) = 1 AND IFNULL(stock, 0) <= 0
+        ORDER BY nombre COLLATE NOCASE
+        """
+    )
+    return [nombre for (nombre,) in cur.fetchall()]
+
+
 SQL_PRODUCTOS = """
     SELECT id, nombre, precio, precio_base, precio_minimo,
            stock, codigo_barras, imagen_path,
@@ -830,10 +841,12 @@ def estado(request: Request):
     cur = conn.cursor()
     cur.execute("SELECT role FROM users WHERE username=?", (usuario,))
     role = (cur.fetchone() or ["user"])[0]
+    sin_stock = _nombres_sin_stock(cur) if role == "admin" else []
     conn.close()
     return {
         "usuario": usuario,
         "rol": role,
+        "sin_stock": sin_stock,
         "permisos": _permisos(usuario),
         "empresa": _empresa_visible(base),
         "itbis_incluido": _itbis_incluido(base),
@@ -3297,18 +3310,28 @@ def mayor_productos(request: Request, q: str = ""):
 
 
 @app.get("/api/mayor")
-def listar_mayor(request: Request):
+def listar_mayor(request: Request, q: str = "", desde: str = "", hasta: str = ""):
     _exigir(request, "mayor")
     conn = db().get_connection()
     cur = conn.cursor()
     _tablas_mayor(cur)
-    cur.execute(
-        """
+    sql = """
         SELECT id, numero, IFNULL(fecha,''), IFNULL(cliente,''), IFNULL(usuario,''),
                IFNULL(nota,''), IFNULL(total,0)
-        FROM ventas_mayor ORDER BY id DESC LIMIT 50
-        """
-    )
+        FROM ventas_mayor WHERE 1=1
+    """
+    params: list = []
+    texto = q.strip()
+    if texto:
+        sql += " AND (numero LIKE ? OR IFNULL(cliente,'') LIKE ? OR IFNULL(usuario,'') LIKE ?)"
+        params.extend([f"%{texto}%", f"%{texto}%", f"%{texto}%"])
+    inicio = (desde or "").strip()[:10]
+    fin = (hasta or "").strip()[:10]
+    if inicio and fin:
+        sql += " AND date(fecha) >= date(?) AND date(fecha) <= date(?)"
+        params.extend([inicio, fin])
+    sql += " ORDER BY id DESC LIMIT 300"
+    cur.execute(sql, params)
     ventas = []
     for vid, numero, fecha, cliente, usuario, nota, total in cur.fetchall():
         cur.execute(
@@ -3328,7 +3351,12 @@ def listar_mayor(request: Request):
             "usuario": usuario, "nota": nota, "total": float(total or 0), "lineas": lineas,
         })
     conn.close()
-    return {"items": ventas, "bodega": BODEGA_MAYOR}
+    return {
+        "items": ventas,
+        "bodega": BODEGA_MAYOR,
+        "cantidad": len(ventas),
+        "total": round(sum(v["total"] for v in ventas), 2),
+    }
 
 
 @app.post("/api/mayor")
@@ -3675,7 +3703,8 @@ def inventario(request: Request, q: str = ""):
     if q.strip():
         sql += " AND (p.nombre LIKE ? OR IFNULL(p.codigo_barras,'') LIKE ?)"
         params.extend([f"%{q.strip()}%", f"%{q.strip()}%"])
-    sql += " ORDER BY p.nombre COLLATE NOCASE LIMIT 200"
+    sql += """ ORDER BY CASE WHEN IFNULL(p.activo,1)=1 AND IFNULL(p.stock,0) <= 0 THEN 0 ELSE 1 END,
+        p.nombre COLLATE NOCASE LIMIT 200"""
     cur.execute(sql, params)
     rows = [
         {
@@ -3695,9 +3724,10 @@ def inventario(request: Request, q: str = ""):
         )
     for fila in rows:
         fila["extras"] = extras_por_producto.get(fila["id"], [])
+    sin_stock = _nombres_sin_stock(cur)
     conn.close()
     d2, d3, d4 = _descuentos_mayor(db())
-    return {"items": rows, "descuentos": {"p2": d2, "p3": d3, "p4": d4}}
+    return {"items": rows, "sin_stock": sin_stock, "descuentos": {"p2": d2, "p3": d3, "p4": d4}}
 
 
 @app.post("/api/inventario")
@@ -4296,6 +4326,7 @@ def indicadores(request: Request, rango: str = "semana"):
         """
     )
     caja = cur.fetchone()
+    sin_stock = _nombres_sin_stock(cur)
     conn.close()
     _rows, costo, valor_venta = base.get_inventory_valuation()
     return {
@@ -4318,6 +4349,8 @@ def indicadores(request: Request, rango: str = "semana"):
         "anuladas": anuladas,
         "valor_costo": costo,
         "valor_venta": valor_venta,
+        "sin_stock": len(sin_stock),
+        "faltantes": sin_stock[:12],
         "caja": None if not caja else {
             "nombre": caja[0], "usuario": caja[1], "fondo": caja[2], "apertura": caja[3],
         },
@@ -5817,6 +5850,10 @@ HTML = """<!DOCTYPE html>
 
   /* Ticket */
   .rail { width:400px; flex-shrink:0; background:var(--surface); border-radius:var(--radius-card); padding:0; position:sticky; top:calc(64px + var(--gap)); max-height:calc(100vh - 64px - var(--gap) * 2); overflow:hidden; display:flex; flex-direction:column; }
+  @media (min-width: 1680px) {
+    .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    .rail { width: clamp(520px, 32vw, 760px); }
+  }
   .rail > * { flex-shrink:0; }
   .rail h3 { margin:0; font-size:18px; font-weight:700; }
   .factura-cabeza { padding:16px 16px 0; }
@@ -6092,6 +6129,7 @@ HTML = """<!DOCTYPE html>
   .operacion div { border-top:0; border-left:1px solid var(--rule); padding:2px 16px; }
   .operacion h3 + div { border-left:0; padding-left:0; }
   .side-stats b { display:block; font-size:17px; margin-top:2px; font-weight:600; }
+  .side-stats b.neg, .stock-cero { color:var(--negative); font-weight:700; }
   .side-stats span { color:var(--muted); font-size:12px; }
   #view-form.es-dash { background:transparent; padding:0; }
   #view-form.es-dash > .hint, #view-form.es-dash > #formMsg { display:none; }
@@ -6240,6 +6278,7 @@ HTML = """<!DOCTYPE html>
       <button class="nav" data-mod="mostrador" data-fn="cocina" type="button" onclick="location.href='/cocina'">Cocina</button>
       <button class="nav" data-view="cotizaciones" data-mod="cotizaciones" onclick="ver('cotizaciones')">Cotizaciones</button>
       <button class="nav" data-view="historial" data-mod="historial" onclick="ver('historial')">Facturas emitidas</button>
+      <button class="nav" data-view="libro-mayor" data-mod="mayor" onclick="ver('libro-mayor')">Ventas al por mayor</button>
       <button class="nav" data-view="cobros" data-mod="cobros" onclick="ver('cobros')">Cuentas por cobrar</button>
       <button class="nav" data-view="dev" data-mod="devoluciones" onclick="ver('dev')">Devoluciones</button>
       <div class="nav-grupo" data-grupo="caja">Caja</div>
@@ -6763,6 +6802,7 @@ async function refrescar(){
     : "Caja cerrada";
   const corto = e.caja ? esc(e.caja.nombre) + " abierta" : "Caja cerrada";
   document.getElementById("top").innerHTML = `<span class="quien">${esc(e.usuario)} · ${esc(e.rol)} · </span><span class="estado${e.caja ? " abierta" : ""}">${turno}</span><span class="estado estado-corto${e.caja ? " abierta" : ""}">${corto}</span>`;
+  avisarFaltantes(e.sin_stock);
   aplicarPermisos(e.permisos);
   window._empresa = e.empresa || {};
   aplicarLogo(window._empresa.logo || "");
@@ -6998,6 +7038,20 @@ function nombresLista(){
   const x = window._descuentos || {p2:2, p3:5, p4:10};
   return ["", "Mínimo de venta", "Por mayor "+x.p2+"%", "Por mayor "+x.p3+"%", "Por mayor "+x.p4+"%"];
 }
+function sinExistencia(p){
+  return !p.combo && p.stock != null && Number(p.stock) <= 0;
+}
+function avisarFaltantes(nombres){
+  if ((window._rol || "") !== "admin") return;
+  const lista = (nombres || []).map(n => String(n || "").trim()).filter(Boolean);
+  const firma = lista.join("|");
+  if (firma === window._firmaFaltantes) return;
+  window._firmaFaltantes = firma;
+  if (!lista.length) return;
+  const muestra = lista.slice(0, 4).join(", ");
+  const resto = lista.length > 4 ? " y " + (lista.length - 4) + " más" : "";
+  aviso("Sin stock: " + muestra + resto + ".", "error");
+}
 function recordarPrecios(listaProductos){
   window._precios = window._precios || {};
   (listaProductos || []).forEach(p => {
@@ -7041,13 +7095,16 @@ async function cargar(){
     data.productos = data.productos.filter(p => String(p.nombre).toLowerCase().includes(qv) || String(p.codigo || "").toLowerCase().includes(qv));
     data.combos = (data.combos || []).filter(c => String(c.nombre).toLowerCase().includes(qv));
   }
-  const tarjetas = data.productos.concat(data.combos || []);
-  recordarPrecios(tarjetas);
+  const vendibles = data.productos.filter(p => !sinExistencia(p));
+  const tarjetas = vendibles.concat(data.combos || []);
+  recordarPrecios(data.productos.concat(data.combos || []));
   if (repreciarTicket()) pintar();
-  const exacto = data.productos.find(p => {
+  const coincide = p => {
     const codes = [p.codigo, p.codigo_producto].map(s => String(s || "").trim().toLowerCase());
     return qv && codes.includes(qv);
-  });
+  };
+  const exacto = vendibles.find(coincide);
+  const agotado = data.productos.find(p => sinExistencia(p) && coincide(p));
   grid.innerHTML = tarjetas.map(p=>{
     const nivel = Number(lista.value);
     const precio = p.combo ? p.precio : ([p.precio, p.precio_2, p.precio_3, p.precio_4][nivel-1] || p.precio);
@@ -7070,6 +7127,11 @@ async function cargar(){
     q.value = "";
     add(exacto, precio);
     if (window._caja) aviso(exacto.nombre + " agregado.", "ok");
+    return cargar();
+  }
+  if (agotado) {
+    q.value = "";
+    aviso(agotado.nombre + " no tiene stock.", "error");
     return cargar();
   }
   if (/^\\d{4,}$/.test(escrito)) aviso("No hay producto con el código " + escrito + ".", "error");
@@ -7224,6 +7286,10 @@ async function abrirCajon(){
   }
 }
 function add(p, precio){
+  if (sinExistencia(p)) {
+    aviso(p.nombre + " no tiene stock.", "error");
+    return;
+  }
   if (!window._caja) {
     msg.style.color = "var(--danger)";
     msg.textContent = "Abre la caja antes de vender.";
@@ -7628,6 +7694,8 @@ async function pintarForm(nombre){
       `<div class="form"><label>Producto<select id="kxProd" onchange="cargarKardex()">${opts}</select></label><button class="sec" onclick="cargarKardex()">Ver movimientos</button></div><div id="kxTabla"></div>`],
     mayor: ["Venta al por mayor", "La vende el almacén, no la caja. Baja el stock de Almacén y deja el registro de lo que salió. Si el producto está en otra bodega, transfiérelo antes.",
       `<div class="form"><label class="wide">Buscar en el almacén<input id="mayQ" placeholder="Nombre o código de barras" autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();buscarMayor()}"/></label><button class="sec" type="button" onclick="buscarMayor()">Buscar</button></div><div id="mayBusca"></div><h3 style="margin:18px 0 8px">Pedido del almacén</h3><div id="mayLineas"></div><div class="form"><label>Cliente<input id="mayCliente" placeholder="Quién compra al por mayor"/></label><label class="wide">Nota<input id="mayNota" placeholder="Entrega, conduce, observación"/></label><button type="button" onclick="guardarMayor()">Registrar venta</button></div><h3 style="margin:22px 0 8px">Registro del almacén</h3><div id="mayHist"></div>`],
+    "libro-mayor": ["Ventas al por mayor", "Lo que salió del almacén. No entra en la caja ni en las facturas del local.",
+      `<div class="form"><label class="wide">Buscar<input id="libQ" placeholder="Número, cliente o usuario" onkeydown="if(event.key==='Enter')cargarLibroMayor()"/></label><label>Desde<input id="libDesde" type="date"/></label><label>Hasta<input id="libHasta" type="date"/></label><button class="sec" onclick="cargarLibroMayor()">Cargar</button></div><div id="libResumen"></div><div id="libTabla"></div>`],
     historial: ["Facturas emitidas", "Abre la factura para verla. También puedes imprimir, descargar o anular.",
       `<div class="form" id="histFiltros"><label id="histEstadoCaja">Estado<select id="histEstado"><option value="emitidas">Emitidas</option><option value="anuladas">Anuladas</option><option value="todos">Todas</option></select></label><label id="histDesdeCaja">Desde<input id="histDesde" type="date"/></label><label id="histHastaCaja">Hasta<input id="histHasta" type="date"/></label><button class="sec" onclick="cargarHistorial()">Cargar</button><p class="hint wide" id="histNota" hidden>Solo ves las facturas emitidas hoy. El historial completo es del administrador.</p></div><div id="docVista"></div><div id="histTabla"></div>`],
     cotizaciones: ["Cotizaciones", "Abre el presupuesto para verlo o cambiar cantidades, productos y cliente.", ""],
@@ -7674,6 +7742,7 @@ async function pintarForm(nombre){
   if(nombre==="inventario") await cargarInventario();
   if(nombre==="combos") await cargarCombos();
   if(nombre==="historial") await cargarHistorial();
+  if(nombre==="libro-mayor") await cargarLibroMayor();
   if(nombre==="mayor") await cargarMayor();
   if(nombre==="kardex") await cargarKardex();
   if(nombre==="cotizaciones") await cargarCotizaciones();
@@ -8374,8 +8443,10 @@ async function cargarInventario(){
     `<span class="con-mini"><button type="button" class="sec foto-mini${p.imagen ? "" : " vacia"}" ${p.imagen ? `style="background-image:url('${p.imagen}')"` : ""} onclick="editarProducto(${p.id})" aria-label="Foto de ${escDash(p.nombre)}">${p.imagen ? "" : "+"}</button>${escDash(p.nombre)}</span>`,
     `<button class="sec" onclick="editarProducto(${p.id})">Editar</button> <button class="sec" onclick="extrasProducto(${p.id})">Extras</button>`,
     money(p.precio_original), money(p.precio), money(precioNivel(p.precio_2, p.precio, x.p2)), money(precioNivel(p.precio_3, p.precio, x.p3)), money(precioNivel(p.precio_4, p.precio, x.p4)),
-    p.stock, escDash(p.codigo || "—"), escDash(p.bodega), escDash(p.categoria || "—")
+    Number(p.stock) <= 0 && p.activo !== false ? `<span class="stock-cero">${p.stock} · Sin stock</span>` : p.stock,
+    escDash(p.codigo || "—"), escDash(p.bodega), escDash(p.categoria || "—")
   ]));
+  avisarFaltantes(d.sin_stock);
   if (document.getElementById("invPrecio")) invPrecio.oninput = recalcularPreciosMayor;
   [descP2, descP3, descP4].forEach(el => { if (el) el.oninput = recalcularPreciosMayor; });
 }
@@ -8489,6 +8560,32 @@ async function cargarKardex(){
   const nombre = kxProd.selectedOptions[0] ? kxProd.selectedOptions[0].textContent : "Producto";
   kxTabla.innerHTML = `<p class="hint">${escDash(nombre)} · existencia ${d.stock}</p>` +
     tabla(["Fecha","Movimiento","Tipo","Cantidad","Saldo","Bodega"], (d.items||[]).map(x => [String(x.fecha||"").slice(0,16), escDash(x.descripcion), x.tipo_codigo, x.cantidad, x.balance, escDash(x.bodega)]), "Este producto no tiene movimientos.");
+}
+async function cargarLibroMayor(){
+  const q = document.getElementById("libQ");
+  const desde = document.getElementById("libDesde");
+  const hasta = document.getElementById("libHasta");
+  let url = "/api/mayor?q=" + encodeURIComponent(q ? q.value : "");
+  if (desde && hasta && desde.value && hasta.value) {
+    url += "&desde=" + encodeURIComponent(desde.value) + "&hasta=" + encodeURIComponent(hasta.value);
+  }
+  const d = await api(url);
+  window._libroMayor = d.items || [];
+  const resumen = document.getElementById("libResumen");
+  if (resumen) resumen.innerHTML = `<p class="hint">${d.cantidad || 0} ${Number(d.cantidad) === 1 ? "venta" : "ventas"} · ${money(d.total || 0)} · salieron de ${escDash(d.bodega || "Almacén")}</p>`;
+  const tablaLibro = document.getElementById("libTabla");
+  if (!tablaLibro) return;
+  tablaLibro.innerHTML = tabla(["Número","Fecha","Cliente","Total","Usuario", '<span class="oculto-visual">Acciones</span>'], window._libroMayor.map(v => {
+    const fecha = String(v.fecha || "");
+    return [escDash(v.numero), fecha.slice(0,10)+"<br>"+fecha.slice(11,16), escDash(v.cliente || "—"), money(v.total), escDash(v.usuario || "—"),
+      `<button class="sec" type="button" onclick="verVentaMayor(${v.id})">Ver</button>`];
+  }), "No hay ventas al por mayor en este período.");
+}
+function verVentaMayor(id){
+  const v = (window._libroMayor || []).find(x => x.id === id);
+  if (!v) return;
+  const lineas = (v.lineas || []).map(l => `<tr><td>${escDash(l.nombre)}</td><td class="num">${l.cantidad}</td><td class="num">${money(l.precio)}</td><td class="num">${money(l.total)}</td></tr>`).join("");
+  abrirModal(v.numero, `<p class="hint">${escDash(v.cliente || "Sin cliente")} · ${escDash(String(v.fecha||"").slice(0,16))} · ${escDash(v.usuario || "—")}</p>${v.nota ? `<p>${escDash(v.nota)}</p>` : ""}<div class="tabla-marco"><table><thead><tr><th scope="col">Producto</th><th scope="col" class="num">Cantidad</th><th scope="col" class="num">Precio</th><th scope="col" class="num">Total</th></tr></thead><tbody>${lineas}</tbody></table></div><p><b>${money(v.total)}</b> · salió del almacén</p>`);
 }
 async function cargarHistorial(){
   const admin = window._rol === "admin";
@@ -8748,6 +8845,8 @@ async function cargarIndicadores(){
           <h3>Inventario</h3>
           <div><span>Valor al costo</span><b>${money(d.valor_costo)}</b></div>
           <div><span>Valor a precio de venta</span><b>${money(d.valor_venta)}</b></div>
+          <div><span>Sin stock</span><b class="${Number(d.sin_stock) ? "neg" : ""}">${d.sin_stock || 0}</b></div>
+          ${(d.faltantes || []).length ? `<div><span>Faltan</span><b>${(d.faltantes || []).map(escDash).join(", ")}${Number(d.sin_stock) > (d.faltantes || []).length ? "…" : ""}</b></div>` : ""}
         </div>
       </div>
     </div>
@@ -9049,7 +9148,14 @@ function fechaCortaTicket(valor){
 function htmlCuadreTicket(d, extra){
   const emp = window._empresa || {};
   const cerrado = (d.estado || "") === "cerrado";
-  const pagos = (d.pagos || []).map(p => filaTicket(etiquetaPago(p.tipo), money(p.monto))).join("");
+  const montoPago = codigo => {
+    const p = (d.pagos || []).find(x => String(x.tipo || "").toLowerCase() === codigo);
+    return money(p ? p.monto : 0);
+  };
+  const otros = (d.pagos || []).filter(p => {
+    const tipo = String(p.tipo || "").toLowerCase();
+    return tipo !== "efectivo" && tipo !== "tarjeta" && tipo !== "transferencia" && Number(p.monto || 0) > 0.009;
+  }).map(p => filaTicket(etiquetaPago(p.tipo), money(p.monto))).join("");
   const movs = (d.movimientos || []).map(m =>
     filaTicket(escDash(m.motivo || m.tipo || "—"), money(m.monto))
     + `<p class="sub">${fechaCortaTicket(m.fecha)} · ${escDash(m.tipo || "")} · ${escDash(m.usuario || "")}</p>`
@@ -9063,16 +9169,15 @@ function htmlCuadreTicket(d, extra){
     + filaTicket("Facturas", String(d.n_facturas || 0))
     + (Number(d.n_anuladas || 0) ? filaTicket("Anuladas", String(d.n_anuladas)) : "")
     + filaTicket("Venta total", money(d.ventas_total))
-    + `<hr class="corte"><span class="titulo">EFECTIVO</span>`
+    + `<hr class="corte"><span class="titulo">FORMAS DE PAGO</span>`
     + filaTicket("Fondo", money(d.fondo))
     + filaTicket("Efectivo", money(d.ventas_efectivo))
-    + filaTicket("Ingresos", money(d.ingresos))
-    + filaTicket("Retiros", money(d.retiros))
     + filaTicket("Esperado", money(d.esperado))
     + filaTicket("Contado", cerrado ? money(d.contado) : "Pendiente")
+    + filaTicket("Tarjeta", montoPago("tarjeta"))
+    + filaTicket("Transferencia", montoPago("transferencia"))
+    + otros
     + `<div class="resultado">` + filaTicket("Resultado", cerrado ? resultadoTicket(d.diferencia) : "Pendiente de conteo") + `</div>`
-    + `<hr class="corte"><span class="titulo">FORMAS DE PAGO</span>`
-    + (pagos || `<p class="sub">Sin cobros en este turno.</p>`)
     + `<hr class="corte"><span class="titulo">MOVIMIENTOS</span>`
     + (movs || `<p class="sub">Sin ingresos ni retiros.</p>`)
     + notaCuadre(d, cerrado)
