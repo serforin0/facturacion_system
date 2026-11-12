@@ -56,6 +56,7 @@ def test_las_paginas_del_mostrador_responden(api):
     assert "function abrirCobro" in html
     assert "function sinExistencia" in html
     assert "no tiene stock" in html
+    assert "function imprimirEnTermica" in html
     assert "function lecturaEnProducto" in html
     assert 'id="vendiendo"' in html
     assert "0x1b, 0x70, 0x00, 0x19, 0xfa" in html

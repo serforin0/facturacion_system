@@ -7254,22 +7254,46 @@ function pedirPuertoCajon(){
 async function asegurarPuertoCajon(){
   try { await pedirPuertoCajon(); } catch (e) {}
 }
+function encolarPuerto(trabajo){
+  const previo = window._colaPuerto || Promise.resolve();
+  const actual = previo.then(trabajo, trabajo);
+  window._colaPuerto = actual.catch(() => {});
+  return actual;
+}
+async function conPuerto(escribir){
+  return encolarPuerto(async () => {
+    if (!window._puertoCajon && navigator.serial) {
+      try {
+        const lista = await navigator.serial.getPorts();
+        if (lista[0]) window._puertoCajon = lista[0];
+      } catch (e) {}
+    }
+    const puerto = window._puertoCajon;
+    if (!puerto) return false;
+    let writer;
+    try {
+      if (!puerto.writable) await puerto.open({baudRate: 9600});
+      writer = puerto.writable.getWriter();
+      await escribir(writer);
+      return true;
+    } catch (e) {
+      try { if (puerto.writable) await puerto.close(); } catch (err) {}
+      return false;
+    } finally {
+      try { if (writer) writer.releaseLock(); } catch (err) {}
+    }
+  });
+}
 async function pulsarCajon(){
-  const puerto = window._puertoCajon;
-  if (!puerto) return false;
-  let writer;
-  try {
-    if (!puerto.writable) await puerto.open({baudRate: 9600});
-    writer = puerto.writable.getWriter();
-    // Pulso ESC/POS genérico: pin 2 y pin 5, 50 ms. Lo usan Epson y la 2connet POS80.
-    await writer.write(new Uint8Array([0x1b, 0x70, 0x00, 0x19, 0xfa, 0x1b, 0x70, 0x01, 0x19, 0xfa]));
-    return true;
-  } catch (e) {
-    try { if (puerto.writable) await puerto.close(); } catch (err) {}
-    return false;
-  } finally {
-    try { if (writer) writer.releaseLock(); } catch (err) {}
+  if (!navigator.serial) return false;
+  if (!window._puertoCajon) {
+    try {
+      const lista = await navigator.serial.getPorts();
+      if (!lista.length) return false;
+    } catch (e) { return false; }
   }
+  // Pulso ESC/POS genérico: pin 2 y pin 5, 50 ms. Lo usan Epson y la 2connet POS80.
+  return conPuerto(writer => writer.write(new Uint8Array([0x1b, 0x70, 0x00, 0x19, 0xfa, 0x1b, 0x70, 0x01, 0x19, 0xfa])));
 }
 async function abrirCajon(){
   if (!navigator.serial) {
@@ -9265,6 +9289,93 @@ async function escribirTicket(marco, html, medidas, paraImprimir){
     marco.contentWindow.print();
   }
 }
+function palabrasTicket(texto){
+  return String(texto || "").split(String.fromCharCode(160)).join(" ").trim().split(" ").filter(Boolean);
+}
+function cortarTicket(texto, ancho){
+  const pals = palabrasTicket(texto);
+  const lineas = [];
+  let actual = "";
+  pals.forEach(p => {
+    const pieza = p.length > ancho ? p.slice(0, ancho) : p;
+    if (!actual) actual = pieza;
+    else if ((actual + " " + pieza).length <= ancho) actual += " " + pieza;
+    else { lineas.push(actual); actual = pieza; }
+  });
+  if (actual) lineas.push(actual);
+  return lineas;
+}
+function alinearTicket(izq, der, ancho){
+  const a = palabrasTicket(izq).join(" ");
+  const b = palabrasTicket(der).join(" ");
+  if (!b) return cortarTicket(a, ancho);
+  if (a.length + 1 + b.length <= ancho) return [a + " ".repeat(ancho - a.length - b.length) + b];
+  return cortarTicket(a, ancho).concat(cortarTicket(b, ancho).map(l => l.padStart(ancho)));
+}
+function bytesLatin(texto){
+  const limpio = String(texto || "").split(String.fromCharCode(160)).join(" ");
+  const out = [];
+  for (let i = 0; i < limpio.length; i++) {
+    const c = limpio.charCodeAt(i);
+    if (c === 8364) out.push(128);
+    else if (c >= 32 && c <= 255) out.push(c);
+    else out.push(63);
+  }
+  return out;
+}
+function bytesTicket(doc, ancho){
+  const bau = doc.querySelector(".bau");
+  if (!bau || !ancho) return null;
+  const trozos = [];
+  const meter = bytes => trozos.push(bytes);
+  const cmd = (...n) => meter(Uint8Array.from(n));
+  const escribir = (lineas, grueso, centro) => {
+    if (!lineas.length) return;
+    if (grueso) cmd(0x1b, 0x45, 1);
+    if (centro) cmd(0x1b, 0x61, 1);
+    lineas.forEach(l => { meter(Uint8Array.from(bytesLatin(l))); cmd(0x0a); });
+    if (centro) cmd(0x1b, 0x61, 0);
+    if (grueso) cmd(0x1b, 0x45, 0);
+  };
+  const emitir = nodo => {
+    if (!nodo || nodo.nodeType !== 1 || nodo.tagName === "IMG" || nodo.classList.contains("qr")) return;
+    if (nodo.tagName === "HR") { escribir(["-".repeat(ancho)], false, false); return; }
+    if (nodo.classList.contains("fila")) {
+      const nom = nodo.querySelector(".nom");
+      const din = nodo.querySelector(".din");
+      escribir(alinearTicket(nom ? nom.textContent : nodo.textContent, din ? din.textContent : "", ancho), nodo.classList.contains("total"), false);
+      return;
+    }
+    const contenedor = nodo.tagName === "HEADER" || nodo.classList.contains("bloque") || nodo.classList.contains("item") || (nodo.tagName === "DIV" && !nodo.classList.contains("renglon"));
+    if (contenedor && nodo.children.length) {
+      [...nodo.children].forEach(emitir);
+      return;
+    }
+    const centro = nodo.classList.contains("centro") || nodo.classList.contains("titulo") || nodo.classList.contains("local") || nodo.classList.contains("pie") || nodo.classList.contains("mesa") || !!(nodo.parentElement && nodo.parentElement.classList.contains("centro"));
+    const grueso = nodo.classList.contains("total") || nodo.classList.contains("titulo") || nodo.classList.contains("local") || nodo.classList.contains("mesa");
+    const lineas = nodo.classList.contains("der") ? cortarTicket(nodo.textContent, ancho).map(l => l.padStart(ancho)) : cortarTicket(nodo.textContent, ancho);
+    escribir(lineas, grueso, centro && !nodo.classList.contains("der"));
+  };
+  cmd(0x1b, 0x40, 0x1b, 0x74, 16, 0x1b, 0x61, 0);
+  [...bau.children].forEach(emitir);
+  cmd(0x1b, 0x64, 4, 0x1d, 0x56, 0x42, 0x00);
+  const total = trozos.reduce((n, b) => n + b.length, 0);
+  const out = new Uint8Array(total);
+  let i = 0;
+  trozos.forEach(b => { out.set(b, i); i += b.length; });
+  return out;
+}
+async function imprimirEnTermica(doc, ancho){
+  if (!navigator.serial || !doc || doc.querySelector(".qr svg")) return false;
+  const bytes = bytesTicket(doc, ancho);
+  if (!bytes) return false;
+  let concedido = !!window._puertoCajon;
+  if (!concedido) {
+    try { concedido = (await navigator.serial.getPorts()).length > 0; } catch (e) { concedido = false; }
+  }
+  if (!concedido) return false;
+  return conPuerto(writer => writer.write(bytes));
+}
 async function imprimirTicket(html){
   const p = papelTicket();
   const viejo = document.getElementById("marcoTicket");
@@ -9276,7 +9387,12 @@ async function imprimirTicket(html){
   marco.tabIndex = -1;
   marco.style.cssText = `position:fixed;left:-300mm;top:0;width:${p.papel}mm;height:20mm;border:0;opacity:0;pointer-events:none`;
   document.body.appendChild(marco);
-  await escribirTicket(marco, html, p, true);
+  await escribirTicket(marco, html, p, false);
+  const directo = await imprimirEnTermica(marco.contentDocument, p.caracteres || 42);
+  if (!directo) {
+    marco.contentWindow.focus();
+    marco.contentWindow.print();
+  }
 }
 function imprimirPrueba(){
   const p = papelTicket();
