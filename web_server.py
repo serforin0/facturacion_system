@@ -11,8 +11,10 @@ import json
 import os
 import sqlite3
 import secrets
+import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,7 +23,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from database import Database
+from app_paths import data_directory
+from database import ClaveDemostracion, Database
 from operacion_local import (
     asiento_simple,
     asiento_venta,
@@ -36,7 +39,6 @@ from operacion_local import (
 TASA_ITBIS = 0.18
 SECRET_PATH = Path(os.environ.get("FACTURACION_SECRET", ".session_secret"))
 app = FastAPI(title="Facturación")
-_sessions: dict[str, str] = {}
 _empresa_oyentes: list[asyncio.Queue] = []
 _empresa_loop: asyncio.AbstractEventLoop | None = None
 _empresa_lock = threading.Lock()
@@ -183,21 +185,88 @@ def _secret() -> str:
 
 _secret()
 _SESION_SEGUNDOS = 12 * 3600
+_TOPE_LOGIN = 8
+_VENTANA_LOGIN = 15 * 60
+_fallos_login: dict[str, tuple[int, float]] = {}
+_bloqueo_login: dict[str, float] = {}
+
+
+def _tabla_sesiones(cur) -> None:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sesiones (
+            id TEXT PRIMARY KEY,
+            usuario TEXT NOT NULL,
+            expira INTEGER NOT NULL
+        )
+        """
+    )
+
+
+def _guardar_sesion(sid: str, usuario: str, expira: int) -> None:
+    conn = db().get_connection()
+    cur = conn.cursor()
+    _tabla_sesiones(cur)
+    ahora = int(time.time())
+    cur.execute("DELETE FROM sesiones WHERE expira < ?", (ahora,))
+    cur.execute(
+        "INSERT INTO sesiones (id, usuario, expira) VALUES (?, ?, ?)",
+        (sid, usuario, expira),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _sesion_viva(sid: str, usuario: str, expira: int) -> bool:
+    if not sid or expira < time.time():
+        return False
+    conn = db().get_connection()
+    cur = conn.cursor()
+    _tabla_sesiones(cur)
+    cur.execute("SELECT usuario, expira FROM sesiones WHERE id=?", (sid,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row) and row[0] == usuario and int(row[1]) >= time.time()
+
+
+def _borrar_sesion(sid: str) -> None:
+    if not sid:
+        return
+    conn = db().get_connection()
+    cur = conn.cursor()
+    _tabla_sesiones(cur)
+    cur.execute("DELETE FROM sesiones WHERE id=?", (sid,))
+    conn.commit()
+    conn.close()
+
+
+def _sid_del_token(token: str) -> str:
+    if "." not in token:
+        return ""
+    cuerpo, firma = token.rsplit(".", 1)
+    buena = hmac.new(_secret().encode(), cuerpo.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(firma, buena):
+        return ""
+    relleno = "=" * (-len(cuerpo) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cuerpo + relleno))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    return str(data.get("s") or "")
 
 
 def _token_sesion(usuario: str) -> str:
+    sid = secrets.token_urlsafe(24)
     expira = int(time.time()) + _SESION_SEGUNDOS
     cuerpo = base64.urlsafe_b64encode(
-        json.dumps({"u": usuario, "e": expira}, separators=(",", ":")).encode()
+        json.dumps({"u": usuario, "e": expira, "s": sid}, separators=(",", ":")).encode()
     ).decode().rstrip("=")
     firma = hmac.new(_secret().encode(), cuerpo.encode(), hashlib.sha256).hexdigest()
+    _guardar_sesion(sid, usuario, expira)
     return f"{cuerpo}.{firma}"
 
 
 def _usuario_de_token(token: str) -> str | None:
-    guardado = _sessions.get(token)
-    if guardado:
-        return guardado
     if "." not in token:
         return None
     cuerpo, firma = token.rsplit(".", 1)
@@ -207,12 +276,61 @@ def _usuario_de_token(token: str) -> str | None:
     relleno = "=" * (-len(cuerpo) % 4)
     try:
         data = json.loads(base64.urlsafe_b64decode(cuerpo + relleno))
-        if int(data["e"]) < time.time():
-            return None
+        expira = int(data["e"])
         usuario = str(data["u"]).strip()
+        sid = str(data.get("s") or "")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    return usuario or None
+    if not usuario or not _sesion_viva(sid, usuario, expira):
+        return None
+    return usuario
+
+
+def _poner_cookie(resp: JSONResponse, token: str) -> None:
+    resp.set_cookie(
+        "sesion",
+        token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+        max_age=_SESION_SEGUNDOS,
+    )
+
+
+def _quitar_cookie(resp: JSONResponse) -> None:
+    resp.delete_cookie("sesion", path="/", secure=True, samesite="lax")
+
+
+def _freno_login(nombre: str) -> None:
+    clave = nombre.strip().lower()[:80]
+    if not clave:
+        return
+    hasta = _bloqueo_login.get(clave, 0)
+    if hasta > time.time():
+        raise HTTPException(status_code=429, detail="Demasiados intentos. Espera 15 minutos.")
+
+
+def _fallo_login(nombre: str) -> None:
+    clave = nombre.strip().lower()[:80]
+    if not clave:
+        return
+    ahora = time.time()
+    cuenta, inicio = _fallos_login.get(clave, (0, ahora))
+    if ahora - inicio > _VENTANA_LOGIN:
+        cuenta, inicio = 0, ahora
+    cuenta += 1
+    if cuenta >= _TOPE_LOGIN:
+        _bloqueo_login[clave] = ahora + _VENTANA_LOGIN
+        _fallos_login.pop(clave, None)
+        return
+    _fallos_login[clave] = (cuenta, inicio)
+
+
+def _limpio_login(nombre: str) -> None:
+    clave = nombre.strip().lower()[:80]
+    _fallos_login.pop(clave, None)
+    _bloqueo_login.pop(clave, None)
 
 
 def _user(request: Request) -> str:
@@ -257,6 +375,186 @@ def _exigir_admin(request: Request) -> str:
     if _rol(user) != "admin":
         raise HTTPException(status_code=403, detail="Solo el administrador puede ver la empresa")
     return user
+
+
+def _usuario_suave(request: Request) -> str:
+    try:
+        return _usuario_de_token(request.cookies.get("sesion") or "") or ""
+    except Exception:
+        return ""
+
+
+def _tabla_errores(cur) -> None:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS errores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL,
+            origen TEXT NOT NULL,
+            punto TEXT NOT NULL,
+            mensaje TEXT NOT NULL,
+            detalle TEXT NOT NULL,
+            usuario TEXT NOT NULL,
+            ruta TEXT NOT NULL
+        )
+        """
+    )
+
+
+_MAX_LOG = 1_000_000
+_COPIAS_LOG = 5
+_log_lock = threading.Lock()
+
+
+def _archivo_log() -> Path | None:
+    try:
+        carpeta = Path(db().db_name).resolve().parent / "logs"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        return carpeta / "facturacion.log"
+    except Exception:
+        try:
+            carpeta = Path(data_directory()) / "logs"
+            carpeta.mkdir(parents=True, exist_ok=True)
+            return carpeta / "facturacion.log"
+        except Exception:
+            return None
+
+
+def _rotar_log(ruta: Path) -> None:
+    if not ruta.exists() or ruta.stat().st_size < _MAX_LOG:
+        return
+    ultimo = ruta.with_name(f"facturacion.log.{_COPIAS_LOG}")
+    if ultimo.exists():
+        ultimo.unlink()
+    for indice in range(_COPIAS_LOG - 1, 0, -1):
+        actual = ruta.with_name(f"facturacion.log.{indice}")
+        if actual.exists():
+            actual.replace(ruta.with_name(f"facturacion.log.{indice + 1}"))
+    ruta.replace(ruta.with_name("facturacion.log.1"))
+
+
+def _escribir_log(nivel: str, origen: str, mensaje: str, detalle: str = "") -> None:
+    try:
+        ruta = _archivo_log()
+        if ruta is None:
+            return
+        momento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        linea = f"{momento} {nivel} {origen} {mensaje}\n"
+        extra = (detalle or "").strip()
+        if extra:
+            linea += extra[-4000:] + "\n"
+        with _log_lock:
+            _rotar_log(ruta)
+            with ruta.open("a", encoding="utf-8") as archivo:
+                archivo.write(linea)
+    except Exception:
+        return
+
+
+def _anotar_error(origen: str, punto: str, mensaje: str, detalle: str = "", usuario: str = "", ruta: str = "") -> None:
+    quien = f" usuario={usuario}" if usuario else ""
+    donde = f" ruta={ruta}" if ruta else ""
+    _escribir_log("ERROR", origen or "servidor", f"{punto} {mensaje}{quien}{donde}".strip(), detalle)
+    try:
+        conn = db().get_connection()
+        cur = conn.cursor()
+        _tabla_errores(cur)
+        cur.execute(
+            """
+            INSERT INTO errores (fecha, origen, punto, mensaje, detalle, usuario, ruta)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                (origen or "servidor")[:40],
+                (punto or "programa")[:240],
+                (mensaje or "Error")[:500],
+                (detalle or "")[-4000:],
+                (usuario or "")[:80],
+                (ruta or "")[:240],
+            ),
+        )
+        cur.execute(
+            """
+            DELETE FROM errores
+            WHERE id < COALESCE((SELECT id FROM errores ORDER BY id DESC LIMIT 1 OFFSET 399), 0)
+            """
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        _escribir_log("ERROR", "programa", "No se pudo guardar el fallo en la base", traceback.format_exc())
+
+
+def _al_arrancar() -> None:
+    _escribir_log("INFO", "programa", "El servidor arrancó")
+
+
+def _al_detener() -> None:
+    _escribir_log("INFO", "programa", "El servidor se detuvo")
+
+
+def _caida_del_programa(tipo, valor, traza) -> None:
+    if tipo is KeyboardInterrupt:
+        sys.__excepthook__(tipo, valor, traza)
+        return
+    _escribir_log(
+        "ERROR",
+        "programa",
+        f"El programa se cayó: {valor}",
+        "".join(traceback.format_exception(tipo, valor, traza)),
+    )
+    sys.__excepthook__(tipo, valor, traza)
+
+
+def _caida_de_hilo(args) -> None:
+    _escribir_log(
+        "ERROR",
+        "programa",
+        f"Se cayó un hilo: {args.exc_value}",
+        "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
+    )
+
+
+app.router.on_startup.append(_al_arrancar)
+app.router.on_shutdown.append(_al_detener)
+sys.excepthook = _caida_del_programa
+if hasattr(threading, "excepthook"):
+    threading.excepthook = _caida_de_hilo
+
+
+@app.exception_handler(HTTPException)
+async def error_http(request: Request, exc: HTTPException):
+    if exc.status_code >= 500:
+        _anotar_error(
+            "servidor",
+            f"{request.method} {request.url.path}",
+            str(exc.detail),
+            "",
+            _usuario_suave(request),
+            request.url.path,
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=dict(exc.headers or {}),
+    )
+
+
+@app.exception_handler(Exception)
+async def error_no_previsto(request: Request, exc: Exception):
+    _anotar_error(
+        "servidor",
+        f"{request.method} {request.url.path}",
+        str(exc) or exc.__class__.__name__,
+        traceback.format_exc(),
+        _usuario_suave(request),
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "El programa falló. Quedó anotado en el registro de errores."},
+    )
 
 
 def _fecha_factura(factura_id: int) -> tuple[str, str]:
@@ -511,6 +809,19 @@ class LoginIn(BaseModel):
     password: str
 
 
+class RenovarClaveIn(BaseModel):
+    username: str
+    password: str
+    nueva: str
+
+
+class ErrorIn(BaseModel):
+    punto: str = ""
+    mensaje: str = ""
+    detalle: str = ""
+    ruta: str = ""
+
+
 class AbrirCajaIn(BaseModel):
     nombre: str = "Caja 1"
     fondo: float | None = None
@@ -729,6 +1040,53 @@ try {
 </body>
 </html>"""
 
+@app.post("/api/errores")
+def anotar_error_cliente(request: Request, body: ErrorIn):
+    usuario = _user(request)
+    punto = body.punto.strip()[:240] or "pantalla"
+    if punto.startswith("/api/errores") or " /api/errores" in punto:
+        return {"ok": True}
+    _anotar_error(
+        "pantalla",
+        punto,
+        body.mensaje.strip()[:500] or "Error en la pantalla",
+        body.detalle,
+        usuario,
+        body.ruta.strip()[:240],
+    )
+    return {"ok": True}
+
+
+@app.get("/api/errores")
+def listar_errores(request: Request, q: str = ""):
+    usuario = _user(request)
+    if _rol(usuario) != "admin":
+        raise HTTPException(status_code=403, detail="Solo el administrador puede ver el registro de errores")
+    conn = db().get_connection()
+    cur = conn.cursor()
+    _tabla_errores(cur)
+    sql = """
+        SELECT id, fecha, origen, punto, mensaje, detalle, usuario, ruta
+        FROM errores WHERE 1=1
+    """
+    params: list = []
+    texto = q.strip()
+    if texto:
+        sql += " AND (punto LIKE ? OR mensaje LIKE ? OR usuario LIKE ? OR ruta LIKE ?)"
+        params.extend([f"%{texto}%", f"%{texto}%", f"%{texto}%", f"%{texto}%"])
+    sql += " ORDER BY id DESC LIMIT 200"
+    cur.execute(sql, params)
+    items = [
+        {
+            "id": fila[0], "fecha": fila[1], "origen": fila[2], "punto": fila[3],
+            "mensaje": fila[4], "detalle": fila[5], "usuario": fila[6], "ruta": fila[7],
+        }
+        for fila in cur.fetchall()
+    ]
+    conn.close()
+    return {"items": items}
+
+
 @app.get("/cocina", response_class=HTMLResponse)
 def cocina_pagina():
     return COCINA_HTML
@@ -750,7 +1108,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v4";
+const CACHE = "pos-v5";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -807,28 +1165,50 @@ def service_worker():
 
 @app.post("/api/login")
 def login(body: LoginIn):
-    role = db().validate_user(body.username.strip(), body.password)
+    nombre = body.username.strip()
+    _freno_login(nombre)
+    try:
+        role = db().validate_user(nombre, body.password)
+    except ClaveDemostracion:
+        _fallo_login(nombre)
+        raise HTTPException(
+            status_code=409,
+            detail="La clave de demostración ya no sirve. Elige una nueva de al menos 8 caracteres.",
+        ) from None
     if not role:
+        _fallo_login(nombre)
         raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
-    token = _token_sesion(body.username.strip())
-    _sessions[token] = body.username.strip()
-    resp = JSONResponse({"ok": True, "usuario": body.username.strip(), "rol": role})
-    resp.set_cookie(
-        "sesion",
-        token,
-        httponly=True,
-        samesite="lax",
-        path="/",
-        max_age=_SESION_SEGUNDOS,
-    )
+    _limpio_login(nombre)
+    token = _token_sesion(nombre)
+    resp = JSONResponse({"ok": True, "usuario": nombre, "rol": role})
+    _poner_cookie(resp, token)
+    return resp
+
+
+@app.post("/api/login/renovar")
+def renovar_clave(body: RenovarClaveIn):
+    nombre = body.username.strip()
+    _freno_login(nombre)
+    if not db().comprobar_clave(nombre, body.password):
+        _fallo_login(nombre)
+        raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
+    try:
+        db().fijar_clave(nombre, body.nueva)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _limpio_login(nombre)
+    role = db().validate_user(nombre, body.nueva)
+    token = _token_sesion(nombre)
+    resp = JSONResponse({"ok": True, "usuario": nombre, "rol": role})
+    _poner_cookie(resp, token)
     return resp
 
 
 @app.post("/api/logout")
 def logout(request: Request):
-    _sessions.pop(request.cookies.get("sesion") or "", None)
+    _borrar_sesion(_sid_del_token(request.cookies.get("sesion") or ""))
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie("sesion", path="/")
+    _quitar_cookie(resp)
     return resp
 
 
@@ -4397,13 +4777,23 @@ def usuarios(request: Request):
     return {"items": items, "arbol": PERMISOS_ARBOL}
 
 
+def _solo_admin_toca_admin(request: Request, rol_nuevo: str, username_objetivo: str = "") -> None:
+    actor = _user(request)
+    if _rol(actor) == "admin":
+        return
+    if rol_nuevo == "admin" or (username_objetivo and _rol(username_objetivo) == "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo un administrador puede crear o editar a otro administrador",
+        )
+
+
 @app.post("/api/usuarios")
 def crear_usuario(request: Request, body: UsuarioIn):
     _exigir(request, "usuarios")
     if body.role not in ("admin", "user", "empleado", "mesero"):
         raise HTTPException(status_code=400, detail="El rol debe ser admin, user, empleado o mesero")
-    if len((body.password or "").strip()) < 1:
-        raise HTTPException(status_code=400, detail="Indica una contraseña")
+    _solo_admin_toca_admin(request, body.role)
     try:
         db().create_user(body.username.strip(), body.password, body.role)
     except ValueError as exc:
@@ -4418,17 +4808,22 @@ def editar_usuario(request: Request, body: UsuarioIn):
     if body.role not in ("admin", "user", "empleado", "mesero"):
         raise HTTPException(status_code=400, detail="El rol debe ser admin, user, empleado o mesero")
     usuario = body.username.strip()
+    _solo_admin_toca_admin(request, body.role, usuario)
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id FROM users WHERE username=?", (usuario,))
     row = cur.fetchone()
+    conn.close()
     if not row:
-        conn.close()
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
     if (body.password or "").strip():
-        cur.execute("UPDATE users SET password=?, role=? WHERE username=?", (body.password, body.role, usuario))
-    else:
-        cur.execute("UPDATE users SET role=? WHERE username=?", (body.role, usuario))
+        try:
+            db().fijar_clave(usuario, body.password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET role=? WHERE username=?", (body.role, usuario))
     conn.commit()
     conn.close()
     _guardar_permisos(usuario, body.modulos, body.role)
@@ -6264,6 +6659,7 @@ HTML = """<!DOCTYPE html>
   <div class="marca"><span class="mono" aria-hidden="true">MD</span><div><h2>MD Alliance</h2><p>Punto de venta</p></div></div>
   <label>Usuario<input id="user" autocomplete="username" required/></label>
   <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required/></label>
+  <label id="cajaNueva" hidden>Nueva contraseña<input id="passNueva" type="password" autocomplete="new-password" minlength="8"/></label>
   <button type="submit">Entrar</button>
   <p class="hint" style="text-align:center;margin:14px 0 0"><a href="/tablet">Entrada del mesero</a></p>
   <div class="msg" id="loginMsg" role="alert"></div>
@@ -6309,6 +6705,7 @@ HTML = """<!DOCTYPE html>
       <button class="nav" data-view="ecf" data-mod="ncf" data-fn="ecf" onclick="ver('ecf')">Facturación electrónica</button>
       <button class="nav" data-view="metodos" data-mod="metodos" onclick="ver('metodos')">Métodos de pago</button>
       <button class="nav" data-view="empresa" data-mod="apariencia" data-solo="admin" onclick="ver('empresa')">Empresa y correo</button>
+      <button class="nav" data-view="errores" data-mod="apariencia" data-solo="admin" onclick="ver('errores')">Registro de errores</button>
       <button class="sec salir-menu" type="button" data-tema-btn onclick="cambiarTema(event)">Modo día</button>
       <button class="sec salir-menu" type="button" onclick="salir()">Salir</button>
     </aside>
@@ -6724,24 +7121,64 @@ function lecturaDeLector(ev){
   caja.value = lector.buf;
 }
 document.addEventListener("keydown", lecturaDeLector, true);
+function reportarError(punto, mensaje, detalle){
+  const clave = String(punto || "") + "|" + String(mensaje || "");
+  const ahora = Date.now();
+  if (window._ultimoError && window._ultimoError.clave === clave && ahora - window._ultimoError.t < 4000) return;
+  window._ultimoError = {clave, t: ahora};
+  const vista = document.querySelector(".nav.on");
+  const cuerpo = JSON.stringify({
+    punto: String(punto || "pantalla").slice(0, 240),
+    mensaje: String(mensaje || "Error").slice(0, 500),
+    detalle: String(detalle || "").slice(-4000),
+    ruta: (vista ? vista.textContent.trim() + " · " : "") + location.pathname
+  });
+  try {
+    fetch("/api/errores", {method:"POST", headers:{"Content-Type":"application/json"}, body: cuerpo, keepalive: true});
+  } catch (e) {}
+}
+window.addEventListener("error", ev => {
+  const pila = ev.error && ev.error.stack ? ev.error.stack : "";
+  reportarError((ev.filename || "pantalla") + ":" + (ev.lineno || 0), ev.message || "Error en la pantalla", pila);
+});
+window.addEventListener("unhandledrejection", ev => {
+  const razon = ev.reason || {};
+  reportarError("pantalla", razon.message || String(razon), razon.stack || "");
+});
 async function api(url, opt){
-  const r = await fetch(url, Object.assign({headers:{"Content-Type":"application/json"}}, opt||{}));
+  const verbo = (opt && opt.method) || "GET";
+  let r;
+  try {
+    r = await fetch(url, Object.assign({headers:{"Content-Type":"application/json"}}, opt||{}));
+  } catch (e) {
+    if (!String(url).includes("/api/errores")) reportarError(verbo + " " + url, e.message || "Sin conexión", e.stack || "");
+    throw e;
+  }
   const data = await r.json().catch(()=>({}));
   if(!r.ok){
     const d = data.detail;
     const texto = typeof d === "string" ? d : (Array.isArray(d) ? d.map(x => x.msg || JSON.stringify(x)).join(", ") : "Error");
+    if (r.status >= 500 && !String(url).includes("/api/errores")) reportarError(verbo + " " + url, texto || "Error", "HTTP " + r.status);
     throw new Error(texto || "Error");
   }
   return data;
 }
 async function entrar(){
+  const nueva = document.getElementById("passNueva");
+  const cajaNueva = document.getElementById("cajaNueva");
+  const renovar = cajaNueva && !cajaNueva.hidden && nueva && nueva.value;
+  const cuerpo = {username:user.value, password:pass.value};
+  if (renovar) cuerpo.nueva = nueva.value;
   try {
-    const s = await api("/api/login", {method:"POST", body: JSON.stringify({username:user.value, password:pass.value})});
+    const s = await api(renovar ? "/api/login/renovar" : "/api/login", {method:"POST", body: JSON.stringify(cuerpo)});
     if (s.rol === "mesero") { location.href = "/tablet"; return; }
     login.style.display="none"; app.style.display="block";
     await refrescar(); await cargar();
     enfocarBusqueda();
-  } catch(e){ loginMsg.textContent = e.message; }
+  } catch(e){
+    loginMsg.textContent = e.message;
+    if (cajaNueva && String(e.message || "").includes("demostración")) cajaNueva.hidden = false;
+  }
 }
 async function sesionInicial(){
   const sonda = new Image();
@@ -7739,6 +8176,8 @@ async function pintarForm(nombre){
     seguimiento: ["Seguimiento de cajeros", "Cuánto vendió cada cajero y qué turnos descuadraron. Deja una nota de seguimiento.", ""],
     impresion: ["Impresión", "La térmica 2connet POS80 usa rollo de 80 mm. El cuadre en hoja carta no cabe en ese rollo y sale cortado. Aquí el cuadre se arma como ticket, y puedes afinar caracteres y margen hasta que la regla quepa en una línea.",
       `<div class="form"><label class="wide">Nombre de la impresora<input id="impNombre" maxlength="80" placeholder="2connet POS80-01"/></label><label>Papel<select id="impPapel" onchange="cambiarPapelImpresion()"><option value="80">80 mm · POS80</option><option value="58">58 mm · portátil</option></select></label><label><span id="impCharsLabel">Caracteres por línea</span><input id="impChars" type="number" min="20" max="64" step="1" oninput="vistaImpresion()"/></label><label>Margen izquierdo (mm)<input id="impMargen" type="number" min="0" max="8" step="1" oninput="vistaImpresion()"/></label><label>El cuadre se imprime en<select id="impCuadre"><option value="ticket">Ticket del rollo (esta térmica)</option><option value="carta">Hoja carta (impresora de oficina)</option></select></label><div class="wide"><button type="button" onclick="guardarImpresion()">Guardar</button> <button type="button" class="sec" onclick="imprimirPrueba()">Probar impresora</button> <button type="button" class="sec" onclick="imprimirMuestraCuadre()">Probar cuadre</button></div><p class="hint wide">Al salir el cuadro de impresión, elige esta impresora, escala 100% y márgenes en Ninguno. La vista de abajo es el ancho real del rollo.</p><div class="wide muestra-impresion" id="impMuestra"></div></div>`],
+    errores: ["Registro de errores", "Cuando el programa falla queda aquí: qué pasó, en qué pantalla o ruta, y a qué hora. En el servidor también se escribe en logs/facturacion.log, junto a la base, aunque la pantalla no alcance a abrirse.",
+      `<div class="form"><label class="wide">Buscar<input id="errQ" placeholder="Pantalla, mensaje o usuario" onkeydown="if(event.key==='Enter')cargarErrores()"/></label><button class="sec" onclick="cargarErrores()">Cargar</button></div><div id="errTabla"></div>`],
     empresa: ["Empresa y correo", "Datos del ticket, el logo del negocio y el servidor que envía el comprobante por correo.",
       `<div class="form"><label>Nombre<input id="empNom"/></label><label class="wide">Dirección<input id="empDir"/></label><label>Teléfono<input id="empTel" placeholder="809-000-0000"/></label><label>RNC<input id="empRnc"/></label><label class="wide">Logo del negocio<input id="empLogoFile" type="file" accept="image/png,image/jpeg,image/webp"/></label><div class="wide logo-previa" id="empLogoCaja" hidden><img id="empLogo" alt="Logo del negocio"><button type="button" class="sec" onclick="quitarLogo()">Quitar logo</button></div><label>Servidor SMTP<input id="smtpHost" placeholder="smtp.hostinger.com"/></label><label>Puerto<input id="smtpPort" value="587"/></label><label>Usuario<input id="smtpUser"/></label><label>Contraseña<input id="smtpPass" type="password" placeholder="Vacía para no cambiarla"/></label><label>Remitente<input id="smtpFrom" placeholder="facturas@tudominio.com"/></label><label class="check wide"><input type="checkbox" id="empItbisIncl"/> Los precios del catálogo ya incluyen el ITBIS (lo normal en colmado y tienda)</label><button onclick="guardarEmpresa()">Guardar</button></div>`],
     porpagar: ["Por pagar", "Compras que todavía no se marcaron como pagadas al suplidor.",
@@ -7778,6 +8217,7 @@ async function pintarForm(nombre){
   if(nombre==="terminales") await cargarTerminales();
   if(nombre==="usuarios") await cargarUsuarios();
   if(nombre==="empresa") await cargarEmpresa();
+  if(nombre==="errores") await cargarErrores();
   if(nombre==="impresion") await cargarImpresion();
   if(nombre==="porpagar") await pintarPorPagar();
   if(nombre==="resultado") await pintarResultado();
@@ -9598,7 +10038,7 @@ function formUsuario(marcar){
     }).join("");
     return `${titulo}<div class="permiso-mod" data-perm-mod="${item.id}"><label class="check"><input type="checkbox" class="mod" onchange="togglePermiso(this)"/> ${item.nombre}</label><div class="permiso-hijos">${filas}</div></div>`;
   }).join("");
-  return `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Obligatoria al crear"/></label><label>Rol<select id="usuRol" onchange="usarRolMesero()"><option>empleado</option><option>mesero</option><option>user</option><option>admin</option></select></label><p class="hint" id="usuNotaMesero" hidden>El mesero solo toma pedidos en la tablet. No abre caja ni hace cuadre. Lo que pide lo factura la cajera con el código, en la caja que esté abierta.</p><p class="hint" id="usuNotaAdmin" hidden>El administrador entra a todas las pantallas. No hace falta marcarlas.</p><div class="wide permisos" id="usuMods">${mods}</div><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div>`;
+  return `<div class="form"><label>Usuario<input id="usuNom"/></label><label>Contraseña<input id="usuPass" type="password" placeholder="Mínimo 8 caracteres"/></label><label>Rol<select id="usuRol" onchange="usarRolMesero()"><option>empleado</option><option>mesero</option><option>user</option><option>admin</option></select></label><p class="hint" id="usuNotaMesero" hidden>El mesero solo toma pedidos en la tablet. No abre caja ni hace cuadre. Lo que pide lo factura la cajera con el código, en la caja que esté abierta.</p><p class="hint" id="usuNotaAdmin" hidden>El administrador entra a todas las pantallas. No hace falta marcarlas.</p><div class="wide permisos" id="usuMods">${mods}</div><button id="btnUsu" onclick="guardarUsuario()">Crear usuario</button></div>`;
 }
 function syncPermiso(input){
   const caja = input.closest(".permiso-mod");
@@ -9820,6 +10260,26 @@ async function leerLogo(file){
     lector.onerror = () => rechazar(new Error("No se pudo leer el logo"));
     lector.readAsDataURL(file);
   });
+}
+async function cargarErrores(){
+  const q = document.getElementById("errQ");
+  const d = await api("/api/errores?q=" + encodeURIComponent(q ? q.value : ""));
+  const caja = document.getElementById("errTabla");
+  if (!caja) return;
+  window._errores = d.items || [];
+  caja.innerHTML = tabla(["Fecha","Dónde","Qué pasó","Usuario", '<span class="oculto-visual">Acciones</span>'], window._errores.map(e => [
+    escDash(String(e.fecha || "").slice(0, 16)),
+    escDash(e.origen === "pantalla" ? (e.ruta || e.punto) : e.punto),
+    escDash(e.mensaje),
+    escDash(e.usuario || "—"),
+    `<button class="sec" type="button" onclick="verError(${e.id})">Ver</button>`
+  ]), "No hay fallos anotados.");
+}
+function verError(id){
+  const e = (window._errores || []).find(x => x.id === id);
+  if (!e) return;
+  const detalle = e.detalle ? `<pre class="hint">${escDash(e.detalle)}</pre>` : `<p class="hint">Sin detalle técnico.</p>`;
+  abrirModal((e.fecha || "Fallo"), `<p><b>${escDash(e.mensaje)}</b></p><p class="hint">${escDash(e.origen)} · ${escDash(e.punto)} · ${escDash(e.usuario || "—")}<br>${escDash(e.ruta || "")}</p>${detalle}`);
 }
 async function cargarEmpresa(){
   const d = await api("/api/empresa");
@@ -10604,6 +11064,7 @@ TABLET_HTML = """<!DOCTYPE html>
   <p>Solo el mesero. El pedido queda con un código y lo factura la cajera en la caja abierta. El mesero no cuadra.</p>
   <label>Usuario<input id="user" autocomplete="username" required/></label>
   <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required/></label>
+  <label id="cajaNueva" hidden>Nueva contraseña<input id="passNueva" type="password" autocomplete="new-password" minlength="8"/></label>
   <button type="submit">Entrar</button>
   <p class="msg" id="loginMsg"></p>
   <p class="nota"><a href="/">Volver a la caja</a></p>
@@ -10695,20 +11156,43 @@ function lineaTotal(l){
 }
 function total(){ return cart.reduce((s,l) => s + lineaTotal(l), 0); }
 function piezas(){ return cart.reduce((s,l) => s + Number(l.cantidad), 0); }
+function reportarError(punto, mensaje, detalle){
+  const cuerpo = JSON.stringify({
+    punto: String(punto || "tablet").slice(0, 240),
+    mensaje: String(mensaje || "Error").slice(0, 500),
+    detalle: String(detalle || "").slice(-4000),
+    ruta: "Tablet · " + location.pathname
+  });
+  try { fetch("/api/errores", {method:"POST", credentials:"same-origin", headers:{"Content-Type":"application/json"}, body: cuerpo, keepalive: true}); } catch (e) {}
+}
 async function api(url, opt){
-  const r = await fetch(url, Object.assign({credentials:"same-origin", headers:{"Content-Type":"application/json"}}, opt||{}));
+  const verbo = (opt && opt.method) || "GET";
+  let r;
+  try {
+    r = await fetch(url, Object.assign({credentials:"same-origin", headers:{"Content-Type":"application/json"}}, opt||{}));
+  } catch (e) {
+    if (!String(url).includes("/api/errores")) reportarError(verbo + " " + url, e.message || "Sin conexión", e.stack || "");
+    throw e;
+  }
   const data = await r.json().catch(()=>({}));
   if(!r.ok){
     const d = data.detail;
-    throw new Error(typeof d === "string" ? d : "No se pudo completar");
+    const texto = typeof d === "string" ? d : "No se pudo completar";
+    if (r.status >= 500 && !String(url).includes("/api/errores")) reportarError(verbo + " " + url, texto, "HTTP " + r.status);
+    throw new Error(texto);
   }
   return data;
 }
 async function entrar(){
   const aviso = document.getElementById("loginMsg");
+  const nueva = document.getElementById("passNueva");
+  const cajaNueva = document.getElementById("cajaNueva");
+  const renovar = cajaNueva && !cajaNueva.hidden && nueva && nueva.value;
   aviso.textContent = "";
+  const cuerpo = {username: user.value, password: pass.value};
+  if (renovar) cuerpo.nueva = nueva.value;
   try {
-    const s = await api("/api/login", {method:"POST", body: JSON.stringify({username: user.value, password: pass.value})});
+    const s = await api(renovar ? "/api/login/renovar" : "/api/login", {method:"POST", body: JSON.stringify(cuerpo)});
     if (s.rol !== "mesero" && s.rol !== "admin") {
       await fetch("/api/logout", {method:"POST", credentials:"same-origin"}).catch(()=>{});
       throw new Error("La tablet es solo para el mesero. La cajera cobra el código en la caja.");
@@ -10727,7 +11211,10 @@ async function entrar(){
     await pendientes();
     pintar();
     preguntarMesa();
-  } catch(e){ aviso.textContent = e.message; }
+  } catch(e){
+    aviso.textContent = e.message;
+    if (cajaNueva && String(e.message || "").includes("demostración")) cajaNueva.hidden = false;
+  }
 }
 function preguntarMesa(){
   mesaMsg.textContent = "";

@@ -1,5 +1,8 @@
 import sqlite3
 import os
+import hashlib
+import hmac
+import secrets
 from datetime import datetime
 
 from app_paths import data_directory
@@ -17,6 +20,49 @@ def _tipo_codigo_default(tipo_movimiento: str) -> str:
     if t in ("retiro", "salida_manual", "ajuste"):
         return "RT"
     return tipo_movimiento[:2].upper() if len(tipo_movimiento) >= 2 else tipo_movimiento.upper()
+
+
+_CLAVES_DEMO = {"admin07!", "usuario07!", "empreado07!"}
+_ITERACIONES_CLAVE = 200_000
+
+
+class ClaveDemostracion(Exception):
+    """La clave sigue siendo una de las de demostración."""
+
+
+def _es_clave_de_demostracion(clave: str) -> bool:
+    return (clave or "").strip() in _CLAVES_DEMO
+
+
+def _exigir_clave_nueva(clave: str) -> None:
+    limpia = (clave or "").strip()
+    if len(limpia) < 8:
+        raise ValueError("La contraseña debe tener al menos 8 caracteres")
+    if _es_clave_de_demostracion(limpia):
+        raise ValueError("Esa contraseña de demostración ya no se puede usar")
+
+
+def _hash_clave(clave: str) -> str:
+    sal = secrets.token_bytes(16)
+    huella = hashlib.pbkdf2_hmac("sha256", clave.encode(), sal, _ITERACIONES_CLAVE)
+    return f"pbkdf2${_ITERACIONES_CLAVE}${sal.hex()}${huella.hex()}"
+
+
+def _clave_coincide(guardada: str, clave: str) -> bool:
+    texto = str(guardada or "")
+    if texto.startswith("pbkdf2$"):
+        partes = texto.split("$")
+        if len(partes) != 4:
+            return False
+        _, vueltas, sal, huella = partes
+        try:
+            prueba = hashlib.pbkdf2_hmac(
+                "sha256", clave.encode(), bytes.fromhex(sal), int(vueltas)
+            ).hex()
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(prueba, huella)
+    return hmac.compare_digest(texto, clave)
 
 
 class Database:
@@ -108,20 +154,7 @@ class Database:
             )
         """)
 
-        # 🔹 USUARIOS POR DEFECTO
-        default_users = [
-            ("admin", "admin07!", "admin"),
-            ("user", "usuario07!", "user"),
-            ("empleado", "empreado07!", "empleado"),
-        ]
-
-        for username, password, role in default_users:
-            cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
-            if cursor.fetchone() is None:
-                cursor.execute(
-                    "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                    (username, password, role)
-                )
+        # Las cuentas de demostración ya no se crean solas.
 
         # =========================
         #   TABLA CLIENTES
@@ -2192,20 +2225,55 @@ class Database:
     # 🔹 MÉTODO PARA VALIDAR LOGIN
     def validate_user(self, username: str, password: str):
         """
-        Devuelve el rol del usuario si las credenciales son correctas,
-        si no, devuelve None.
+        Devuelve el rol si la clave es correcta.
+        Una clave de demostración conocida no entra: hay que cambiarla.
         """
+        if not self.comprobar_clave(username, password):
+            return None
+        if _es_clave_de_demostracion(password):
+            self._reescribir_hash(username, password)
+            raise ClaveDemostracion()
+        self._reescribir_hash(username, password)
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role FROM users WHERE username = ? AND password = ?",
-            (username, password)
-        )
+        cursor.execute("SELECT role FROM users WHERE username = ?", (username,))
         row = cursor.fetchone()
         conn.close()
-        if row:
-            return row[0]  # role
-        return None
+        return row[0] if row else None
+
+    def comprobar_clave(self, username: str, password: str) -> bool:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT password FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return False
+        return _clave_coincide(row[0], password)
+
+    def fijar_clave(self, username: str, password: str) -> None:
+        _exigir_clave_nueva(password)
+        self._guardar_hash(username, _hash_clave(password))
+
+    def _reescribir_hash(self, username: str, password: str) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT password FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
+        if row and not str(row[0]).startswith("pbkdf2$"):
+            cursor.execute(
+                "UPDATE users SET password=? WHERE username=?",
+                (_hash_clave(password), username),
+            )
+            conn.commit()
+        conn.close()
+
+    def _guardar_hash(self, username: str, huella: str) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET password=? WHERE username=?", (huella, username))
+        conn.commit()
+        conn.close()
 
     def _migrate_permisos_seguimiento(self, cursor):
         cursor.execute(
@@ -2433,15 +2501,16 @@ class Database:
 
     def create_user(self, username: str, password: str, role: str):
         """
-        Crea un nuevo usuario. Lanza ValueError si el username ya existe.
-        ⚠️ En producción deberías guardar password hasheado.
+        Crea un nuevo usuario. Lanza ValueError si el username ya existe
+        o si la clave es corta o de demostración.
         """
+        _exigir_clave_nueva(password)
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
             cursor.execute(
                 "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                (username, password, role)
+                (username, _hash_clave(password), role)
             )
             conn.commit()
         except sqlite3.IntegrityError:
@@ -2465,8 +2534,9 @@ class Database:
             params.append(username)
 
         if password:  # solo si no está vacío
+            _exigir_clave_nueva(password)
             campos.append("password = ?")
-            params.append(password)
+            params.append(_hash_clave(password))
 
         if role:
             campos.append("role = ?")

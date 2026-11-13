@@ -230,7 +230,11 @@ class UsersManager(ctk.CTkFrame):
             messagebox.showerror("Error", "Solo un administrador puede asignar rol admin")
             return
 
-        self.db.update_user(self.selected_user_id, username, password_to_set, role)
+        try:
+            self.db.update_user(self.selected_user_id, username, password_to_set, role)
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            return
         messagebox.showinfo("Éxito", "Usuario actualizado")
         self.load_users()
 

@@ -665,6 +665,6 @@ def apply_demo_seed_if_empty(cursor) -> bool:
 
     print(
         "📦 Demo: ~90 días de kardex (CO/RT/FA), ~60 facturas, resumen mensual en reportes, "
-        "cierres de caja históricos. Usuario: admin / admin07!"
+        "cierres de caja históricos. El administrador entra con la clave que ya definió."
     )
     return True

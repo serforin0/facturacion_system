@@ -6,12 +6,20 @@ import pytest
 from database import Database
 
 
+def sembrar_usuarios_de_prueba(base):
+    base.create_user("admin", "clave-admin-1", "admin")
+    base.create_user("user", "clave-usuario-1", "user")
+    base.create_user("empleado", "clave-empleado-1", "empleado")
+
+
 @pytest.fixture
 def base(tmp_path):
     """Base SQLite vacía de negocio, aislada del archivo real del proyecto."""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        return Database(str(tmp_path / "prueba.db"))
+        base = Database(str(tmp_path / "prueba.db"))
+    sembrar_usuarios_de_prueba(base)
+    return base
 
 
 def insertar_producto(cur, codigo, nombre, stock=10, precio=100, bodega="Principal"):

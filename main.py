@@ -10,7 +10,7 @@ from config_impresion_dialog import open_config_impresion
 from inventory_manager import InventoryManager
 from styles import Styles
 from cuenta_servidor import ServidorInalcanzable, consultar_usuario, url_servidor
-from database import Database
+from database import ClaveDemostracion, Database
 from facturacion_erp_manager import FacturacionERPManager
 from factura_manager import FacturaManager              # Módulo de facturación (punto de venta)
 from main_reportes_manager import MainReportesManager   # Módulo general de reportes (Ventas + Inventario)
@@ -227,7 +227,11 @@ class BarSystemApp:
             messagebox.showwarning("Aviso", "Ingresa usuario y contraseña")
             return
 
-        role = self.db.validate_user(username, password)
+        try:
+            role = self.db.validate_user(username, password)
+        except ClaveDemostracion:
+            self._cambiar_clave_demo(username, password)
+            return
         if role:
             self._abrir_sesion(username, role, password)
             return
@@ -251,6 +255,25 @@ class BarSystemApp:
 
         threading.Thread(target=trabajo, daemon=True).start()
 
+    def _cambiar_clave_demo(self, username, password):
+        from tkinter import simpledialog
+        nueva = simpledialog.askstring(
+            "Nueva contraseña",
+            "La clave de demostración ya no sirve.\nElige una nueva de al menos 8 caracteres.",
+            show="*",
+            parent=self.root,
+        )
+        if not nueva:
+            return
+        try:
+            self.db.fijar_clave(username, nueva.strip())
+        except ValueError as exc:
+            messagebox.showerror("Contraseña", str(exc))
+            return
+        role = self.db.validate_user(username, nueva.strip())
+        if role:
+            self._abrir_sesion(username, role, nueva.strip())
+
     def _aplicar_usuario_servidor(self, username, password, rol, error):
         self._login_buscando = False
         if not getattr(self, "btn_login", None):
@@ -268,7 +291,14 @@ class BarSystemApp:
         try:
             self.db.create_user(username, password, rol)
         except ValueError:
-            rol = self.db.validate_user(username, password)
+            try:
+                rol = self.db.validate_user(username, password)
+            except ClaveDemostracion:
+                messagebox.showerror(
+                    "Contraseña",
+                    "La clave de demostración ya no sirve. Elige una nueva de al menos 8 caracteres.",
+                )
+                return
             if not rol:
                 messagebox.showerror("Error", "El usuario ya existe en esta computadora con otra contraseña.")
                 return

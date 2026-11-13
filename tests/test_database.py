@@ -36,13 +36,20 @@ def test_el_codigo_de_movimiento_sale_del_tipo():
     assert _tipo_codigo_default("") == ""
 
 
-def test_el_login_acepta_al_admin_y_rechaza_la_clave(base):
-    assert base.validate_user("admin", "admin07!") == "admin"
+def test_el_login_guarda_la_clave_con_hash(base):
+    assert base.validate_user("admin", "clave-admin-1") == "admin"
     assert base.validate_user("admin", "no") is None
-    base.create_user("cajero1", "clave", "user")
-    assert base.validate_user("cajero1", "clave") == "user"
+    base.create_user("cajero1", "clave-de-prueba", "user")
+    assert base.validate_user("cajero1", "clave-de-prueba") == "user"
+    conn = base.get_connection()
+    guardada = conn.execute("SELECT password FROM users WHERE username='cajero1'").fetchone()[0]
+    conn.close()
+    assert guardada.startswith("pbkdf2$")
+    assert "clave-de-prueba" not in guardada
     with pytest.raises(ValueError):
-        base.create_user("cajero1", "otra", "user")
+        base.create_user("cajero1", "otra-clave-1", "user")
+    with pytest.raises(ValueError):
+        base.create_user("corto", "clave", "user")
 
 
 def test_la_configuracion_se_guarda_y_se_lee(base):

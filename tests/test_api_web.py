@@ -1,13 +1,14 @@
 """Flujos HTTP del mostrador: login, caja, venta, historial y permisos."""
 import contextlib
 import io
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import web_server
 from database import Database
-from tests.conftest import insertar_producto
+from tests.conftest import insertar_producto, sembrar_usuarios_de_prueba
 
 
 @pytest.fixture
@@ -15,13 +16,14 @@ def api(tmp_path, monkeypatch):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         base = Database(str(tmp_path / "web.db"))
+    sembrar_usuarios_de_prueba(base)
     monkeypatch.setattr(web_server, "db", lambda: base)
-    cliente = TestClient(web_server.app)
+    cliente = TestClient(web_server.app, base_url="https://testserver")
     cliente.base = base
     return cliente
 
 
-def _entrar(api, usuario="admin", clave="admin07!"):
+def _entrar(api, usuario="admin", clave="clave-admin-1"):
     resp = api.post("/api/login", json={"username": usuario, "password": clave})
     assert resp.status_code == 200, resp.text
     assert resp.json()["usuario"] == usuario
@@ -57,6 +59,8 @@ def test_las_paginas_del_mostrador_responden(api):
     assert "function sinExistencia" in html
     assert "no tiene stock" in html
     assert "function imprimirEnTermica" in html
+    assert "Registro de errores" in html
+    assert "function reportarError" in html
     assert "function lecturaEnProducto" in html
     assert 'id="vendiendo"' in html
     assert "0x1b, 0x70, 0x00, 0x19, 0xfa" in html
@@ -147,12 +151,12 @@ def test_el_mesero_no_abre_caja_y_el_cajero_si_crea_cliente(api):
     _entrar(api)
     creado = api.post(
         "/api/usuarios",
-        json={"username": "mesero1", "password": "mesa", "role": "mesero"},
+        json={"username": "mesero1", "password": "mesa-prueba", "role": "mesero"},
     )
     assert creado.status_code == 200
     api.post("/api/logout")
 
-    _entrar(api, "mesero1", "mesa")
+    _entrar(api, "mesero1", "mesa-prueba")
     assert api.get("/api/estado").json()["rol"] == "mesero"
     caja = api.post("/api/caja/abrir", json={"nombre": "Caja", "fondo": 0})
     assert caja.status_code == 403
@@ -208,7 +212,7 @@ def test_inventario_metodos_y_empresa_responden_al_admin(api):
 
 
 def test_la_venta_al_por_mayor_baja_el_stock_del_almacen(api):
-    _entrar(api, "empleado", "empreado07!")
+    _entrar(api, "empleado", "clave-empleado-1")
     assert api.get("/api/mayor").status_code == 403
     api.post("/api/logout")
 
@@ -319,7 +323,7 @@ def test_la_transferencia_se_cobra_solo_con_el_monto(api):
 
 
 def test_el_empleado_publica_la_venta_y_el_cuadre_la_recibe(api):
-    _entrar(api, "empleado", "empreado07!")
+    _entrar(api, "empleado", "clave-empleado-1")
     pid = _producto(api, "SYNC-1", precio=25, stock=10)
     resp = api.post("/api/sync/venta", json={
         "ventas": [{
@@ -354,3 +358,113 @@ def test_el_empleado_publica_la_venta_y_el_cuadre_la_recibe(api):
     conn.close()
     assert float(stock) == 8
     assert float(cuadre) == 50
+
+
+def test_el_registro_guarda_el_fallo_y_el_punto(api):
+    _entrar(api, "empleado", "clave-empleado-1")
+    aviso = api.post("/api/errores", json={
+        "punto": "Cobrar",
+        "mensaje": "No se pudo imprimir el ticket",
+        "detalle": "linea 12",
+        "ruta": "Mostrador",
+    })
+    assert aviso.status_code == 200, aviso.text
+    assert api.get("/api/errores").status_code == 403
+    api.post("/api/logout")
+
+    _entrar(api)
+    antes = api.get("/api/errores").json()["items"]
+    vacio = api.post("/api/vender", json={"items": []})
+    assert vacio.status_code == 400
+    assert len(api.get("/api/errores").json()["items"]) == len(antes)
+
+    lista = api.get("/api/errores", params={"q": "imprimir"})
+    assert lista.status_code == 200
+    item = lista.json()["items"][0]
+    assert item["origen"] == "pantalla"
+    assert item["punto"] == "Cobrar"
+    assert item["mensaje"] == "No se pudo imprimir el ticket"
+    assert item["usuario"] == "empleado"
+    assert item["ruta"] == "Mostrador"
+
+    @web_server.app.get("/api/_fallo_de_prueba")
+    def _fallo_de_prueba():
+        raise RuntimeError("se rompió al cobrar")
+
+    try:
+        silencioso = TestClient(web_server.app, raise_server_exceptions=False)
+        silencioso.cookies.update(api.cookies)
+        roto = silencioso.get("/api/_fallo_de_prueba")
+        assert roto.status_code == 500
+        assert "registro de errores" in roto.json()["detail"]
+        guardados = api.get("/api/errores", params={"q": "cobrar"}).json()["items"]
+        fallo = next(x for x in guardados if x["origen"] == "servidor")
+        assert fallo["punto"] == "GET /api/_fallo_de_prueba"
+        assert "se rompió al cobrar" in fallo["mensaje"]
+        assert "RuntimeError" in fallo["detalle"]
+        web_server._al_arrancar()
+        web_server._al_detener()
+        bitacora = Path(api.base.db_name).parent / "logs" / "facturacion.log"
+        texto = bitacora.read_text(encoding="utf-8")
+        assert "El servidor arrancó" in texto
+        assert "El servidor se detuvo" in texto
+        assert "No se pudo imprimir el ticket" in texto
+        assert "Cobrar" in texto
+        assert "se rompió al cobrar" in texto
+        assert "GET /api/_fallo_de_prueba" in texto
+    finally:
+        web_server.app.router.routes = [
+            ruta for ruta in web_server.app.router.routes
+            if getattr(ruta, "path", None) != "/api/_fallo_de_prueba"
+        ]
+
+
+def test_la_sesion_muere_al_salir_y_la_clave_viaja_cifrada(api):
+    entrada = _entrar(api)
+    cookie = entrada.headers["set-cookie"].lower()
+    assert "httponly" in cookie
+    assert "secure" in cookie
+    sesion = api.cookies.get("sesion")
+    api.post("/api/logout")
+    api.cookies.clear()
+    api.cookies.set("sesion", sesion)
+    assert api.get("/api/estado").status_code == 401
+    api.cookies.clear()
+
+    for _ in range(8):
+        malo = api.post("/api/login", json={"username": "nadie", "password": "incorrecta-1"})
+        assert malo.status_code == 401
+    bloqueado = api.post("/api/login", json={"username": "nadie", "password": "incorrecta-1"})
+    assert bloqueado.status_code == 429
+
+    conn = api.base.get_connection()
+    conn.execute(
+        "INSERT INTO users (username, password, role) VALUES ('viejo', 'admin07!', 'admin')"
+    )
+    conn.commit()
+    conn.close()
+    demo = api.post("/api/login", json={"username": "viejo", "password": "admin07!"})
+    assert demo.status_code == 409
+    nueva = api.post("/api/login/renovar", json={
+        "username": "viejo", "password": "admin07!", "nueva": "clave-nueva-1",
+    })
+    assert nueva.status_code == 200, nueva.text
+    assert api.get("/api/estado").json()["usuario"] == "viejo"
+    api.post("/api/logout")
+
+    _entrar(api)
+    creado = api.post("/api/usuarios", json={
+        "username": "encargado",
+        "password": "clave-encargado",
+        "role": "empleado",
+        "modulos": ["usuarios"],
+    })
+    assert creado.status_code == 200, creado.text
+    api.post("/api/logout")
+    _entrar(api, "encargado", "clave-encargado")
+    prohibido = api.post("/api/usuarios", json={
+        "username": "jefe",
+        "password": "clave-jefe-01",
+        "role": "admin",
+    })
+    assert prohibido.status_code == 403
