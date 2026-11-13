@@ -1110,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v6";
+const CACHE = "pos-v7";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -6183,6 +6183,7 @@ HTML = """<!DOCTYPE html>
   #login h2 { margin:0; font-size:20px; font-weight:700; }
   #login p { margin:0; color:var(--muted); }
   #login label { display:grid; gap:6px; font-size:13px; color:var(--muted); }
+  #login label[hidden] { display:none !important; }
   #login button { height:44px; margin-top:6px; }
   #login { animation: llegar 520ms var(--ease-out) both; }
   #login .mono { animation: pintar 560ms var(--ease-in-out) 140ms both; }
@@ -6667,7 +6668,7 @@ HTML = """<!DOCTYPE html>
   <div class="marca"><span class="mono" aria-hidden="true">MD</span><div><h2>MD Alliance</h2><p>Punto de venta</p></div></div>
   <label>Usuario<input id="user" autocomplete="username" required/></label>
   <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required/></label>
-  <label id="cajaNueva" hidden>Nueva contraseña<input id="passNueva" type="password" autocomplete="new-password" minlength="8"/></label>
+  <label id="cajaNueva" hidden>Nueva contraseña<input id="passNueva" type="password" autocomplete="off" disabled/></label>
   <button type="submit">Entrar</button>
   <p class="hint" style="text-align:center;margin:14px 0 0"><a href="/tablet">Entrada del mesero</a></p>
   <div class="msg" id="loginMsg" role="alert"></div>
@@ -7201,7 +7202,11 @@ async function entrar(){
     enfocarBusqueda();
   } catch(e){
     loginMsg.textContent = e.message;
-    if (cajaNueva && String(e.message || "").includes("demostración")) cajaNueva.hidden = false;
+    if (cajaNueva && nueva && String(e.message || "").includes("demostración")) {
+      cajaNueva.hidden = false;
+      nueva.disabled = false;
+      nueva.focus();
+    }
   }
 }
 async function sesionInicial(){
@@ -10905,6 +10910,7 @@ TABLET_HTML = """<!DOCTYPE html>
   #login h1 { margin:0; font-size:28px; }
   #login p, .nota { color:var(--muted); margin:0; }
   #login label { display:grid; gap:6px; font-size:13px; color:var(--muted); font-weight:700; }
+  #login label[hidden] { display:none !important; }
   #login input, .buscar input {
     background:var(--raised); border:1px solid var(--line); border-radius:14px;
     min-height:52px; padding:0 14px; color:var(--ink);
@@ -11101,7 +11107,7 @@ TABLET_HTML = """<!DOCTYPE html>
   <p>Solo el mesero. El pedido queda con un código y lo factura la cajera en la caja abierta. El mesero no cuadra.</p>
   <label>Usuario<input id="user" autocomplete="username" required/></label>
   <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required/></label>
-  <label id="cajaNueva" hidden>Nueva contraseña<input id="passNueva" type="password" autocomplete="new-password" minlength="8"/></label>
+  <label id="cajaNueva" hidden>Nueva contraseña<input id="passNueva" type="password" autocomplete="off" disabled/></label>
   <button type="submit">Entrar</button>
   <p class="msg" id="loginMsg"></p>
   <p class="nota"><a href="/">Volver a la caja</a></p>
@@ -11250,7 +11256,11 @@ async function entrar(){
     preguntarMesa();
   } catch(e){
     aviso.textContent = e.message;
-    if (cajaNueva && String(e.message || "").includes("demostración")) cajaNueva.hidden = false;
+    if (cajaNueva && nueva && String(e.message || "").includes("demostración")) {
+      cajaNueva.hidden = false;
+      nueva.disabled = false;
+      nueva.focus();
+    }
   }
 }
 function preguntarMesa(){
