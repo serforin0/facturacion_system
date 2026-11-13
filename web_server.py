@@ -1110,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v7";
+const CACHE = "pos-v8";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -7085,7 +7085,15 @@ function enfocarBusqueda(){
   if (activo && activo !== document.body && (campoDeTexto(activo) || activo.tagName === "SELECT")) return;
   caja.focus();
 }
+function enLogin(){
+  const formulario = document.getElementById("login");
+  return !!(formulario && getComputedStyle(formulario).display !== "none");
+}
+function esClave(el){
+  return !!(el && el.tagName === "INPUT" && String(el.type || "").toLowerCase() === "password");
+}
 function lecturaDeLector(ev){
+  if (enLogin() || esClave(ev.target)) { resetLector(); return; }
   const venta = document.getElementById("view-venta");
   if (!venta || venta.style.display === "none" || modal.classList.contains("on") || cobroAbierto()) { resetLector(); return; }
   if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return;
