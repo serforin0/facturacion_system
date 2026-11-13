@@ -68,6 +68,27 @@ def test_las_paginas_del_mostrador_responden(api):
     assert "Venta al por mayor" in html
 
 
+def test_un_codigo_no_trae_combos_de_otra_cosa(api):
+    _entrar(api)
+    conn = api.base.get_connection()
+    cur = conn.cursor()
+    pid = insertar_producto(cur, "GWV7501", "Pieza GWV", stock=4, precio=25)
+    otro = insertar_producto(cur, "CMB-A", "Cerveza suelta", stock=8)
+    conn.commit()
+    conn.close()
+    api.base.guardar_combo("Combo Demo", 100, [(otro, 1), (pid, 1)])
+    suelto = api.get("/api/catalogo")
+    assert suelto.status_code == 200
+    assert any(c["nombre"] == "Combo Demo" for c in suelto.json()["combos"])
+    buscado = api.get("/api/catalogo", params={"q": "GWV7501"})
+    assert buscado.status_code == 200
+    cuerpo = buscado.json()
+    assert [p["id"] for p in cuerpo["productos"]] == [pid]
+    assert cuerpo["productos"][0]["codigo"] == "GWV7501"
+    assert cuerpo["productos"][0]["imagen"] == "/estaticos/productos/sin-foto.svg"
+    assert cuerpo["combos"] == []
+
+
 def test_sin_sesion_no_hay_estado_ni_venta(api):
     assert api.get("/api/estado").status_code == 401
     assert api.post("/api/vender", json={"items": [{"id": 1, "cantidad": 1}]}).status_code == 401

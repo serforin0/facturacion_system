@@ -65,6 +65,8 @@ def _imagen_de(nombre: str, imagen_path: str | None = None) -> str:
     for clave, archivo in _FONDOS:
         if clave in texto:
             return f"/estaticos/productos/{archivo}"
+    if texto.strip():
+        return "/estaticos/productos/sin-foto.svg"
     return ""
 
 
@@ -1108,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v5";
+const CACHE = "pos-v6";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -1316,6 +1318,12 @@ def catalogo(request: Request, q: str = "", categoria: int | None = None):
         {"id": i, "nombre": n, "precio": float(p), "descripcion": d or "", "combo": True, "stock": None, "imagen": _imagen_de(n), "itbis": True, "codigo": "", "minimo": 0, "extras": []}
         for i, n, p, d in db().listar_combos_venta()
     ]
+    if texto:
+        aguja = texto.lower()
+        combos = [
+            c for c in combos
+            if aguja in c["nombre"].lower() or aguja in c["descripcion"].lower()
+        ]
     conn.close()
     return {
         "categorias": categorias,
@@ -7084,31 +7092,47 @@ function lecturaDeLector(ev){
   if (!caja) return;
   const ahora = performance.now();
   if (ev.key === "Enter" || ev.key === "Tab") {
-    const reciente = lector.buf.length >= 4 && (ahora - lector.t) < 120;
+    const reciente = lector.buf.length >= 3 && (ahora - lector.t) < 250;
     const escrito = ev.target === caja ? caja.value.trim() : "";
-    const codigo = (lector.propio || reciente) && lector.buf.length >= 4
-      ? (escrito.length > lector.buf.length && escrito.endsWith(lector.buf) ? escrito : lector.buf)
-      : "";
+    const deCaja = ev.target === caja && ev.key === "Enter";
+    const dePistola = lector.propio || reciente;
+    if (!deCaja && !dePistola) { resetLector(); return; }
+    const codigo = deCaja
+      ? escrito
+      : (escrito.length >= lector.buf.length && escrito.endsWith(lector.buf) ? escrito : lector.buf.trim());
     resetLector();
-    if (codigo.length < 4) return;
+    if (!codigo) return;
     ev.preventDefault();
     ev.stopPropagation();
     caja.value = codigo;
     clearTimeout(window._qT);
-    cargar();
+    cargar(true);
     caja.focus();
     return;
   }
   if (ev.key.length !== 1) { resetLector(); return; }
-  const sigue = lector.buf && (ahora - lector.t) <= 45;
-  if (!sigue) { lector.buf = ""; lector.propio = false; }
+  const sigue = lector.buf && (ahora - lector.t) <= 150;
+  if (!sigue) {
+    lector.buf = "";
+    lector.propio = false;
+    lector.previo = ev.target === caja ? (caja.value || "") : "";
+  }
   lector.buf += ev.key;
   lector.t = ahora;
   const rafaga = sigue && lector.buf.length >= 2;
   if (!rafaga && ev.target === caja) return;
   if (!rafaga && campoDeTexto(ev.target)) return;
   ev.preventDefault();
-  if (ev.target !== caja && campoDeTexto(ev.target)) {
+  if (ev.target === caja) {
+    const actual = caja.value || "";
+    const sinUltimo = lector.buf.slice(0, -1);
+    let valor = actual;
+    if (sinUltimo && actual.endsWith(sinUltimo)) valor = actual.slice(0, -sinUltimo.length) + lector.buf;
+    else if (!actual.endsWith(lector.buf)) valor = actual + ev.key;
+    const sobra = lector.previo || "";
+    if (sobra && lector.buf.length >= 4 && valor.endsWith(lector.buf) && valor.length > lector.buf.length) valor = lector.buf;
+    caja.value = valor;
+  } else if (campoDeTexto(ev.target)) {
     const puesto = lector.buf.slice(0, -1);
     const valor = ev.target.value || "";
     if (puesto && valor.endsWith(puesto)) {
@@ -7118,7 +7142,7 @@ function lecturaDeLector(ev){
   }
   lector.propio = true;
   caja.focus();
-  caja.value = lector.buf;
+  if (ev.target !== caja) caja.value = lector.buf;
 }
 document.addEventListener("keydown", lecturaDeLector, true);
 function reportarError(punto, mensaje, detalle){
@@ -7512,36 +7536,47 @@ function repreciarTicket(){
   });
   return cambio;
 }
-async function cargar(){
+async function cargar(desdeLector){
+  const pedido = (window._cargaCat || 0) + 1;
+  window._cargaCat = pedido;
+  const consulta = q.value;
+  const categoria = cat.value;
+  const esLector = desdeLector === true;
   grid.setAttribute("aria-busy", "true");
   let data;
   try {
-    data = await api("/api/catalogo?q=" + encodeURIComponent(q.value) + (cat.value ? "&categoria="+cat.value : ""));
+    data = await api("/api/catalogo?q=" + encodeURIComponent(consulta) + (categoria ? "&categoria="+categoria : ""));
   } catch(e) {
+    if (pedido !== window._cargaCat) return;
     grid.innerHTML = `<p class="vacio">No se pudo cargar el catálogo: ${String(e.message).replaceAll("<","&lt;")}</p>`;
     return;
   } finally {
     grid.removeAttribute("aria-busy");
   }
+  if (pedido !== window._cargaCat) return;
   if (data.descuentos) etiquetasLista(data.descuentos);
   cat.innerHTML = '<option value="">Todas</option>' + data.categorias.map(c=>`<option value="${c.id}">${c.nombre}</option>`).join("");
   if (window._cat) cat.value = window._cat;
-  const escrito = q.value.trim();
+  const escrito = consulta.trim();
   const qv = escrito.toLowerCase();
   if (!navigator.onLine && qv) {
-    data.productos = data.productos.filter(p => String(p.nombre).toLowerCase().includes(qv) || String(p.codigo || "").toLowerCase().includes(qv));
-    data.combos = (data.combos || []).filter(c => String(c.nombre).toLowerCase().includes(qv));
+    data.productos = data.productos.filter(p => String(p.nombre).toLowerCase().includes(qv) || String(p.codigo || "").toLowerCase().includes(qv) || String(p.codigo_producto || "").toLowerCase().includes(qv));
+  }
+  if (qv) {
+    data.combos = (data.combos || []).filter(c => String(c.nombre).toLowerCase().includes(qv) || String(c.descripcion || "").toLowerCase().includes(qv));
   }
   const vendibles = data.productos.filter(p => !sinExistencia(p));
   const tarjetas = vendibles.concat(data.combos || []);
   recordarPrecios(data.productos.concat(data.combos || []));
   if (repreciarTicket()) pintar();
   const coincide = p => {
-    const codes = [p.codigo, p.codigo_producto].map(s => String(s || "").trim().toLowerCase());
-    return qv && codes.includes(qv);
+    const codes = [p.codigo, p.codigo_producto].map(s => String(s || "").replace(/\\s+/g, "").toLowerCase());
+    return qv && codes.includes(qv.replace(/\\s+/g, ""));
   };
   const exacto = vendibles.find(coincide);
   const agotado = data.productos.find(p => sinExistencia(p) && coincide(p));
+  const unico = esLector && !exacto && vendibles.length === 1 && !(data.combos || []).length ? vendibles[0] : null;
+  const elegido = exacto || unico;
   grid.innerHTML = tarjetas.map(p=>{
     const nivel = Number(lista.value);
     const precio = p.combo ? p.precio : ([p.precio, p.precio_2, p.precio_3, p.precio_4][nivel-1] || p.precio);
@@ -7558,12 +7593,12 @@ async function cargar(){
     window._animarGrid = false;
     animar(grid, [{opacity:0}, {opacity:1}], {duration:150});
   }
-  if (exacto) {
+  if (elegido) {
     const nivel = Number(lista.value);
-    const precio = [exacto.precio, exacto.precio_2, exacto.precio_3, exacto.precio_4][nivel-1] || exacto.precio;
+    const precio = [elegido.precio, elegido.precio_2, elegido.precio_3, elegido.precio_4][nivel-1] || elegido.precio;
     q.value = "";
-    add(exacto, precio);
-    if (window._caja) aviso(exacto.nombre + " agregado.", "ok");
+    add(elegido, precio);
+    if (window._caja) aviso(elegido.nombre + " agregado.", "ok");
     return cargar();
   }
   if (agotado) {
@@ -7571,7 +7606,9 @@ async function cargar(){
     aviso(agotado.nombre + " no tiene stock.", "error");
     return cargar();
   }
-  if (/^\\d{4,}$/.test(escrito)) aviso("No hay producto con el código " + escrito + ".", "error");
+  if (escrito && !vendibles.length && !(data.combos || []).length && (esLector || /^\\d{4,}$/.test(escrito))) {
+    aviso("No hay producto con el código " + escrito + ".", "error");
+  }
 }
 cat.onchange = ()=>{ window._cat = cat.value; window._animarGrid = true; cargar(); };
 lista.onchange = cargar;
@@ -10433,7 +10470,7 @@ async function cobrar(){
     avisoCobro(e.message);
   }
 }
-q.addEventListener("keydown", ev=>{ if(ev.key==="Enter") { clearTimeout(window._qT); cargar(); } });
+q.addEventListener("keydown", ev=>{ if(ev.key==="Enter") { clearTimeout(window._qT); cargar(true); } });
 q.addEventListener("input", ()=>{ clearTimeout(window._qT); window._qT = setTimeout(cargar, 250); });
 function imprimirPrecuenta(){
   const van = cart.filter(l => l.cobrar !== false);

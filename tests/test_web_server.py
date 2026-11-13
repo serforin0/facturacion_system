@@ -92,7 +92,7 @@ def test_el_filtro_de_fechas_usa_el_rango_o_los_dias():
 
 def test_la_imagen_cae_en_el_fondo_del_producto():
     assert _imagen_de("Cerveza Presidente") == "/estaticos/productos/cerveza.jpg"
-    assert _imagen_de("Servilleta") == ""
+    assert _imagen_de("Servilleta") == "/estaticos/productos/sin-foto.svg"
 
 
 def test_el_texto_del_combo_junta_los_componentes():
