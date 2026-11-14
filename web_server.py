@@ -1110,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v8";
+const CACHE = "pos-v9";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -7729,6 +7729,19 @@ async function dejarEnMesa(){
     msg.textContent = e.message;
   }
 }
+async function prepararImpresora(){
+  if (!navigator.serial) return false;
+  try {
+    if (!window._puertoCajon) {
+      const lista = await navigator.serial.getPorts();
+      if (lista[0]) window._puertoCajon = lista[0];
+    }
+    if (!window._puertoCajon) window._puertoCajon = await navigator.serial.requestPort();
+    return !!window._puertoCajon;
+  } catch (e) {
+    return false;
+  }
+}
 function pedirPuertoCajon(){
   if (!navigator.serial || window._puertoCajon) return Promise.resolve(window._puertoCajon || null);
   if (window._pidiendoCajon) return window._pidiendoCajon;
@@ -7757,17 +7770,18 @@ async function conPuerto(escribir){
     }
     const puerto = window._puertoCajon;
     if (!puerto) return false;
-    let writer;
-    try {
+    const enviar = async () => {
       if (!puerto.writable) await puerto.open({baudRate: 9600});
-      writer = puerto.writable.getWriter();
-      await escribir(writer);
+      const writer = puerto.writable.getWriter();
+      try { await escribir(writer); }
+      finally { try { writer.releaseLock(); } catch (err) {} }
+    };
+    try {
+      await enviar();
       return true;
     } catch (e) {
-      try { if (puerto.writable) await puerto.close(); } catch (err) {}
-      return false;
-    } finally {
-      try { if (writer) writer.releaseLock(); } catch (err) {}
+      try { await puerto.close(); } catch (err) {}
+      try { await enviar(); return true; } catch (err2) { return false; }
     }
   });
 }
@@ -9142,8 +9156,9 @@ async function enviarFactura(id, emailActual){
   } catch(e){ formMsg.style.color="var(--danger)"; formMsg.textContent = e.message; }
 }
 async function reimprimirFactura(id){
+  await prepararImpresora();
   const f = await api("/api/factura/"+id);
-  imprimirRecibo(f);
+  await imprimirRecibo(f);
 }
 async function repetirFactura(id){
   const f = await api("/api/factura/"+id);
@@ -9856,14 +9871,16 @@ function bytesTicket(doc, ancho){
   return out;
 }
 async function imprimirEnTermica(doc, ancho){
-  if (!navigator.serial || !doc || doc.querySelector(".qr svg")) return false;
+  if (!navigator.serial || !doc) return false;
   const bytes = bytesTicket(doc, ancho);
   if (!bytes) return false;
-  let concedido = !!window._puertoCajon;
-  if (!concedido) {
-    try { concedido = (await navigator.serial.getPorts()).length > 0; } catch (e) { concedido = false; }
+  if (!window._puertoCajon) {
+    try {
+      const lista = await navigator.serial.getPorts();
+      if (lista[0]) window._puertoCajon = lista[0];
+    } catch (e) {}
   }
-  if (!concedido) return false;
+  if (!window._puertoCajon) return false;
   return conPuerto(writer => writer.write(bytes));
 }
 async function imprimirTicket(html){
@@ -10424,7 +10441,7 @@ async function cobrar(){
     return;
   }
   const hayEfectivo = pagos.some(p => p.caja && p.monto > 0);
-  if (hayEfectivo) await asegurarPuertoCajon();
+  await prepararImpresora();
   const boton = document.getElementById("btnCobrar");
   boton.classList.add("cobrando");
   boton.disabled = true;
@@ -10455,7 +10472,7 @@ async function cobrar(){
     }
     boton.classList.remove("cobrando");
     cerrarCobro();
-    imprimirRecibo(data);
+    await imprimirRecibo(data);
     repintarPlaca(data);
     const pendienteId = window._esperaId;
     const conduceId = window._conduceId;
@@ -10485,17 +10502,18 @@ async function cobrar(){
 }
 q.addEventListener("keydown", ev=>{ if(ev.key==="Enter") { clearTimeout(window._qT); cargar(true); } });
 q.addEventListener("input", ()=>{ clearTimeout(window._qT); window._qT = setTimeout(cargar, 250); });
-function imprimirPrecuenta(){
+async function imprimirPrecuenta(){
   const van = cart.filter(l => l.cobrar !== false);
   if (!van.length) {
     msg.style.color = "var(--danger)";
     msg.textContent = "El ticket está vacío.";
     return;
   }
+  await prepararImpresora();
   const t = totalTicket();
   const cli = (document.getElementById("cliVenta") || {}).selectedOptions;
   const vend = (document.getElementById("vendVenta") || {}).selectedOptions;
-  imprimirRecibo({
+  await imprimirRecibo({
     precuenta: true,
     fecha: "",
     observaciones: (document.getElementById("obsVenta") || {}).value || "",
