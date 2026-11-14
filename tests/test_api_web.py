@@ -1,6 +1,7 @@
 """Flujos HTTP del mostrador: login, caja, venta, historial y permisos."""
 import contextlib
 import io
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -489,3 +490,52 @@ def test_la_sesion_muere_al_salir_y_la_clave_viaja_cifrada(api):
         "role": "admin",
     })
     assert prohibido.status_code == 403
+
+
+def test_quien_no_es_admin_solo_ve_los_cuadres_de_hoy(api):
+    hoy = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = api.base.get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO cierres_caja (
+            nombre_caja, fecha_apertura, fecha_cierre, usuario_apertura, usuario_cierre,
+            monto_inicial, efectivo_contado, diferencia_efectivo, estado
+        ) VALUES ('Caja 1', ?, ?, 'empleado', 'empleado', 0, 0, 0, 'cerrado')
+        """,
+        (hoy, hoy),
+    )
+    de_hoy = cur.lastrowid
+    cur.execute(
+        """
+        INSERT INTO cierres_caja (
+            nombre_caja, fecha_apertura, fecha_cierre, usuario_apertura, usuario_cierre,
+            monto_inicial, efectivo_contado, diferencia_efectivo, estado
+        ) VALUES ('Caja 1', ?, ?, 'empleado', 'empleado', 0, 0, 0, 'cerrado')
+        """,
+        (ayer, ayer),
+    )
+    de_ayer = cur.lastrowid
+    cur.execute(
+        "INSERT INTO usuario_permisos (username, modulo) VALUES ('empleado', 'caja:cerrar')"
+    )
+    conn.commit()
+    conn.close()
+
+    _entrar(api, "empleado", "clave-empleado-1")
+    propio = api.get("/api/caja/panel", params={"desde": "2020-01-01", "hasta": "2030-01-01"})
+    assert propio.status_code == 200, propio.text
+    cuerpo = propio.json()
+    assert cuerpo["solo_hoy"] is True
+    ids = [c["id"] for c in cuerpo["cierres"]]
+    assert de_hoy in ids
+    assert de_ayer not in ids
+    assert api.get(f"/api/caja/cierre/{de_ayer}").status_code == 403
+
+    api.post("/api/logout")
+    _entrar(api)
+    completo = api.get("/api/caja/panel")
+    assert completo.json()["solo_hoy"] is False
+    todos = [c["id"] for c in completo.json()["cierres"]]
+    assert de_hoy in todos and de_ayer in todos

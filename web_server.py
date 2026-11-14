@@ -1110,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v9";
+const CACHE = "pos-v10";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -2207,8 +2207,32 @@ def _panel_caja(base: Database, desde: str = "", hasta: str = "") -> dict:
 
 @app.get("/api/caja/panel")
 def panel_caja(request: Request, desde: str = "", hasta: str = ""):
-    _exigir_alguna_funcion(request, "caja", ("caja", "ingreso", "retiro", "cerrar"))
-    return _panel_caja(db(), desde, hasta)
+    user = _exigir_alguna_funcion(request, "caja", ("caja", "ingreso", "retiro", "cerrar"))
+    admin = _rol(user) == "admin"
+    if not admin:
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        desde = hasta = hoy
+    datos = _panel_caja(db(), desde, hasta)
+    datos["solo_hoy"] = not admin
+    return datos
+
+
+def _cuadre_es_de_hoy(cierre_id: int) -> bool:
+    conn = db().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT fecha_cierre FROM cierres_caja WHERE id=?", (cierre_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return True
+    return str(row[0])[:10] == datetime.now().strftime("%Y-%m-%d")
+
+
+def _exigir_cuadre_visible(request: Request, cierre_id: int) -> None:
+    if _rol(_user(request)) == "admin":
+        return
+    if not _cuadre_es_de_hoy(cierre_id):
+        raise HTTPException(status_code=403, detail="Solo puedes ver los cuadres de hoy")
 
 
 def _pagos_del_cuadre(base: Database, cierre_id: int, apertura: str, cerrado: bool) -> list[dict]:
@@ -2243,6 +2267,7 @@ def _pagos_del_cuadre(base: Database, cierre_id: int, apertura: str, cerrado: bo
 @app.get("/api/caja/cierre/{cierre_id}")
 def ver_cuadre(request: Request, cierre_id: int):
     _exigir_alguno(request, ("caja:cerrar", "historial"))
+    _exigir_cuadre_visible(request, cierre_id)
     return _datos_cuadre(db(), cierre_id)
 
 
@@ -2343,6 +2368,7 @@ def _datos_cuadre(base: Database, cierre_id: int) -> dict:
 @app.get("/api/caja/cierre/{cierre_id}/pdf")
 def pdf_cuadre(request: Request, cierre_id: int, descarga: int = 0):
     _exigir_alguno(request, ("caja:cerrar", "historial"))
+    _exigir_cuadre_visible(request, cierre_id)
     from report_pdf_builder import build_cuadre_caja_pdf
 
     base = db()
@@ -2432,6 +2458,7 @@ def editar_turno(request: Request, cierre_id: int, body: TurnoEditIn):
 @app.post("/api/caja/cierre/{cierre_id}")
 def editar_cierre(request: Request, cierre_id: int, body: CerrarCajaIn):
     _exigir(request, "caja", "cerrar")
+    _exigir_cuadre_visible(request, cierre_id)
     conn = db().get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -8197,7 +8224,7 @@ async function pintarForm(nombre){
     retiro: ["Retiro de efectivo", "No puede superar el efectivo esperado del turno. Abajo están los retiros de este turno.",
       `<div class="form"><button onclick="nuevoMov('retiro')">Registrar retiro</button></div><div id="movLista"></div>`],
     cerrar: ["Cuadre y cierre", "El historial muestra todos los cuadres. Imprimir manda un ticket del ancho del rollo. Ver PDF abre la hoja carta, para archivar o para una impresora de oficina.",
-      `<div class="form"><button onclick="nuevoCierre()">Cerrar turno</button><label>Desde<input id="cuadreDesde" type="date"/></label><label>Hasta<input id="cuadreHasta" type="date"/></label><button class="sec" onclick="cargarPanelCaja('cerrar')">Filtrar</button></div><div id="cajaInfo"></div>`],
+      `<div class="form"><button onclick="nuevoCierre()">Cerrar turno</button><label id="cuadreDesdeCaja">Desde<input id="cuadreDesde" type="date"/></label><label id="cuadreHastaCaja">Hasta<input id="cuadreHasta" type="date"/></label><button class="sec" id="cuadreFiltrar" onclick="cargarPanelCaja('cerrar')">Filtrar</button></div><div id="cajaInfo"></div>`],
     compra: ["Compras", "Pulsa Registrar compra. Varias líneas entran en la misma compra y suman existencia.",
       `<div class="form"><button onclick="nuevaCompra()">Registrar compra</button></div><div id="compLista"></div>`],
     promo: ["Promociones", "Se aplican en el mostrador cuando el producto está en la promoción.",
@@ -8301,8 +8328,20 @@ async function pintarForm(nombre){
   }
 }
 async function cargarPanelCaja(nombre){
+  const admin = window._rol === "admin";
+  const desdeCaja = document.getElementById("cuadreDesdeCaja");
+  const hastaCaja = document.getElementById("cuadreHastaCaja");
+  const filtrar = document.getElementById("cuadreFiltrar");
+  if (desdeCaja) desdeCaja.style.display = admin ? "" : "none";
+  if (hastaCaja) hastaCaja.style.display = admin ? "" : "none";
+  if (filtrar) filtrar.style.display = admin ? "" : "none";
+  if (nombre === "cerrar" && document.getElementById("formHint")) {
+    formHint.textContent = admin
+      ? "El historial muestra todos los cuadres. Imprimir manda un ticket del ancho del rollo. Ver PDF abre la hoja carta, para archivar o para una impresora de oficina."
+      : "Solo ves los cuadres de hoy. El historial completo es del administrador.";
+  }
   let q = "";
-  if (nombre === "cerrar") {
+  if (nombre === "cerrar" && admin) {
     const desde = document.getElementById("cuadreDesde");
     const hasta = document.getElementById("cuadreHasta");
     const p = new URLSearchParams();
@@ -8327,12 +8366,12 @@ async function cargarPanelCaja(nombre){
     ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p><div class="acciones"><button class="sec" onclick="verPdfCuadre(${a.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${a.id})">Imprimir ticket</button></div></div>`
     : "<p class='hint'>No hay turno abierto.</p>";
   const filas = (d.cierres || []).filter(c => c.estado === "cerrado");
-  const vacio = q ? "No hay cuadres en ese período." : "Todavía no hay cuadres cerrados.";
+  const vacio = !admin ? "No hay cuadres cerrados hoy." : (q ? "No hay cuadres en ese período." : "Todavía no hay cuadres cerrados.");
   const ahora = new Date();
   const hoy = ahora.getFullYear() + "-" + String(ahora.getMonth() + 1).padStart(2, "0") + "-" + String(ahora.getDate()).padStart(2, "0");
   const estadoCuadre = c => String(c.cierre || "").slice(0, 10) === hoy ? "hoy" : (Math.abs(Number(c.diferencia || 0)) < 0.05 ? "bien" : "mal");
   const leyenda = filas.length ? `<div class="leyenda-cuadres"><span class="hoy">Cierre de hoy</span><span class="bien">Cuadrado</span><span class="mal">Con sobrante o faltante</span></div>` : "";
-  box.innerHTML = resumen + `<div id="cuadreVista"></div><h3>Historial de cuadres</h3>${leyenda}<div id="cuadreTabla">` + tabla(
+  box.innerHTML = resumen + `<div id="cuadreVista"></div><h3>${admin ? "Historial de cuadres" : "Cuadres de hoy"}</h3>${leyenda}<div id="cuadreTabla">` + tabla(
     ["Cierre","Turno","Cajero","Fondo","Esperado","Contado","Diferencia",""],
     filas.map(c => [
       String(c.cierre||"").slice(0,16) + (estadoCuadre(c) === "hoy" ? ` <span class="pill aviso">Hoy</span>` : ""), escDash(c.nombre), escDash(c.usuario || "—"),
