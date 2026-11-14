@@ -1110,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v10";
+const CACHE = "pos-v11";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -9195,9 +9195,8 @@ async function enviarFactura(id, emailActual){
   } catch(e){ formMsg.style.color="var(--danger)"; formMsg.textContent = e.message; }
 }
 async function reimprimirFactura(id){
-  await prepararImpresora();
   const f = await api("/api/factura/"+id);
-  await imprimirRecibo(f);
+  await imprimirRecibo(f, true);
 }
 async function repetirFactura(id){
   const f = await api("/api/factura/"+id);
@@ -9922,7 +9921,7 @@ async function imprimirEnTermica(doc, ancho){
   if (!window._puertoCajon) return false;
   return conPuerto(writer => writer.write(bytes));
 }
-async function imprimirTicket(html){
+async function imprimirTicket(html, porNavegador){
   const p = papelTicket();
   const viejo = document.getElementById("marcoTicket");
   if (viejo) viejo.remove();
@@ -9933,6 +9932,10 @@ async function imprimirTicket(html){
   marco.tabIndex = -1;
   marco.style.cssText = `position:fixed;left:-300mm;top:0;width:${p.papel}mm;height:20mm;border:0;opacity:0;pointer-events:none`;
   document.body.appendChild(marco);
+  if (porNavegador) {
+    await escribirTicket(marco, html, p, true);
+    return;
+  }
   await escribirTicket(marco, html, p, false);
   const directo = await imprimirEnTermica(marco.contentDocument, p.caracteres || 42);
   if (!directo) {
@@ -10568,7 +10571,7 @@ async function imprimirPrecuenta(){
     }))
   });
 }
-async function imprimirRecibo(data){
+async function imprimirRecibo(data, porNavegador){
   const emp = window._empresa || {};
   const lugar = datosMesa(notaTicket(data));
   const propina = Number(data.propina || 0);
@@ -10623,7 +10626,7 @@ async function imprimirRecibo(data){
   const firma = data.precuenta
     ? (lugar.camarero ? filaTicket("Camarero", escDash(lugar.camarero)) : "")
     : (atendio ? `<hr class="corte"><p class="centro atendio">Le atendió: ${escDash(String(atendio).toUpperCase())}</p>` : "");
-  await imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte">${cabezaLineas()}${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`);
+  await imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte">${cabezaLineas()}${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`, porNavegador);
 }
 async function cargarMetodos(){
   const d = await api("/api/metodos");
