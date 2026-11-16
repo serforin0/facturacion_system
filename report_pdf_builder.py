@@ -522,6 +522,7 @@ def build_cuadre_caja_pdf(datos: dict, empresa: dict) -> bytes:
     elems = []
     cerrado = (datos.get("estado") or "") == "cerrado"
     diferencia = float(datos.get("diferencia") or 0)
+    ciego = bool(datos.get("ciego"))
     if not cerrado:
         resultado = "Pendiente de conteo"
         contado = "Pendiente"
@@ -538,6 +539,9 @@ def build_cuadre_caja_pdf(datos: dict, empresa: dict) -> bytes:
         resultado = f"Faltante {_rd(abs(diferencia))}"
         contado = _rd(datos.get("contado"))
         diferencia_txt = _rd(diferencia)
+    if ciego and cerrado:
+        resultado = "Descuadrado" if datos.get("descuadrado") else "Cuadrado"
+        diferencia_txt = "—"
 
     titulo = "CUADRE DE CAJA" if cerrado else "PRE-CUADRE DE CAJA"
     hdr = _cabecera_empresa(empresa)
@@ -567,21 +571,24 @@ def build_cuadre_caja_pdf(datos: dict, empresa: dict) -> bytes:
     elems.append(Spacer(1, 12))
     elems.append(Paragraph("<b>Efectivo</b>", normal))
     elems.append(Spacer(1, 4))
-    elems.append(
-        _tabla_reporte(
-            [
-                ["Concepto", "Monto"],
-                ["Fondo inicial", _rd(datos.get("fondo"))],
-                ["Ventas en efectivo", _rd(datos.get("ventas_efectivo"))],
-                ["Ingresos de efectivo", _rd(datos.get("ingresos"))],
-                ["Retiros de efectivo", _rd(datos.get("retiros"))],
-                ["Efectivo esperado", _rd(datos.get("esperado"))],
-                ["Efectivo contado", contado],
-                ["Diferencia", diferencia_txt],
-            ],
-            [340, 192],
-        )
-    )
+    if ciego:
+        filas_efectivo = [
+            ["Concepto", "Monto"],
+            ["Efectivo contado", contado],
+            ["Resultado", resultado],
+        ]
+    else:
+        filas_efectivo = [
+            ["Concepto", "Monto"],
+            ["Fondo inicial", _rd(datos.get("fondo"))],
+            ["Ventas en efectivo", _rd(datos.get("ventas_efectivo"))],
+            ["Ingresos de efectivo", _rd(datos.get("ingresos"))],
+            ["Retiros de efectivo", _rd(datos.get("retiros"))],
+            ["Efectivo esperado", _rd(datos.get("esperado"))],
+            ["Efectivo contado", contado],
+            ["Diferencia", diferencia_txt],
+        ]
+    elems.append(_tabla_reporte(filas_efectivo, [340, 192]))
 
     pagos = datos.get("pagos") or []
     elems.append(Spacer(1, 12))

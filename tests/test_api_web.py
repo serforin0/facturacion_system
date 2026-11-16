@@ -45,7 +45,9 @@ def test_las_paginas_del_mostrador_responden(api):
         resp = api.get(ruta)
         assert resp.status_code == 200, ruta
     html = api.get("/").text
-    assert "MD Alliance" in html
+    assert "<h2>MD</h2>" in html
+    assert "menu_oculto" in html
+    assert "function alternarMenu" in html
     assert "Entrada del mesero" in html
     assert "delete g.opacity" in html
     assert 'scope="col"' in html
@@ -539,3 +541,61 @@ def test_quien_no_es_admin_solo_ve_los_cuadres_de_hoy(api):
     assert completo.json()["solo_hoy"] is False
     todos = [c["id"] for c in completo.json()["cierres"]]
     assert de_hoy in todos and de_ayer in todos
+
+
+def test_el_cajero_no_ve_el_efectivo_esperado_y_el_sobrante_no_se_avisa(api, monkeypatch):
+    monkeypatch.setenv("CIERRE_CIEGO", "1")
+    conn = api.base.get_connection()
+    conn.execute("INSERT INTO usuario_permisos (username, modulo) VALUES ('empleado', 'caja')")
+    conn.commit()
+    conn.close()
+    _entrar(api, "empleado", "clave-empleado-1")
+    abierto = api.post("/api/caja/abrir", json={"nombre": "Caja 1", "fondo": 500})
+    assert abierto.status_code == 200, abierto.text
+    panel = api.get("/api/caja/panel")
+    assert panel.status_code == 200, panel.text
+    cuerpo = panel.json()
+    assert cuerpo["ciego"] is True
+    assert "esperado" not in cuerpo["abierta"]
+    assert "fondo" not in cuerpo["abierta"]
+
+    sobra = api.post("/api/caja/cerrar", json={"contado": 1000000, "observaciones": ""})
+    assert sobra.status_code == 200, sobra.text
+    assert sobra.json()["ciego"] is True
+    assert sobra.json()["descuadrado"] is False
+    assert "esperado" not in sobra.json()
+    assert "diferencia" not in sobra.json()
+    conn = api.base.get_connection()
+    guardado = conn.execute(
+        "SELECT diferencia_efectivo FROM cierres_caja WHERE efectivo_contado=1000000"
+    ).fetchone()[0]
+    conn.close()
+    assert float(guardado) > 0
+
+    falta = api.post("/api/caja/abrir", json={"nombre": "Caja 1", "fondo": 200})
+    assert falta.status_code == 200, falta.text
+    sin_nota = api.post("/api/caja/cerrar", json={"contado": 0, "observaciones": ""})
+    assert sin_nota.status_code == 400
+    assert sin_nota.json()["detail"] == "Está descuadrado. Escribe una observación."
+    con_nota = api.post("/api/caja/cerrar", json={"contado": 0, "observaciones": "Faltó efectivo"})
+    assert con_nota.status_code == 200, con_nota.text
+    assert con_nota.json()["descuadrado"] is True
+    assert "diferencia" not in con_nota.json()
+    assert "esperado" not in con_nota.json()
+
+    api.post("/api/logout")
+    _entrar(api)
+    admin = api.get("/api/caja/panel").json()
+    assert admin.get("ciego") is not True
+    por_contado = {c["contado"]: c for c in admin["cierres"]}
+    assert por_contado[1000000]["diferencia"] > 0
+    assert por_contado[1000000]["esperado"] > 0
+    assert por_contado[0]["diferencia"] < 0
+
+    monkeypatch.delenv("CIERRE_CIEGO", raising=False)
+    api.post("/api/logout")
+    _entrar(api, "empleado", "clave-empleado-1")
+    assert api.post("/api/caja/abrir", json={"nombre": "Caja 1", "fondo": 100}).status_code == 200
+    normal = api.post("/api/caja/cerrar", json={"contado": 150, "observaciones": ""})
+    assert normal.status_code == 400
+    assert "Si no cuadra" in normal.json()["detail"]

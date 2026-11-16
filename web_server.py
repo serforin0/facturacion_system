@@ -1110,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v11";
+const CACHE = "pos-v18";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -2066,7 +2066,7 @@ def movimiento(request: Request, body: MovimientoIn):
                 esperado += float(previo[1] or 0)
             if body.monto > esperado + 0.01:
                 conn.close()
-                raise HTTPException(status_code=400, detail=f"El retiro supera el efectivo esperado ({esperado:.2f})")
+                raise HTTPException(status_code=400, detail=_aviso_retiro(usuario, esperado))
         cur.execute(
             "UPDATE movimientos_efectivo SET tipo=?, monto=?, motivo=? WHERE id=?",
             (tipo, round(float(body.monto), 2), body.motivo.strip(), body.id),
@@ -2078,9 +2078,100 @@ def movimiento(request: Request, body: MovimientoIn):
         ingresos, retiros = base.totales_movimientos_efectivo(caja[0])
         esperado = float(caja[6] or 0) + _efectivo_ventas(base, caja[2], caja[0]) + ingresos - retiros
         if body.monto > esperado + 0.01:
-            raise HTTPException(status_code=400, detail=f"El retiro supera el efectivo esperado ({esperado:.2f})")
+            raise HTTPException(status_code=400, detail=_aviso_retiro(usuario, esperado))
     base.registrar_movimiento_efectivo(caja[0], tipo, body.monto, body.motivo, usuario)
     return {"ok": True}
+
+
+def _cierre_ciego(username: str) -> bool:
+    """En Nova el cajero no ve el efectivo que debería haber en la gaveta."""
+    return os.environ.get("CIERRE_CIEGO") == "1" and _rol(username) != "admin"
+
+
+def _aviso_retiro(username: str, esperado: float) -> str:
+    if _cierre_ciego(username):
+        return "El retiro supera el efectivo disponible"
+    return f"El retiro supera el efectivo esperado ({esperado:.2f})"
+
+
+def _nota_de_cierre(diff: float, observaciones: str | None, ciego: bool) -> str | None:
+    texto = (observaciones or "").strip()
+    if ciego:
+        if diff < -0.05 and len(texto) < 3:
+            return "Está descuadrado. Escribe una observación."
+        return None
+    if abs(diff) > 0.05 and len(texto) < 3:
+        return "Si no cuadra, escribe una observación"
+    return None
+
+
+def _respuesta_cierre(ciego: bool, diff: float, esperado: float, extra: dict) -> dict:
+    if ciego:
+        extra["ciego"] = True
+        extra["descuadrado"] = diff < -0.05
+        return extra
+    extra["esperado"] = round(esperado, 2)
+    extra["diferencia"] = diff
+    return extra
+
+
+def _enmascarar_cuadre(datos: dict, afectan: set[str] | None = None) -> dict:
+    diff = float(datos.get("diferencia") or 0)
+    corto = diff < -0.05
+    limpio = dict(datos)
+    limpio["ciego"] = True
+    limpio["descuadrado"] = corto
+    for clave in ("esperado", "fondo", "ventas_efectivo", "ingresos", "retiros"):
+        limpio.pop(clave, None)
+    if corto:
+        limpio.pop("diferencia", None)
+    else:
+        limpio["diferencia"] = 0
+    caja = {c.lower() for c in (afectan or {"efectivo"})}
+    limpio["pagos"] = [
+        p for p in (limpio.get("pagos") or [])
+        if str(p.get("tipo") or p.get("codigo") or "").lower() not in caja
+    ]
+    movimientos = []
+    for mov in limpio.get("movimientos") or []:
+        copia = dict(mov)
+        copia.pop("monto", None)
+        movimientos.append(copia)
+    limpio["movimientos"] = movimientos
+    return limpio
+
+
+def _enmascarar_panel(datos: dict) -> dict:
+    datos = dict(datos)
+    datos["ciego"] = True
+    abierta = datos.get("abierta")
+    if abierta:
+        datos["abierta"] = {
+            "id": abierta["id"],
+            "nombre": abierta["nombre"],
+            "apertura": abierta["apertura"],
+            "usuario": abierta.get("usuario") or "",
+            "pagos": [p for p in (abierta.get("pagos") or []) if not p.get("en_caja")],
+            "ciego": True,
+        }
+    limpios = []
+    for cierre in datos.get("cierres") or []:
+        diff = float(cierre.get("diferencia") or 0)
+        limpios.append({
+            "id": cierre["id"],
+            "nombre": cierre["nombre"],
+            "apertura": cierre.get("apertura"),
+            "cierre": cierre.get("cierre"),
+            "usuario": cierre.get("usuario"),
+            "usuario_apertura": cierre.get("usuario_apertura"),
+            "contado": cierre.get("contado"),
+            "observaciones": cierre.get("observaciones") or "",
+            "estado": cierre.get("estado"),
+            "ciego": True,
+            "descuadrado": diff < -0.05,
+        })
+    datos["cierres"] = limpios
+    return datos
 
 
 @app.post("/api/caja/cerrar")
@@ -2093,8 +2184,10 @@ def cerrar_caja(request: Request, body: CerrarCajaIn):
     ingresos, retiros = base.totales_movimientos_efectivo(caja[0])
     esperado = float(caja[6] or 0) + _efectivo_ventas(base, caja[2], caja[0]) + ingresos - retiros
     diff = round(float(body.contado) - esperado, 2)
-    if abs(diff) > 0.05 and len((body.observaciones or "").strip()) < 3:
-        raise HTTPException(status_code=400, detail="Si no cuadra, escribe una observación")
+    ciego = _cierre_ciego(usuario)
+    nota = _nota_de_cierre(diff, body.observaciones, ciego)
+    if nota:
+        raise HTTPException(status_code=400, detail=nota)
     conn = base.get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2115,7 +2208,7 @@ def cerrar_caja(request: Request, body: CerrarCajaIn):
     )
     conn.commit()
     conn.close()
-    return {"ok": True, "id": caja[0], "esperado": round(esperado, 2), "diferencia": diff}
+    return _respuesta_cierre(ciego, diff, esperado, {"ok": True, "id": caja[0]})
 
 
 def _resumen_pagos_turno(base: Database, cierre_id: int, apertura: str) -> list[dict]:
@@ -2214,6 +2307,8 @@ def panel_caja(request: Request, desde: str = "", hasta: str = ""):
         desde = hasta = hoy
     datos = _panel_caja(db(), desde, hasta)
     datos["solo_hoy"] = not admin
+    if _cierre_ciego(user):
+        datos = _enmascarar_panel(datos)
     return datos
 
 
@@ -2266,9 +2361,13 @@ def _pagos_del_cuadre(base: Database, cierre_id: int, apertura: str, cerrado: bo
 
 @app.get("/api/caja/cierre/{cierre_id}")
 def ver_cuadre(request: Request, cierre_id: int):
-    _exigir_alguno(request, ("caja:cerrar", "historial"))
+    user = _exigir_alguno(request, ("caja:cerrar", "historial"))
     _exigir_cuadre_visible(request, cierre_id)
-    return _datos_cuadre(db(), cierre_id)
+    base = db()
+    datos = _datos_cuadre(base, cierre_id)
+    if _cierre_ciego(user):
+        datos = _enmascarar_cuadre(datos, set(base.codigos_afectan_caja()))
+    return datos
 
 
 def _datos_cuadre(base: Database, cierre_id: int) -> dict:
@@ -2367,13 +2466,15 @@ def _datos_cuadre(base: Database, cierre_id: int) -> dict:
 
 @app.get("/api/caja/cierre/{cierre_id}/pdf")
 def pdf_cuadre(request: Request, cierre_id: int, descarga: int = 0):
-    _exigir_alguno(request, ("caja:cerrar", "historial"))
+    user = _exigir_alguno(request, ("caja:cerrar", "historial"))
     _exigir_cuadre_visible(request, cierre_id)
     from report_pdf_builder import build_cuadre_caja_pdf
 
     base = db()
     try:
         datos = _datos_cuadre(base, cierre_id)
+        if _cierre_ciego(user):
+            datos = _enmascarar_cuadre(datos, set(base.codigos_afectan_caja()))
         pdf = build_cuadre_caja_pdf(datos, base.get_empresa_info())
     except ImportError as exc:
         raise HTTPException(status_code=500, detail="Falta reportlab en el servidor") from exc
@@ -2474,9 +2575,12 @@ def editar_cierre(request: Request, cierre_id: int, body: CerrarCajaIn):
         raise HTTPException(status_code=400, detail="Ese turno no está cerrado")
     esperado = round(float(row[0] or 0) - float(row[1] or 0), 2)
     diff = round(float(body.contado) - esperado, 2)
-    if abs(diff) > 0.05 and len((body.observaciones or "").strip()) < 3:
+    usuario = _user(request)
+    ciego = _cierre_ciego(usuario)
+    nota = _nota_de_cierre(diff, body.observaciones, ciego)
+    if nota:
         conn.close()
-        raise HTTPException(status_code=400, detail="Si no cuadra, escribe una observación")
+        raise HTTPException(status_code=400, detail=nota)
     cur.execute(
         """
         UPDATE cierres_caja
@@ -2487,7 +2591,7 @@ def editar_cierre(request: Request, cierre_id: int, body: CerrarCajaIn):
     )
     conn.commit()
     conn.close()
-    return {"ok": True, "esperado": esperado, "diferencia": diff}
+    return _respuesta_cierre(ciego, diff, esperado, {"ok": True})
 
 
 def _filtro_fecha(desde: str | None, hasta: str | None, dias: int, columna: str) -> tuple[str, list]:
@@ -6142,7 +6246,7 @@ HTML = """<!DOCTYPE html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Facturación</title>
-<script>document.documentElement.dataset.tema = localStorage.getItem("tema") || (matchMedia("(prefers-color-scheme: light)").matches ? "dia" : "noche");</script>
+<script>document.documentElement.dataset.tema = localStorage.getItem("tema") || (matchMedia("(prefers-color-scheme: light)").matches ? "dia" : "noche"); if (localStorage.getItem("menu_oculto") === "1") document.documentElement.classList.add("menu-oculto");</script>
 <style>
   @font-face {
     font-family: "Archivo";
@@ -6226,7 +6330,7 @@ HTML = """<!DOCTYPE html>
   /* Shell: barra lateral y barra superior sobre el mismo fondo, divididas por reglas de 1 px */
   #app { display:none; min-height:100vh; }
   .shell { display:flex; min-height:100vh; }
-  .side { width:224px; flex-shrink:0; padding:14px 12px 16px; display:flex; flex-direction:column; gap:1px; border-right:1px solid var(--rule); max-height:100vh; overflow-y:auto; position:sticky; top:0; background:var(--ground); }
+  .side { width:224px; flex-shrink:0; padding:14px 12px 16px; display:flex; flex-direction:column; gap:1px; border-right:1px solid var(--rule); max-height:100vh; overflow-y:auto; position:sticky; top:0; background:var(--ground); transition: width 240ms var(--ease-out), padding 240ms var(--ease-out), border-color 240ms ease; }
   .brand { display:flex; align-items:center; gap:10px; padding:4px 8px 10px; }
   .brand b { display:block; font-size:14px; font-weight:600; }
   .brand small { display:block; color:var(--faint); font-size:12px; }
@@ -6249,7 +6353,11 @@ HTML = """<!DOCTYPE html>
   #top .estado { display:inline-flex; align-items:center; gap:6px; }
   #top .estado::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--faint); }
   #top .estado.abierta::before { background:var(--positive); }
-  #btnMenu { display:none; }
+  #btnMenu { display:inline-flex; align-items:center; }
+  @media (min-width: 1101px) {
+    html.menu-oculto .side { width:0; padding-left:0; padding-right:0; border-right-color:transparent; overflow:hidden; }
+    html.menu-oculto #avisos { left:22px; }
+  }
   .salir-menu { display:none; }
 
   .work { flex:1; display:flex; gap:var(--gap); min-width:0; padding:var(--gap) 22px 22px; align-items:flex-start; }
@@ -6692,7 +6800,7 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
 <form id="login" onsubmit="event.preventDefault(); entrar();">
-  <div class="marca"><span class="mono" aria-hidden="true">MD</span><div><h2>MD Alliance</h2><p>Punto de venta</p></div></div>
+  <div class="marca"><span class="mono" aria-hidden="true">MD</span><div><h2>MD</h2><p>Punto de venta</p></div></div>
   <label>Usuario<input id="user" autocomplete="username" required/></label>
   <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required/></label>
   <label id="cajaNueva" hidden>Nueva contraseña<input id="passNueva" type="password" autocomplete="off" disabled/></label>
@@ -6703,7 +6811,7 @@ HTML = """<!DOCTYPE html>
 <main id="app">
   <div class="shell">
     <aside class="side" id="side" aria-label="Navegación">
-      <div class="brand"><span class="mono" aria-hidden="true">MD</span><div><b>MD Alliance</b><small>Punto de venta</small></div></div>
+      <div class="brand"><span class="mono" aria-hidden="true">MD</span><div><b>MD</b><small>Punto de venta</small></div></div>
       <div class="nav-grupo" data-grupo="venta">Venta</div>
       <button class="nav on" data-view="venta" data-mod="mostrador" data-fn="venta" onclick="ver('venta')">Mostrador</button>
       <button class="nav" data-view="mayor" data-mod="mayor" onclick="ver('mayor')">Venta al por mayor</button>
@@ -6748,7 +6856,7 @@ HTML = """<!DOCTYPE html>
     <div class="velo" onclick="menu(false)"></div>
     <div class="main">
       <header class="topbar">
-        <button class="sec" id="btnMenu" type="button" onclick="menu(true)" aria-controls="side" aria-expanded="false">Menú</button>
+        <button class="sec" id="btnMenu" type="button" onclick="alternarMenu()" aria-controls="side" aria-expanded="true">Ocultar</button>
         <h1 class="rotulo" id="rotulo" data-grupo="venta">Mostrador</h1>
         <div class="topbar-der">
           <div id="top"></div>
@@ -6993,11 +7101,29 @@ document.addEventListener("toggle", ev => {
   menuEl.style.right = Math.round(innerWidth - r.right) + "px";
 }, true);
 addEventListener("scroll", () => document.querySelectorAll("details.mas[open]").forEach(d => d.removeAttribute("open")), {passive: true, capture: true});
+function pintarBotonMenu(){
+  const b = document.getElementById("btnMenu");
+  if (!b) return;
+  const estrecho = matchMedia("(max-width: 1100px)").matches;
+  const abierto = estrecho ? document.body.classList.contains("menu-abierto") : !document.documentElement.classList.contains("menu-oculto");
+  b.setAttribute("aria-expanded", abierto ? "true" : "false");
+  b.textContent = abierto && !estrecho ? "Ocultar" : "Menú";
+}
 function menu(abrir){
   document.body.classList.toggle("menu-abierto", !!abrir);
-  const b = document.getElementById("btnMenu");
-  if (b) b.setAttribute("aria-expanded", abrir ? "true" : "false");
+  pintarBotonMenu();
 }
+function alternarMenu(){
+  if (matchMedia("(max-width: 1100px)").matches) {
+    menu(!document.body.classList.contains("menu-abierto"));
+    return;
+  }
+  const oculto = !document.documentElement.classList.contains("menu-oculto");
+  localStorage.setItem("menu_oculto", oculto ? "1" : "0");
+  document.documentElement.classList.toggle("menu-oculto", oculto);
+  pintarBotonMenu();
+}
+pintarBotonMenu();
 function errorModal(e){
   const texto = (e && e.message) ? e.message : "No se pudo guardar";
   const m = document.getElementById("modalMsg");
@@ -7757,16 +7883,19 @@ async function dejarEnMesa(){
   }
 }
 async function prepararImpresora(){
-  if (!navigator.serial) return false;
+  if (!navigator.serial || window._puertoCajon) return !!window._puertoCajon;
   try {
-    if (!window._puertoCajon) {
-      const lista = await navigator.serial.getPorts();
-      if (lista[0]) window._puertoCajon = lista[0];
-    }
-    if (!window._puertoCajon) window._puertoCajon = await navigator.serial.requestPort();
-    return !!window._puertoCajon;
+    const lista = await navigator.serial.getPorts();
+    if (lista[0]) window._puertoCajon = lista[0];
+  } catch (e) {}
+  return !!window._puertoCajon;
+}
+function reservarHojaImpresion(){
+  try {
+    const hoja = window.open("", "hojaTicket", "popup,width=420,height=720");
+    return hoja && !hoja.closed ? hoja : null;
   } catch (e) {
-    return false;
+    return null;
   }
 }
 function pedirPuertoCajon(){
@@ -8352,18 +8481,24 @@ async function cargarPanelCaja(nombre){
   }
   const d = await api("/api/caja/panel" + q);
   window._cajaPanel = d;
+  window._cierreCiego = !!d.ciego;
   const box = document.getElementById("cajaInfo");
   if (!box) return;
+  const ciego = !!d.ciego;
   if (nombre === "caja") {
     const a = d.abierta;
     box.innerHTML = a
-      ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · ${escDash(a.usuario || "—")} · ${escDash(String(a.apertura||"").slice(0,16))}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)} · esperado ${money(a.esperado)}</p><button class="sec" onclick="editarTurno()">Editar turno</button></div>`
+      ? (ciego
+        ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · ${escDash(a.usuario || "—")} · ${escDash(String(a.apertura||"").slice(0,16))}</p><button class="sec" onclick="editarTurno()">Editar turno</button></div>`
+        : `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · ${escDash(a.usuario || "—")} · ${escDash(String(a.apertura||"").slice(0,16))}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)} · esperado ${money(a.esperado)}</p><button class="sec" onclick="editarTurno()">Editar turno</button></div>`)
       : "<p class='hint'>No hay turno abierto.</p>";
     return;
   }
   const a = d.abierta;
   const resumen = a
-    ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p><div class="acciones"><button class="sec" onclick="verPdfCuadre(${a.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${a.id})">Imprimir ticket</button></div></div>`
+    ? (ciego
+      ? `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · ${escDash(a.usuario || "—")}</p><div class="acciones"><button class="sec" onclick="verPdfCuadre(${a.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${a.id})">Imprimir ticket</button></div></div>`
+      : `<div class="doc"><p>Turno abierto: ${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p><div class="acciones"><button class="sec" onclick="verPdfCuadre(${a.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${a.id})">Imprimir ticket</button></div></div>`)
     : "<p class='hint'>No hay turno abierto.</p>";
   const filas = (d.cierres || []).filter(c => c.estado === "cerrado");
   const vacio = !admin ? "No hay cuadres cerrados hoy." : (q ? "No hay cuadres en ese período." : "Todavía no hay cuadres cerrados.");
@@ -8371,9 +8506,17 @@ async function cargarPanelCaja(nombre){
   const hoy = ahora.getFullYear() + "-" + String(ahora.getMonth() + 1).padStart(2, "0") + "-" + String(ahora.getDate()).padStart(2, "0");
   const estadoCuadre = c => String(c.cierre || "").slice(0, 10) === hoy ? "hoy" : (Math.abs(Number(c.diferencia || 0)) < 0.05 ? "bien" : "mal");
   const leyenda = filas.length ? `<div class="leyenda-cuadres"><span class="hoy">Cierre de hoy</span><span class="bien">Cuadrado</span><span class="mal">Con sobrante o faltante</span></div>` : "";
-  box.innerHTML = resumen + `<div id="cuadreVista"></div><h3>${admin ? "Historial de cuadres" : "Cuadres de hoy"}</h3>${leyenda}<div id="cuadreTabla">` + tabla(
-    ["Cierre","Turno","Cajero","Fondo","Esperado","Contado","Diferencia",""],
-    filas.map(c => [
+  const columnas = ciego
+    ? ["Cierre","Turno","Cajero","Contado",""]
+    : ["Cierre","Turno","Cajero","Fondo","Esperado","Contado","Diferencia",""];
+  const marca = c => c.descuadrado ? ` <span class="pill mal">Descuadrado</span>` : "";
+  box.innerHTML = resumen + `<div id="cuadreVista"></div><h3>${admin ? "Historial de cuadres" : "Cuadres de hoy"}</h3>${ciego ? "" : leyenda}<div id="cuadreTabla">` + tabla(
+    columnas,
+    filas.map(c => ciego ? [
+      String(c.cierre||"").slice(0,16) + (estadoCuadre(c) === "hoy" ? ` <span class="pill aviso">Hoy</span>` : "") + marca(c),
+      escDash(c.nombre), escDash(c.usuario || "—"), money(c.contado),
+      `<div class="acciones"><button class="sec" onclick="verPdfCuadre(${c.id})">Ver PDF</button><button class="sec" onclick="imprimirCierre(${c.id})">Imprimir ticket</button><button class="sec" onclick="bajarCuadre(${c.id})">Descargar</button><button class="sec" onclick="editarCierre(${c.id})">Editar</button></div>`
+    ] : [
       String(c.cierre||"").slice(0,16) + (estadoCuadre(c) === "hoy" ? ` <span class="pill aviso">Hoy</span>` : ""), escDash(c.nombre), escDash(c.usuario || "—"),
       money(c.fondo), money(c.esperado), money(c.contado),
       `<span class="pill ${Math.abs(Number(c.diferencia || 0)) < 0.05 ? "bien" : "mal"}">${textoDif(c.diferencia)}</span>`,
@@ -8384,7 +8527,10 @@ async function cargarPanelCaja(nombre){
   box.querySelectorAll("#cuadreTabla tbody tr").forEach((tr, i) => tr.classList.add("cuadre-" + estadoCuadre(filas[i])));
 }
 function htmlCuadre(d){
-  const montos = tabla(["Concepto","Monto"], [
+  const montos = tabla(["Concepto","Monto"], d.ciego ? [
+    ["Contado", money(d.contado)],
+    ["Resultado", d.descuadrado ? "Descuadrado" : "Cuadrado"]
+  ] : [
     ["Fondo", money(d.fondo)],
     ["Ventas en efectivo", money(d.ventas_efectivo)],
     ["Ingresos", money(d.ingresos)],
@@ -8515,20 +8661,25 @@ const CAMPOS_CIERRE = `<div class="form">
   <p id="cierreDif" class="cierre-dif" aria-live="polite">Cuenta el efectivo de la gaveta y escríbelo.</p>`;
 async function nuevoCierre(){
   window._cierreEdit = null;
-  let a;
-  try { a = (await api("/api/caja/panel")).abierta; } catch(e) { formMsg.style.color = "var(--danger)"; formMsg.textContent = e.message; return; }
+  let panel;
+  try { panel = await api("/api/caja/panel"); } catch(e) { formMsg.style.color = "var(--danger)"; formMsg.textContent = e.message; return; }
+  const a = panel.abierta;
   if (!a) { abrirModal("Cierre de caja", `<p class="hint">No hay un turno abierto para cerrar.</p>`); return; }
-  window._cierreEsperado = Number(a.esperado || 0);
+  window._cierreCiego = !!panel.ciego;
+  window._cierreEsperado = window._cierreCiego ? null : Number(a.esperado || 0);
   const fuera = (a.pagos || []).filter(p => !p.en_caja && p.monto > 0);
-  abrirModal("Cierre de caja", `<div class="cierre-pop">
-      <p class="cierre-turno">${escDash(a.nombre)} · abrió ${escDash(a.usuario || "—")} · ${escDash(String(a.apertura || "").slice(0, 16))}</p>
-      <div class="cierre-esperado"><span>Debe haber en caja</span><b>${money(a.esperado)}</b><em>Solo el efectivo de la gaveta</em></div>
+  const cifras = window._cierreCiego
+    ? `<p class="hint">Cuenta el efectivo de la gaveta y escríbelo. Si falta dinero, el cierre queda descuadrado.</p>`
+    : `<div class="cierre-esperado"><span>Debe haber en caja</span><b>${money(a.esperado)}</b><em>Solo el efectivo de la gaveta</em></div>
       <dl class="cierre-desglose">
         <div><dt>Caja chica (fondo)</dt><dd>${money(a.fondo)}</dd></div>
         <div><dt>Ventas en efectivo</dt><dd>+ ${money(a.ventas_efectivo)}</dd></div>
         <div><dt>Ingresos de efectivo</dt><dd>+ ${money(a.ingresos)}</dd></div>
         <div><dt>Retiros de efectivo</dt><dd>− ${money(a.retiros)}</dd></div>
-      </dl>
+      </dl>`;
+  abrirModal("Cierre de caja", `<div class="cierre-pop">
+      <p class="cierre-turno">${escDash(a.nombre)} · abrió ${escDash(a.usuario || "—")} · ${escDash(String(a.apertura || "").slice(0, 16))}</p>
+      ${cifras}
       ${fuera.length ? `<p class="hint">No va en la gaveta: ${fuera.map(p => `${escDash(p.nombre)} ${money(p.monto)}`).join(" · ")}</p>` : ""}
     </div>${CAMPOS_CIERRE}
     <div class="form"><button id="btnCerrar" onclick="guardarCierre()">Cerrar turno</button><button class="sec" type="button" onclick="cerrarModal()">Cancelar</button></div>`);
@@ -8538,6 +8689,11 @@ function pintarDiferenciaCierre(){
   const el = document.getElementById("cierreDif");
   if (!el) return;
   const texto = cajaContado.value.trim();
+  if (window._cierreCiego || window._cierreEsperado == null) {
+    el.className = "cierre-dif";
+    el.textContent = texto ? "Cuenta el efectivo de la gaveta y escríbelo." : "Cuenta el efectivo de la gaveta y escríbelo.";
+    return;
+  }
   if (!texto) { el.className = "cierre-dif"; el.textContent = "Cuenta el efectivo de la gaveta y escríbelo."; return; }
   const dif = Math.round((Number(texto) - (window._cierreEsperado || 0)) * 100) / 100;
   const cuadra = Math.abs(dif) < 0.05;
@@ -8548,8 +8704,12 @@ function editarCierre(id){
   const c = ((window._cajaPanel && window._cajaPanel.cierres) || []).find(x => x.id === id);
   if (!c) return;
   window._cierreEdit = id;
-  window._cierreEsperado = Number(c.esperado || 0);
-  abrirModal("Corregir cierre", `<div class="cierre-pop"><div class="cierre-esperado"><span>Debía haber en caja</span><b>${money(c.esperado)}</b><em>${escDash(c.nombre)} · cerrado ${escDash(String(c.cierre || "").slice(0, 16))}</em></div></div>${CAMPOS_CIERRE}
+  window._cierreCiego = !!c.ciego || !!window._cierreCiego;
+  window._cierreEsperado = window._cierreCiego ? null : Number(c.esperado || 0);
+  const cabeza = window._cierreCiego
+    ? `<p class="hint">Cuenta otra vez el efectivo. Si falta dinero, el cierre queda descuadrado.</p>`
+    : `<div class="cierre-esperado"><span>Debía haber en caja</span><b>${money(c.esperado)}</b><em>${escDash(c.nombre)} · cerrado ${escDash(String(c.cierre || "").slice(0, 16))}</em></div>`;
+  abrirModal("Corregir cierre", `<div class="cierre-pop">${cabeza}</div>${CAMPOS_CIERRE}
     <div class="form"><button id="btnCerrar" onclick="guardarCierre()">Guardar cambios</button><button class="sec" type="button" onclick="cerrarModal()">Cancelar</button></div>`);
   cajaContado.value = c.contado;
   cajaObs.value = c.observaciones || "";
@@ -8585,8 +8745,11 @@ async function cargarMovimientos(tipo){
   const box = document.getElementById("movLista");
   if (!box) return;
   const a = d.abierta;
+  window._cierreCiego = !!d.ciego;
   const resumen = a
-    ? `<div class="doc"><p>${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p></div>`
+    ? (d.ciego
+      ? `<div class="doc"><p>${escDash(a.nombre)} · turno abierto</p></div>`
+      : `<div class="doc"><p>${escDash(a.nombre)} · efectivo esperado ${money(a.esperado)}</p><p>Fondo ${money(a.fondo)} · ventas en efectivo ${money(a.ventas_efectivo)} · ingresos ${money(a.ingresos)} · retiros ${money(a.retiros)}</p></div>`)
     : "<p class='hint'>No hay turno abierto. Los movimientos de turnos cerrados se consultan; solo se editan los del turno abierto.</p>";
   window._movs = (d.recientes || []).filter(m => m.tipo === tipo);
   box.innerHTML = resumen + tabla(["Fecha","Monto","Motivo","Usuario",""], window._movs.map(m => [
@@ -8632,7 +8795,15 @@ async function guardarCierre(){
     const cerradoId = editando || r.id;
     window._cierreEdit = null;
     if (editando) {
-      okModal("Cierre actualizado. Esperado " + money(r.esperado) + " · " + textoDif(r.diferencia) + ".");
+      okModal(r.ciego
+        ? (r.descuadrado ? "Cierre actualizado. Quedó descuadrado." : "Cierre actualizado.")
+        : "Cierre actualizado. Esperado " + money(r.esperado) + " · " + textoDif(r.diferencia) + ".");
+    } else if (r.ciego) {
+      const mal = !!r.descuadrado;
+      abrirModal("Caja cerrada", `<div class="cierre-pop">
+          <div class="cierre-esperado ${mal ? "mal" : "bien"}"><span>Resultado del cierre</span><b>${mal ? "Descuadrado" : "Turno cerrado"}</b><em>${mal ? "Falta efectivo en la gaveta" : fechaTicket("")}</em></div>
+        </div>
+        <div class="form"><button type="button" onclick="imprimirCierre(${cerradoId})">Imprimir cierre</button><button class="sec" type="button" onclick="cerrarModal()">Listo</button></div>`);
     } else {
       const cuadra = Math.abs(Number(r.diferencia || 0)) < 0.05;
       abrirModal("Caja cerrada", `<div class="cierre-pop">
@@ -9196,7 +9367,7 @@ async function enviarFactura(id, emailActual){
 }
 async function reimprimirFactura(id){
   const f = await api("/api/factura/"+id);
-  await imprimirRecibo(f, true);
+  await imprimirRecibo(f);
 }
 async function repetirFactura(id){
   const f = await api("/api/factura/"+id);
@@ -9724,9 +9895,16 @@ function htmlCuadreTicket(d, extra){
     return tipo !== "efectivo" && tipo !== "tarjeta" && tipo !== "transferencia" && Number(p.monto || 0) > 0.009;
   }).map(p => filaTicket(etiquetaPago(p.tipo), money(p.monto))).join("");
   const movs = (d.movimientos || []).map(m =>
-    filaTicket(escDash(m.motivo || m.tipo || "—"), money(m.monto))
+    (d.ciego
+      ? filaTicket(escDash(m.motivo || m.tipo || "—"), escDash(m.tipo || ""))
+      : filaTicket(escDash(m.motivo || m.tipo || "—"), money(m.monto)))
     + `<p class="sub">${fechaCortaTicket(m.fecha)} · ${escDash(m.tipo || "")} · ${escDash(m.usuario || "")}</p>`
   ).join("");
+  const ciego = !!d.ciego;
+  const resultado = ciego
+    ? (cerrado ? (d.descuadrado ? "Descuadrado" : "Cuadrado") : "Pendiente de conteo")
+    : (cerrado ? resultadoTicket(d.diferencia) : "Pendiente de conteo");
+  const efectivo = ciego ? "" : filaTicket("Fondo", money(d.fondo)) + filaTicket("Efectivo", money(d.ventas_efectivo)) + filaTicket("Esperado", money(d.esperado));
   return `<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${cerrado ? "CUADRE DE CAJA" : "PRE-CUADRE"}</span>`
     + filaTicket("Turno", escDash(d.nombre || "Caja"))
     + filaTicket("Abrió", escDash(d.usuario_apertura || "—"))
@@ -9737,14 +9915,12 @@ function htmlCuadreTicket(d, extra){
     + (Number(d.n_anuladas || 0) ? filaTicket("Anuladas", String(d.n_anuladas)) : "")
     + filaTicket("Venta total", money(d.ventas_total))
     + `<hr class="corte"><span class="titulo">FORMAS DE PAGO</span>`
-    + filaTicket("Fondo", money(d.fondo))
-    + filaTicket("Efectivo", money(d.ventas_efectivo))
-    + filaTicket("Esperado", money(d.esperado))
+    + efectivo
     + filaTicket("Contado", cerrado ? money(d.contado) : "Pendiente")
     + filaTicket("Tarjeta", montoPago("tarjeta"))
     + filaTicket("Transferencia", montoPago("transferencia"))
     + otros
-    + `<div class="resultado">` + filaTicket("Resultado", cerrado ? resultadoTicket(d.diferencia) : "Pendiente de conteo") + `</div>`
+    + `<div class="resultado">` + filaTicket("Resultado", resultado) + `</div>`
     + `<hr class="corte"><span class="titulo">MOVIMIENTOS</span>`
     + (movs || `<p class="sub">Sin ingresos ni retiros.</p>`)
     + notaCuadre(d, cerrado)
@@ -9813,24 +9989,59 @@ const CSS_TICKET = `
   .qr { display:flex; justify-content:center; margin-top:1.5mm; }
   .qr svg { width:28mm; height:28mm; }
 `;
-async function escribirTicket(marco, html, medidas, paraImprimir){
+function htmlDocumentoTicket(html, medidas){
   const p = medidas || papelTicket();
-  const doc = marco.contentDocument;
   const titulo = (p.nombre || "Ticket").replace(/[<>"']/g, "");
   const izq = p.margen ? p.margen + "mm" : "auto";
-  doc.open();
-  doc.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${titulo}</title><style id="pagina">@page{size:${p.papel}mm 400mm;margin:0}</style><style>${CSS_TICKET}</style></head><body style="--papel:${p.papel}mm;--util:${p.util}mm;--letra:${p.letra}mm;--izq:${izq};width:${p.papel}mm">${html}</body></html>`);
-  doc.close();
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${titulo}</title><style id="pagina">@page{size:${p.papel}mm 400mm;margin:0}</style><style>${CSS_TICKET}</style></head><body style="--papel:${p.papel}mm;--util:${p.util}mm;--letra:${p.letra}mm;--izq:${izq};width:${p.papel}mm">${html}</body></html>`;
+}
+async function medirTicket(doc, marco, medidas){
+  const p = medidas || papelTicket();
   if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
   await Promise.all([...doc.images].map(img => img.complete ? null : new Promise(r => { img.onload = img.onerror = r; })));
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-  const alto = Math.ceil(doc.body.getBoundingClientRect().height * 25.4 / 96) + 2;
-  doc.getElementById("pagina").textContent = `@page{size:${p.papel}mm ${alto}mm;margin:0}`;
-  marco.style.height = Math.max(alto, 20) + "mm";
+  await Promise.race([
+    new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))),
+    new Promise(r => setTimeout(r, 200))
+  ]);
+  const alto = Math.ceil((doc.body ? doc.body.getBoundingClientRect().height : 0) * 25.4 / 96) + 2;
+  const pagina = doc.getElementById("pagina");
+  if (pagina) pagina.textContent = `@page{size:${p.papel}mm ${Math.max(alto, 80)}mm;margin:0}`;
+  if (marco && marco.style) marco.style.height = Math.max(alto, 20) + "mm";
+}
+async function escribirTicket(marco, html, medidas, paraImprimir){
+  const doc = marco.contentDocument;
+  doc.open();
+  doc.write(htmlDocumentoTicket(html, medidas));
+  doc.close();
+  await medirTicket(doc, marco, medidas);
   if (paraImprimir) {
     marco.contentWindow.focus();
     marco.contentWindow.print();
   }
+}
+async function imprimirEnHoja(hoja, html, medidas){
+  const doc = hoja.document;
+  const pagina = htmlDocumentoTicket(html, medidas).replace("</body>", "<script>window.print()<\\/script></body>");
+  try { hoja.focus(); } catch (e) {}
+  doc.open();
+  doc.write(pagina);
+  doc.close();
+}
+function lanzarDialogoTicket(html, medidas){
+  const p = medidas || papelTicket();
+  const viejo = document.getElementById("marcoTicket");
+  if (viejo) viejo.remove();
+  const marco = document.createElement("iframe");
+  marco.id = "marcoTicket";
+  marco.title = "Ticket";
+  marco.style.cssText = `position:fixed;left:0;top:0;width:${p.papel}mm;height:140mm;border:0;background:#fff;z-index:80`;
+  document.body.appendChild(marco);
+  const doc = marco.contentDocument;
+  doc.open();
+  doc.write(htmlDocumentoTicket(html, p));
+  doc.close();
+  try { marco.contentWindow.focus(); } catch (e) {}
+  try { marco.contentWindow.print(); } catch (e) {}
 }
 function palabrasTicket(texto){
   return String(texto || "").split(String.fromCharCode(160)).join(" ").trim().split(" ").filter(Boolean);
@@ -9921,7 +10132,7 @@ async function imprimirEnTermica(doc, ancho){
   if (!window._puertoCajon) return false;
   return conPuerto(writer => writer.write(bytes));
 }
-async function imprimirTicket(html, porNavegador){
+async function imprimirTicket(html){
   const p = papelTicket();
   const viejo = document.getElementById("marcoTicket");
   if (viejo) viejo.remove();
@@ -9932,16 +10143,7 @@ async function imprimirTicket(html, porNavegador){
   marco.tabIndex = -1;
   marco.style.cssText = `position:fixed;left:-300mm;top:0;width:${p.papel}mm;height:20mm;border:0;opacity:0;pointer-events:none`;
   document.body.appendChild(marco);
-  if (porNavegador) {
-    await escribirTicket(marco, html, p, true);
-    return;
-  }
-  await escribirTicket(marco, html, p, false);
-  const directo = await imprimirEnTermica(marco.contentDocument, p.caracteres || 42);
-  if (!directo) {
-    marco.contentWindow.focus();
-    marco.contentWindow.print();
-  }
+  await escribirTicket(marco, html, p, true);
 }
 function imprimirPrueba(){
   const p = papelTicket();
@@ -10483,7 +10685,6 @@ async function cobrar(){
     return;
   }
   const hayEfectivo = pagos.some(p => p.caja && p.monto > 0);
-  await prepararImpresora();
   const boton = document.getElementById("btnCobrar");
   boton.classList.add("cobrando");
   boton.disabled = true;
@@ -10551,7 +10752,6 @@ async function imprimirPrecuenta(){
     msg.textContent = "El ticket está vacío.";
     return;
   }
-  await prepararImpresora();
   const t = totalTicket();
   const cli = (document.getElementById("cliVenta") || {}).selectedOptions;
   const vend = (document.getElementById("vendVenta") || {}).selectedOptions;
@@ -10571,7 +10771,7 @@ async function imprimirPrecuenta(){
     }))
   });
 }
-async function imprimirRecibo(data, porNavegador){
+async function imprimirRecibo(data, porNavegador, hoja){
   const emp = window._empresa || {};
   const lugar = datosMesa(notaTicket(data));
   const propina = Number(data.propina || 0);
@@ -10626,7 +10826,7 @@ async function imprimirRecibo(data, porNavegador){
   const firma = data.precuenta
     ? (lugar.camarero ? filaTicket("Camarero", escDash(lugar.camarero)) : "")
     : (atendio ? `<hr class="corte"><p class="centro atendio">Le atendió: ${escDash(String(atendio).toUpperCase())}</p>` : "");
-  await imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte">${cabezaLineas()}${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`, porNavegador);
+  await imprimirTicket(`<div class="bau">${cabezaTicket(emp)}<hr class="corte"><span class="titulo">${titulo}</span>${data.precuenta ? `<span class="centro ley">Documento no fiscal</span>` : ""}<hr class="corte">${meta}<hr class="corte">${cabezaLineas()}${lineasTicket(data)}<hr class="corte">${cuentas}${impuestos}${pagos ? `<hr class="corte">${pagos}` : ""}${vuelto}${debe}${bloqueEcf ? `<hr class="corte">${bloqueEcf}` : ""}${firma}${pieTicket()}</div>`);
 }
 async function cargarMetodos(){
   const d = await api("/api/metodos");
