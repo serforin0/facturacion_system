@@ -1110,7 +1110,7 @@ def tablet():
 
 
 SW_JS = r"""
-const CACHE = "pos-v18";
+const CACHE = "pos-v19";
 const API_GUARDADAS = ["/api/estado", "/api/catalogo", "/api/metodos", "/api/clientes", "/api/vendedores", "/api/terminales", "/api/espera"];
 self.addEventListener("install", ev => {
   ev.waitUntil(caches.open(CACHE).then(c => c.add("/")).then(() => self.skipWaiting()));
@@ -6388,12 +6388,16 @@ HTML = """<!DOCTYPE html>
   .bajo { outline:0; }
 
   /* Ticket */
-  .rail { width:400px; flex-shrink:0; background:var(--surface); border-radius:var(--radius-card); padding:0; position:sticky; top:calc(64px + var(--gap)); max-height:calc(100vh - 64px - var(--gap) * 2); overflow:hidden; display:flex; flex-direction:column; }
+  .rail { width:400px; flex-shrink:0; background:var(--surface); border-radius:var(--radius-card); padding:0; position:sticky; top:calc(64px + var(--gap)); max-height:calc(100vh - 64px - var(--gap) * 2); max-height:calc(100dvh - 64px - var(--gap) * 2); overflow:auto; display:flex; flex-direction:column; }
   @media (min-width: 1680px) {
     .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
     .rail { width: clamp(520px, 32vw, 760px); }
   }
   .rail > * { flex-shrink:0; }
+  .rail > .factura-cuerpo { flex:1 1000 auto; min-height:72px; overflow:auto; }
+  .rail > .factura-datos { flex:0 1 auto; min-height:88px; overflow:auto; }
+  .rail > .factura-pie { flex-shrink:0; background:var(--surface); }
+  .factura-pie .opciones[open] { max-height:min(220px, 32vh); overflow:auto; }
   .rail h3 { margin:0; font-size:18px; font-weight:700; }
   .factura-cabeza { padding:16px 16px 0; }
   .factura-datos { display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; padding:12px 16px 0; }
@@ -6536,7 +6540,8 @@ HTML = """<!DOCTYPE html>
   .form input[type=file] { padding:9px 10px; font-size:12px; }
   #view-form h3 { margin:22px 0 4px; font-size:15px; }
   #cambio { margin:2px 0; color:var(--muted); }
-  #cobro .modal-card { width:min(520px, 100%); }
+  #cobro .modal-card { width:min(520px, 100%); max-height:calc(100vh - 24px); max-height:calc(100dvh - 24px); overflow:auto; }
+  #cobro #btnCobrar { position:sticky; bottom:0; z-index:2; }
   .cobro-total { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin:0 0 14px; }
   .cobro-total small { color:var(--muted); font-size:12px; font-weight:700; }
   .cobro-total b { font-size:28px; line-height:1; }
@@ -6696,13 +6701,12 @@ HTML = """<!DOCTYPE html>
 
 
   /* Tablet y teléfono: la barra lateral se pliega en una hoja de menú */
-  .barra-ticket { display:none; }
+  .barra-ticket { display:flex; position:fixed; left:16px; right:16px; bottom:12px; z-index:30; height:60px; align-items:center; justify-content:space-between; gap:12px; padding:0 8px 0 18px; border-radius:14px; background:var(--r-venta); color:var(--r-venta-ink); font-weight:700; font-stretch:112%; font-variant-numeric:tabular-nums; box-shadow:0 10px 30px rgba(0,0,0,.45); /* taste-skill-ignore: barra fija flotante */ transform: translateY(calc(100% + 24px)); visibility:hidden; transition: transform 240ms var(--ease-out), visibility 0s linear 240ms; }
+  .barra-ticket.on { transform:none; visibility:visible; transition: transform 340ms var(--ease-drawer); }
+  .barra-ticket button { background:var(--r-venta-ink); color:var(--r-venta); height:44px; }
+  body.con-barra .work { padding-bottom:88px; }
   @media (max-width: 1100px) {
     #avisos { left:16px; right:16px; bottom:84px; width:auto; max-width:420px; margin:0 auto; }
-    .barra-ticket { display:flex; position:fixed; left:16px; right:16px; bottom:12px; z-index:30; height:60px; align-items:center; justify-content:space-between; gap:12px; padding:0 8px 0 18px; border-radius:14px; background:var(--r-venta); color:var(--r-venta-ink); font-weight:700; font-stretch:112%; font-variant-numeric:tabular-nums; box-shadow:0 10px 30px rgba(0,0,0,.45); /* taste-skill-ignore: barra fija flotante */ transform: translateY(calc(100% + 24px)); visibility:hidden; transition: transform 240ms var(--ease-out), visibility 0s linear 240ms; }
-    .barra-ticket.on { transform:none; visibility:visible; transition: transform 340ms var(--ease-drawer); }
-    .barra-ticket button { background:var(--r-venta-ink); color:var(--r-venta); height:44px; }
-    body.con-barra .work { padding-bottom:88px; }
     #btnMenu { display:inline-flex; align-items:center; }
     .tema-barra, .salir-barra { display:none; }
     #top .quien, #top .estado:not(.estado-corto) { display:none; }
@@ -6987,7 +6991,7 @@ HTML = """<!DOCTYPE html>
     <div id="modalCuerpo"></div>
   </div>
 </div>
-<div class="barra-ticket" id="barraTicket" aria-hidden="true"><span id="barraResumen"></span><button type="button" onclick="irAlTicket()">Ver ticket</button></div>
+<div class="barra-ticket" id="barraTicket" aria-hidden="true"><span id="barraResumen"></span><button type="button" onclick="irAlTicket()">Cobrar</button></div>
 <div id="avisos" aria-live="polite"></div>
 <div id="barraRed" role="status" aria-live="polite" hidden></div>
 <script>
